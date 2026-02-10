@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  db-migrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: db-migrator
+    ports:
+      - "8501:8501"
+    volumes:
+      # Persist output files
+      - ./output:/app/output
+      # Persist saved configurations
+      - ./configs:/app/configs
+      # Persist backups
+      - ./backups:/app/backups
+    environment:
+      # Optional: Set default connection values
+      # - SOURCE_HOST=your-source-db-host
+      # - TARGET_HOST=your-target-db-host
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true
+    restart: unless-stopped
+    networks:
+      - db-migrator-network
+
+networks:
+  db-migrator-network:
+    driver: bridge
