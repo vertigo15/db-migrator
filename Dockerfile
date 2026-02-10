@@ -1,9 +1,10 @@
 # DB Migrator - Streamlit Application
 FROM python:3.11-slim
 
-# Install PostgreSQL client tools for pg_dump
+# Install PostgreSQL client tools for pg_dump and curl for healthcheck
 RUN apt-get update && apt-get install -y \
     postgresql-client \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
