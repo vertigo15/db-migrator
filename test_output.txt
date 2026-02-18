@@ -1,0 +1,43 @@
+[CONFIG] _BASE_DIR: C:\Users\user\OneDrive - JeenAI\Documents\code\Jeen_4_to_5_db_migration\db-migrator
+[CONFIG] _ENV_PATH: C:\Users\user\OneDrive - JeenAI\Documents\code\Jeen_4_to_5_db_migration\db-migrator\.env
+[CONFIG] .env exists: True
+[CONFIG] SOURCE_DB_HOST after load_dotenv: jeen-pg-dev-weu.postgres.database.azure.com
+============================================================
+ENV Loading Test
+============================================================
+Starting fresh Streamlit server...
+Expected values from .env:
+  Host: jeen-pg-dev-weu.postgres.database.azure.com
+  Port: 5432
+  Database: postgres
+  Username: jeen_pg_dev_admin
+  Table Prefix: jeen_dev
+
+Clearing localStorage...
+Opening http://localhost:8501/connect...
+Found 5 input fields
+  Input: value='localhost', placeholder='localhost'
+  Input: value='', placeholder='my_database'
+  Input: value='', placeholder='postgres'
+  Input: value='5432', placeholder=''
+  Input: value='jeen_dev', placeholder='jeen_dev'
+
+Actual values in form:
+  host: localhost
+  database: 
+  username: 
+  table_prefix: jeen_dev
+
+Verification:
+
+Stopping Streamlit server...
+Traceback (most recent call last):
+  File "C:\Users\user\OneDrive - JeenAI\Documents\code\Jeen_4_to_5_db_migration\db-migrator\tests\test_env_loading.py", line 192, in <module>
+    success = test_env_values_loaded()
+  File "C:\Users\user\OneDrive - JeenAI\Documents\code\Jeen_4_to_5_db_migration\db-migrator\tests\test_env_loading.py", line 147, in test_env_values_loaded
+    print(f"  \u274c Host mismatch: expected '{expected['host']}', got '{actual_values.get('host')}'")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u274c' in position 2: character maps to <undefined>

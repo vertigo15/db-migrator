@@ -60,8 +60,12 @@ def load_from_storage(key: str, default: Any = None) -> Any:
         if result is None or result == "null" or result == "":
             return default
         
+        # If result is already a Python type (not a string), return it directly
+        if isinstance(result, (int, float, bool, list, dict)):
+            return result
+        
         return json.loads(result)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         return default
     except Exception as e:
         st.error(f"Failed to load from localStorage: {e}")

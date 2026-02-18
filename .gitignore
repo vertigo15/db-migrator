@@ -26,6 +26,9 @@ ENV/
 env/
 .venv/
 
+# Environment variables (don't commit sensitive credentials)
+.env
+
 # IDEs
 .idea/
 .vscode/

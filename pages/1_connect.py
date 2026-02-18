@@ -1,15 +1,11 @@
 """
-Page 1: Connect to Source Database
-
-Features:
-- Connection form with localStorage persistence
-- Test connection
-- Table prefix configuration
-- Table existence verification
-- pg_dump backup functionality
+Page 1: Connect to Source Database.
+Defaults are loaded from the project .env file.
 """
 import os
 import streamlit as st
+from dotenv import dotenv_values
+
 from utils.db import (
     ConnectionConfig, 
     test_connection, 
@@ -17,78 +13,65 @@ from utils.db import (
     run_pg_dump,
     get_table_row_count
 )
-from utils.storage import save_connection, load_connection, save_to_storage, load_from_storage
+from utils.storage import save_connection, save_to_storage
 from utils.config import SessionKeys, get_all_table_names
 
 # Page config
 st.set_page_config(page_title="Connect to Source DB", page_icon="🔌", layout="wide")
 st.title("🔌 Connect to Source Database")
 
-# Get the base directory for backups
+# Get the base directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 
 
-def init_session_state():
-    """Initialize session state from localStorage."""
-    if "source_form_loaded" not in st.session_state:
-        st.session_state.source_form_loaded = True
-        
-        # Try to load from localStorage
-        saved_conn = load_connection("source")
-        if saved_conn:
-            st.session_state[SessionKeys.SOURCE_CONNECTION] = saved_conn
-        
-        saved_prefix = load_from_storage("table_prefix")
-        if saved_prefix:
-            st.session_state[SessionKeys.TABLE_PREFIX] = saved_prefix
+@st.cache_data
+def load_defaults():
+    """Load connection defaults from the project .env file."""
+    env_path = os.path.join(BASE_DIR, ".env")
+    if os.path.exists(env_path):
+        config = dotenv_values(env_path)
+        return {
+            "host": config.get("SOURCE_DB_HOST", "localhost"),
+            "port": int(config.get("SOURCE_DB_PORT", "5432")),
+            "database": config.get("SOURCE_DB_DATABASE", ""),
+            "username": config.get("SOURCE_DB_USERNAME", ""),
+            "password": config.get("SOURCE_DB_PASSWORD", ""),
+            "prefix": config.get("TABLE_PREFIX", "jeen_dev"),
+        }
+    
+    # Fallback defaults when .env is missing
+    return {
+        "host": "localhost",
+        "port": 5432,
+        "database": "",
+        "username": "",
+        "password": "",
+        "prefix": "jeen_dev",
+    }
+
+
+# Load defaults once
+DEFAULTS = load_defaults()
 
 
 def render_connection_form():
     """Render the database connection form."""
     st.subheader("Connection Details")
     
-    # Get saved values or defaults
-    saved_conn = st.session_state.get(SessionKeys.SOURCE_CONNECTION, {})
-    
     with st.form("source_connection_form"):
         col1, col2 = st.columns(2)
         
         with col1:
-            host = st.text_input(
-                "Host",
-                value=saved_conn.get("host", "localhost"),
-                placeholder="localhost"
-            )
-            database = st.text_input(
-                "Database",
-                value=saved_conn.get("database", ""),
-                placeholder="my_database"
-            )
-            username = st.text_input(
-                "Username",
-                value=saved_conn.get("username", ""),
-                placeholder="postgres"
-            )
+            host = st.text_input("Host", value=DEFAULTS["host"], placeholder="localhost")
+            database = st.text_input("Database", value=DEFAULTS["database"], placeholder="my_database")
+            username = st.text_input("Username", value=DEFAULTS["username"], placeholder="postgres")
         
         with col2:
-            port = st.number_input(
-                "Port",
-                value=int(saved_conn.get("port", 5432)),
-                min_value=1,
-                max_value=65535
-            )
-            password = st.text_input(
-                "Password",
-                type="password",
-                placeholder="••••••••"
-            )
-            table_prefix = st.text_input(
-                "Table Prefix",
-                value=st.session_state.get(SessionKeys.TABLE_PREFIX, "jeen_dev"),
-                placeholder="jeen_dev",
-                help="Prefix for table names (e.g., 'jeen_dev' for 'jeen_dev_users')"
-            )
+            port = st.number_input("Port", value=int(DEFAULTS["port"]), min_value=1, max_value=65535)
+            password = st.text_input("Password", type="password", value=DEFAULTS["password"], placeholder="••••••••")
+            table_prefix = st.text_input("Table Prefix", value=DEFAULTS["prefix"], placeholder="jeen_dev",
+                                        help="Prefix for table names (e.g., 'jeen_dev' for 'jeen_dev_users')")
         
         submitted = st.form_submit_button("🔗 Test Connection", type="primary", use_container_width=True)
         
@@ -111,13 +94,11 @@ def render_connection_form():
             if success:
                 st.success(f"✅ {message}")
                 
-                # Save to session state
                 conn_dict = config.to_dict()
                 st.session_state[SessionKeys.SOURCE_CONNECTION] = conn_dict
                 st.session_state[SessionKeys.TABLE_PREFIX] = table_prefix
                 st.session_state["source_config"] = config
                 
-                # Save to localStorage (without password)
                 save_connection("source", conn_dict)
                 save_to_storage("table_prefix", table_prefix)
                 
@@ -137,7 +118,6 @@ def render_table_verification():
     conn_dict = st.session_state[SessionKeys.SOURCE_CONNECTION]
     prefix = st.session_state.get(SessionKeys.TABLE_PREFIX, "jeen_dev")
     
-    # Need password for verification
     if "source_config" not in st.session_state:
         st.warning("Please enter your password and test the connection to verify tables.")
         password = st.text_input("Enter password to verify tables:", type="password", key="verify_pwd")
@@ -155,7 +135,6 @@ def render_table_verification():
     
     config = st.session_state["source_config"]
     
-    # Check tables
     with st.spinner("Checking tables..."):
         table_status = check_tables_exist(config, prefix)
     
@@ -163,31 +142,18 @@ def render_table_verification():
         st.error("Failed to check tables. Please verify your connection.")
         return
     
-    # Store resolved tables in session state
     st.session_state[SessionKeys.RESOLVED_TABLES] = table_status
-    
-    # Display table status
     st.markdown(f"**Resolved table names for prefix `{prefix}`:**")
     
     cols = st.columns(3)
     for i, (logical_name, info) in enumerate(table_status.items()):
         with cols[i % 3]:
             if info["exists"]:
-                # Get row count
                 count = get_table_row_count(config, info["actual_name"])
-                st.success(f"""
-                **{logical_name}**  
-                `{info['actual_name']}`  
-                {count:,} rows
-                """)
+                st.success(f"**{logical_name}**  \n`{info['actual_name']}`  \n{count:,} rows")
             else:
-                st.error(f"""
-                **{logical_name}**  
-                `{info['actual_name']}`  
-                ❌ Not found
-                """)
+                st.error(f"**{logical_name}**  \n`{info['actual_name']}`  \n❌ Not found")
     
-    # Summary
     existing_count = sum(1 for info in table_status.values() if info["exists"])
     total_count = len(table_status)
     
@@ -209,29 +175,13 @@ def render_backup_section():
     prefix = st.session_state.get(SessionKeys.TABLE_PREFIX, "jeen_dev")
     table_status = st.session_state.get(SessionKeys.RESOLVED_TABLES, {})
     
-    # Backup options
-    backup_type = st.radio(
-        "Backup Type",
-        ["Full Database", "Selected Tables Only"],
-        horizontal=True
-    )
+    backup_type = st.radio("Backup Type", ["Full Database", "Selected Tables Only"], horizontal=True)
     
     tables_to_backup = None
-    
     if backup_type == "Selected Tables Only":
-        # Get existing tables
-        existing_tables = [
-            info["actual_name"] 
-            for info in table_status.values() 
-            if info["exists"]
-        ]
-        
+        existing_tables = [info["actual_name"] for info in table_status.values() if info["exists"]]
         if existing_tables:
-            tables_to_backup = st.multiselect(
-                "Select tables to backup",
-                options=existing_tables,
-                default=existing_tables
-            )
+            tables_to_backup = st.multiselect("Select tables to backup", options=existing_tables, default=existing_tables)
         else:
             st.warning("No tables found to backup.")
             return
@@ -239,21 +189,13 @@ def render_backup_section():
     compress = st.checkbox("Compress backup (gzip)", value=True)
     
     if st.button("🗄️ Create Backup", type="secondary"):
-        # Ensure backup directory exists
         os.makedirs(BACKUP_DIR, exist_ok=True)
         
         with st.spinner("Creating backup... This may take a while for large databases."):
-            success, message, output_path = run_pg_dump(
-                config,
-                BACKUP_DIR,
-                tables=tables_to_backup,
-                compress=compress
-            )
+            success, message, output_path = run_pg_dump(config, BACKUP_DIR, tables=tables_to_backup, compress=compress)
         
         if success:
             st.success(f"✅ {message}")
-            
-            # Provide download button
             if output_path and os.path.exists(output_path):
                 with open(output_path, "rb") as f:
                     st.download_button(
@@ -265,7 +207,6 @@ def render_backup_section():
         else:
             st.error(f"❌ {message}")
     
-    # Show existing backups
     if os.path.exists(BACKUP_DIR):
         backups = [f for f in os.listdir(BACKUP_DIR) if f.endswith(('.sql', '.sql.gz'))]
         if backups:
@@ -278,32 +219,19 @@ def render_backup_section():
                         st.text(f"{backup} ({size_mb:.2f} MB)")
                     with col2:
                         with open(backup_path, "rb") as f:
-                            st.download_button(
-                                label="📥",
-                                data=f,
-                                file_name=backup,
-                                key=f"dl_{backup}"
-                            )
+                            st.download_button(label="📥", data=f, file_name=backup, key=f"dl_{backup}")
 
 
 def main():
     """Main page function."""
-    init_session_state()
-    
-    # Connection form
     render_connection_form()
-    
-    # Table verification (only if connected)
     render_table_verification()
-    
-    # Backup section (only if connected and verified)
     render_backup_section()
     
-    # Next step hint
     if SessionKeys.RESOLVED_TABLES in st.session_state:
         st.markdown("---")
         st.info("👉 **Next Step:** Go to **Select Data** page to choose users and documents to migrate.")
 
 
-if __name__ == "__main__":
-    main()
+# Run main
+main()

@@ -1,8 +1,16 @@
 """
 Shared configuration, constants, and table definitions for db-migrator.
 """
+import os
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (using explicit path)
+# override=True ensures variables are updated even if they're already set
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV_PATH = os.path.join(_BASE_DIR, ".env")
+load_dotenv(_ENV_PATH, override=True)
 
 # Storage namespace prefix for localStorage keys
 STORAGE_PREFIX = "db_migrator_"
@@ -85,6 +93,17 @@ TABLE_DEFINITIONS: Dict[str, TableDefinition] = {
             FROM public.{table_name}
         """
     ),
+    "logs": TableDefinition(
+        logical_name="logs",
+        name_template="{prefix}_logs",
+        query_template="""
+            SELECT id, user_id, chat_id, question, question_in_english, answer, created_at,
+                   message_index, question_number, token_amount, words_amount, is_like,
+                   type, bot_id, toolkit_settings, title, category, sentiment,
+                   sourcetext, sourcelink, webpagelink, documents_selected, calculated_time
+            FROM public.{table_name}
+        """
+    ),
 }
 
 # Extraction order (respecting foreign keys)
@@ -95,6 +114,7 @@ EXTRACTION_ORDER = [
     "custom_documents",
     "embeddings",
     "agents",
+    "logs",
 ]
 
 
@@ -230,3 +250,34 @@ class SessionKeys:
     TRANSFORMED_DATA = "transformed_data"
     MAPPING_CONFIG = "mapping_config"
     MIGRATION_LOG = "migration_log"
+
+def get_env_connection_defaults() -> Dict[str, str]:
+    """
+    Load default connection settings from .env file.
+    
+    Returns:
+        Dictionary with host, port, database, username, password for source database
+    """
+    return {
+        "host": os.getenv("SOURCE_DB_HOST", "localhost"),
+        "port": os.getenv("SOURCE_DB_PORT", "5432"),
+        "database": os.getenv("SOURCE_DB_DATABASE", ""),
+        "username": os.getenv("SOURCE_DB_USERNAME", ""),
+        "password": os.getenv("SOURCE_DB_PASSWORD", ""),
+    }
+
+
+def get_env_table_prefix() -> str:
+    """Load default table prefix from .env file."""
+    return os.getenv("TABLE_PREFIX", "jeen_dev")
+
+
+def get_env_target_defaults() -> Dict[str, str]:
+    """Load default target database connection settings from .env file."""
+    return {
+        "host": os.getenv("TARGET_DB_HOST", "localhost"),
+        "port": os.getenv("TARGET_DB_PORT", "5432"),
+        "database": os.getenv("TARGET_DB_DATABASE", ""),
+        "username": os.getenv("TARGET_DB_USERNAME", ""),
+        "password": os.getenv("TARGET_DB_PASSWORD", ""),
+    }

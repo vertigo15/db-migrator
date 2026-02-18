@@ -14,7 +14,7 @@ import pandas as pd
 
 from utils.db import ConnectionConfig, test_connection
 from utils.storage import save_connection, load_connection
-from utils.config import SessionKeys
+from utils.config import SessionKeys, get_env_target_defaults
 from utils.loader import DataLoader, get_target_table_info, TARGET_TABLES, LOAD_ORDER
 
 # Page config
@@ -27,14 +27,22 @@ TRANSFORM_DIR = os.path.join(BASE_DIR, "output", "transform")
 
 
 def init_session_state():
-    """Initialize session state from localStorage."""
+    """Initialize session state from localStorage, falling back to .env defaults."""
     if "target_form_loaded" not in st.session_state:
         st.session_state.target_form_loaded = True
         
-        # Try to load from localStorage
+        # Start with .env defaults
+        env_defaults = get_env_target_defaults()
+        connection_data = {k: v for k, v in env_defaults.items() if v}
+        
+        # Override with localStorage values if they exist
         saved_conn = load_connection("target")
-        if saved_conn:
-            st.session_state[SessionKeys.TARGET_CONNECTION] = saved_conn
+        if saved_conn and isinstance(saved_conn, dict):
+            for k, v in saved_conn.items():
+                if v:  # Only override if value is non-empty
+                    connection_data[k] = v
+        
+        st.session_state[SessionKeys.TARGET_CONNECTION] = connection_data
 
 
 def render_target_connection():
@@ -348,5 +356,5 @@ def main():
     st.info("👉 **Next Step:** Go to **Run** page to execute the full migration pipeline with validation.")
 
 
-if __name__ == "__main__":
-    main()
+# Streamlit multipage apps import pages as modules, not scripts
+main()
