@@ -165,10 +165,8 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     selected_user_ids = users_df[users_df["email"].isin(selected_emails)]["id"].tolist()
     st.session_state[SessionKeys.SELECTED_USER_IDS] = selected_user_ids
     
-    # Save selection button
-    if st.button("💾 Save Selection", type="secondary"):
-        save_selected_users(selected_emails)
-        st.success(f"Saved {len(selected_emails)} selected users!")
+    # Auto-save selection (no button needed)
+    save_selected_users(selected_emails)
     
     # Selection summary
     st.metric("Selected Users", len(selected_emails))
@@ -176,11 +174,12 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     return selected_emails, selected_user_ids
 
 def render_user_groups_under_users(config: ConnectionConfig, prefix: str, user_ids: list):
-    """Show user groups for currently selected users (under user selection)."""
+    """Show user groups for currently selected users with selection capability."""
     st.subheader("👥 User Groups")
     if not user_ids:
         st.info("Select users to view their groups.")
-        return
+        st.session_state["selected_group_ids"] = []
+        return []
     users_table = get_table_name("users", prefix)
     groups_table = get_table_name("users_groups", prefix)
     # Detect the group-id column in users table (schema may vary between environments)
@@ -195,7 +194,8 @@ def render_user_groups_under_users(config: ConnectionConfig, prefix: str, user_i
     group_col = next((c for c in candidate_cols if c in available_cols), None)
     if group_col is None:
         st.info("No group-id column found in users table for this environment.")
-        return
+        st.session_state["selected_group_ids"] = []
+        return []
     placeholders = ", ".join(["%s"] * len(user_ids))
     group_ids_query = f"""
         SELECT DISTINCT "{group_col}" AS group_id
@@ -205,7 +205,8 @@ def render_user_groups_under_users(config: ConnectionConfig, prefix: str, user_i
     gids_df = execute_query(config, group_ids_query, tuple(user_ids))
     if gids_df.empty:
         st.info("No user groups found for selected users.")
-        return
+        st.session_state["selected_group_ids"] = []
+        return []
     group_ids = gids_df["group_id"].astype(str).tolist()
     gp = ", ".join(["%s"] * len(group_ids))
     groups_query = f"""
@@ -215,8 +216,44 @@ def render_user_groups_under_users(config: ConnectionConfig, prefix: str, user_i
         ORDER BY group_name
     """
     groups_df = execute_query(config, groups_query, tuple(group_ids))
+    if groups_df.empty:
+        st.info("No user groups found.")
+        st.session_state["selected_group_ids"] = []
+        return []
+    
     st.caption(f"Groups found: {len(groups_df)}")
-    st.dataframe(groups_df, use_container_width=True, hide_index=True)
+    
+    # Select all checkbox for groups
+    select_all_groups = st.checkbox("Select all groups", value=True, key="select_all_groups")
+    
+    # Previous selection
+    previous = st.session_state.get("selected_group_ids")
+    if select_all_groups:
+        groups_df["selected"] = True
+    else:
+        if isinstance(previous, list):
+            groups_df["selected"] = groups_df["id"].astype(str).isin(previous)
+        else:
+            groups_df["selected"] = True
+    
+    # Reorder columns
+    groups_df = groups_df[["selected", "id", "group_name", "default_model", "default_max_tokens_per_user"]]
+    
+    edited_df = st.data_editor(
+        groups_df,
+        hide_index=True,
+        use_container_width=True,
+        height=250,
+        column_config={
+            "selected": st.column_config.CheckboxColumn("Select", default=True),
+        },
+        key="groups_editor",
+    )
+    
+    selected_group_ids = edited_df[edited_df["selected"] == True]["id"].astype(str).tolist()
+    st.session_state["selected_group_ids"] = selected_group_ids
+    st.metric("Selected Groups", len(selected_group_ids))
+    return selected_group_ids
 
 
 def render_document_filters(config: ConnectionConfig, prefix: str, user_ids: list):
@@ -432,6 +469,76 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
     st.metric("Selected Embeddings", len(selected_embedding_ids))
     return selected_embedding_ids
 
+def render_conversations_selection(config: ConnectionConfig, prefix: str, user_ids: list):
+    """Render selectable conversations list (default all selected)."""
+    st.markdown("---")
+    st.subheader("💬 Select Conversations")
+    if not user_ids:
+        st.info("No selected users, so no conversations to select.")
+        st.session_state["selected_conversation_ids"] = []
+        return []
+    logs_table = get_table_name("logs", prefix)
+    placeholders = ", ".join(["%s"] * len(user_ids))
+    query = f"""
+        SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id
+        FROM public.{logs_table}
+        WHERE user_id IN ({placeholders})
+        ORDER BY created_at DESC
+        LIMIT 5000
+    """
+    with st.spinner("Loading conversations..."):
+        convs_df = execute_query(config, query, tuple(user_ids))
+    if not convs_df.empty and "created_at" in convs_df.columns:
+        convs_df["created_at"] = pd.to_datetime(convs_df["created_at"], unit="s", errors="coerce")
+    if convs_df.empty:
+        st.info("No conversations found for selected users.")
+        st.session_state["selected_conversation_ids"] = []
+        return []
+    
+    # Truncate question/answer for display
+    convs_df["question_preview"] = convs_df["question"].astype(str).str[:100] + "..."
+    convs_df["answer_preview"] = convs_df["answer"].astype(str).str[:100] + "..."
+    
+    search = st.text_input("🔍 Search conversations", placeholder="Search by id/user_id/question...", key="conv_search")
+    filtered_df = convs_df.copy()
+    if search:
+        mask = (
+            filtered_df["id"].astype(str).str.contains(search, case=False, na=False)
+            | filtered_df["user_id"].astype(str).str.contains(search, case=False, na=False)
+            | filtered_df["chat_id"].astype(str).str.contains(search, case=False, na=False)
+            | filtered_df["question"].astype(str).str.contains(search, case=False, na=False)
+        )
+        filtered_df = filtered_df[mask]
+    select_all_convs = st.checkbox("Select all conversations in current list", value=True, key="select_all_convs")
+    previous = st.session_state.get("selected_conversation_ids")
+    if select_all_convs:
+        filtered_df["selected"] = True
+    else:
+        if isinstance(previous, list):
+            filtered_df["selected"] = filtered_df["id"].isin(previous)
+        else:
+            filtered_df["selected"] = True
+    filtered_df = filtered_df[["selected", "id", "user_id", "chat_id", "type", "question_preview", "answer_preview", "created_at"]]
+    edited_df = st.data_editor(
+        filtered_df,
+        hide_index=True,
+        use_container_width=True,
+        height=320,
+        column_config={
+            "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
+            "question_preview": st.column_config.TextColumn("Question"),
+            "answer_preview": st.column_config.TextColumn("Answer"),
+            "chat_id": st.column_config.TextColumn("Chat ID"),
+            "type": st.column_config.TextColumn("Type"),
+        },
+        key="conversations_editor",
+    )
+    selected_conversation_ids = edited_df[edited_df["selected"] == True]["id"].astype(str).tolist()
+    st.session_state["selected_conversation_ids"] = selected_conversation_ids
+    st.metric("Selected Conversations", len(selected_conversation_ids))
+    return selected_conversation_ids
+
+
 def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: list):
     """Render selectable agents list (default all selected)."""
     st.markdown("---")
@@ -644,7 +751,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
     with col2:
         export_csv = st.checkbox(
             "📄 Export CSV files",
-            value=True,
+            value=False,
             help="Export data as CSV files (can be disabled if you only need SQL)"
         )
     
@@ -748,6 +855,12 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         if results.get("sql_files"):
             st.subheader("📥 Download SQL Migration Files")
             st.info("💡 These SQL files can be executed directly with: `psql -h <host> -U <user> -d <database> -f <file>.sql`")
+            
+            # Show the host folder path (volume mounted)
+            # Container path: /app/output/extract -> Host path: ./output/extract
+            host_folder = "output/extract"  # Relative to project root on host
+            st.info(f"📂 **SQL files location (copy to File Explorer):**")
+            st.code(host_folder, language=None)
             cols_sql = st.columns(3)
             for i, (table, filepath) in enumerate(results.get("sql_files", {}).items()):
                 if os.path.exists(filepath):
@@ -760,6 +873,20 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                                 mime="text/plain",
                                 key=f"dl_sql_{table}"
                             )
+            
+            # SQL file preview expanders
+            st.subheader("👁️ SQL Files Preview")
+            for table, filepath in results.get("sql_files", {}).items():
+                if os.path.exists(filepath):
+                    file_size = os.path.getsize(filepath)
+                    size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024 * 1024):.1f} MB"
+                    with st.expander(f"🗃️ {table}.sql ({size_str})"):
+                        with open(filepath, "r", encoding="utf-8") as f:
+                            # Read first 50KB for preview (large files truncated)
+                            content = f.read(50000)
+                            if file_size > 50000:
+                                content += "\n\n-- [TRUNCATED - File too large for full preview] --"
+                        st.code(content, language="sql")
         
         # Preview expanders
         st.subheader("👁️ Data Preview")
@@ -796,6 +923,9 @@ def main():
     
     # Agents selection (default all selected)
     selected_agent_ids = render_agents_selection(config, prefix, selected_user_ids)
+    
+    # Conversations selection (default all selected)
+    selected_conversation_ids = render_conversations_selection(config, prefix, selected_user_ids)
     
     # Get current doc count for summary
     filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
