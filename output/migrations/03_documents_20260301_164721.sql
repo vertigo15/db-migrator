@@ -1,7 +1,7 @@
 -- ============================================================
 -- DOCUMENTS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-01T14:15:07.034470
+-- Generated: 2026-03-01T16:47:25.773686
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: document_db.public.documents
 -- Records to migrate: 1
@@ -114,7 +114,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: document_db.public.documents';
     
-    RAISE NOTICE 'Generated: 2026-03-01T14:15:07.034470';
+    RAISE NOTICE 'Generated: 2026-03-01T16:47:25.773686';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -142,7 +142,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('documents_20260301_141507', 'documents', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)", "namespace_uuid": "0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b"}'::jsonb)
+VALUES ('documents_20260301_164725', 'documents', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)", "namespace_uuid": "0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 -- IMPORTANT: Users and folders must be migrated FIRST!
@@ -219,7 +219,7 @@ BEGIN
         'documents',
         v_old_doc_id,
         v_new_doc_id,
-        'documents_20260301_141507'
+        'documents_20260301_164725'
     );
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
@@ -228,7 +228,7 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'documents_20260301_141507';
+WHERE batch_id = 'documents_20260301_164725';
 
 -- Total documents processed: 1
 -- Skipped (no doc_id): 0

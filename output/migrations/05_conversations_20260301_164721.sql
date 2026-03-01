@@ -1,7 +1,7 @@
 -- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-01T14:15:10.923054
+-- Generated: 2026-03-01T16:47:33.077848
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: conversations + messages + message_content_blocks
 -- Source rows: 12
@@ -37,7 +37,7 @@ BEGIN
     RAISE NOTICE 'This script will migrate conversations and messages';
     RAISE NOTICE 'Source rows: 12';
     RAISE NOTICE 'Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b';
-    RAISE NOTICE 'Generated: 2026-03-01T14:15:10.923106';
+    RAISE NOTICE 'Generated: 2026-03-01T16:47:33.077890';
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'PREREQUISITE: Users must be migrated first!';
     RAISE NOTICE '============================================================';
@@ -155,8 +155,8 @@ ORDER BY table_name;
 INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 SELECT * FROM (
   VALUES
-    ('7929aa9a-d56a-416d-8647-ba509a0fe785'::uuid, NULL, 16, 440, true, NULL::timestamp, '2025-08-25T11:50:33.993556'::timestamptz, '2025-08-25T11:51:45.649515'::timestamptz, '2025-08-25T11:51:45.649515'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808')),
-    ('a6030c5e-8ab0-42db-8dda-ddb30d53088a'::uuid, NULL, 8, 198, true, NULL::timestamp, '2025-08-25T11:53:51.440362'::timestamptz, '2025-08-25T11:58:19.268601'::timestamptz, '2025-08-25T11:58:19.268601'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808'))
+    ('7929aa9a-d56a-416d-8647-ba509a0fe785'::uuid, 'Conversation 7929aa9a', 16, 440, true, NULL::timestamp, '2025-08-25T11:50:33.993556'::timestamptz, '2025-08-25T11:51:45.649515'::timestamptz, '2025-08-25T11:51:45.649515'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808')),
+    ('a6030c5e-8ab0-42db-8dda-ddb30d53088a'::uuid, 'Conversation a6030c5e', 8, 198, true, NULL::timestamp, '2025-08-25T11:53:51.440362'::timestamptz, '2025-08-25T11:58:19.268601'::timestamptz, '2025-08-25T11:58:19.268601'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808'))
 ) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 
