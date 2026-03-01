@@ -89,8 +89,12 @@ TABLE_DEFINITIONS: Dict[str, TableDefinition] = {
         name_template="playground_bot_generator_config",
         has_prefix=False,
         query_template="""
-            SELECT bot_id, user_id, bot_data, tags, folder_id, created_at
+            SELECT bot_id, user_id, bot_data, toolkit_settings, character_prompts,
+                   hack_prompt, analysis_prompt, grade_prompt, relevant_answer_prompt,
+                   first_message, additional_links_title, docs_chosen, chosen_docs_folders,
+                   folder_id, created_at, updated_at, last_activity, deleted_at, tags
             FROM public.{table_name}
+            WHERE deleted_at IS NULL
         """
     ),
     "logs": TableDefinition(
@@ -280,4 +284,5 @@ def get_env_target_defaults() -> Dict[str, str]:
         "database": os.getenv("TARGET_DB_DATABASE", ""),
         "username": os.getenv("TARGET_DB_USERNAME", ""),
         "password": os.getenv("TARGET_DB_PASSWORD", ""),
+        "schema_mode": os.getenv("TARGET_SCHEMA_MODE", "schemas"),
     }

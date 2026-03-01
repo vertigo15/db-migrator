@@ -316,56 +316,87 @@ def get_target_table_info(config: ConnectionConfig, schema_mode: str = "schemas"
     info = {}
     
     try:
-        conn = get_connection(config)
-        cursor = conn.cursor()
-        
         for logical_name, table_config in TARGET_TABLES.items():
             target_table = table_config.get("target_table", logical_name)
-            schema = table_config.get("target_schema", "public") if schema_mode == "schemas" else "public"
+            target_schema = table_config.get("target_schema", "public")
             
-            # Check if table exists
-            cursor.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = %s 
-                    AND table_name = %s
-                );
-            """, (schema, target_table))
-            exists = cursor.fetchone()[0]
+            # For separate databases mode, connect to the correct database
+            if schema_mode == "databases":
+                # Create a new config with the correct database name
+                db_config = ConnectionConfig(
+                    host=config.host,
+                    port=config.port,
+                    database=target_schema,  # Use target_schema as database name
+                    username=config.username,
+                    password=config.password
+                )
+                schema = "public"
+            else:
+                # For schemas mode, use the provided config
+                db_config = config
+                schema = target_schema
             
-            table_info = {
-                "exists": exists,
-                "schema": schema,
-                "table_name": target_table,
-                "full_name": f"{schema}.{target_table}",
-                "row_count": 0,
-                "columns": [],
-            }
-            
-            if exists:
-                # Get row count
-                try:
-                    cursor.execute(f"SELECT COUNT(*) FROM {schema}.{target_table};")
-                    table_info["row_count"] = cursor.fetchone()[0]
-                except:
-                    pass
+            try:
+                conn = get_connection(db_config)
+                cursor = conn.cursor()
                 
-                # Get column info
+                # Check if table exists
                 cursor.execute("""
-                    SELECT column_name, data_type, is_nullable
-                    FROM information_schema.columns
-                    WHERE table_schema = %s AND table_name = %s
-                    ORDER BY ordinal_position;
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = %s 
+                        AND table_name = %s
+                    );
                 """, (schema, target_table))
-                table_info["columns"] = [
-                    {"name": row[0], "type": row[1], "nullable": row[2]}
-                    for row in cursor.fetchall()
-                ]
-            
-            info[logical_name] = table_info
-        
-        cursor.close()
-        conn.close()
+                exists = cursor.fetchone()[0]
+                
+                table_info = {
+                    "exists": exists,
+                    "schema": schema,
+                    "database": target_schema if schema_mode == "databases" else schema,
+                    "table_name": target_table,
+                    "full_name": f"{target_schema}.{target_table}" if schema_mode == "databases" else f"{schema}.{target_table}",
+                    "row_count": 0,
+                    "columns": [],
+                }
+                
+                if exists:
+                    # Get row count
+                    try:
+                        cursor.execute(f"SELECT COUNT(*) FROM {schema}.{target_table};")
+                        table_info["row_count"] = cursor.fetchone()[0]
+                    except:
+                        pass
+                    
+                    # Get column info
+                    cursor.execute("""
+                        SELECT column_name, data_type, is_nullable
+                        FROM information_schema.columns
+                        WHERE table_schema = %s AND table_name = %s
+                        ORDER BY ordinal_position;
+                    """, (schema, target_table))
+                    table_info["columns"] = [
+                        {"name": row[0], "type": row[1], "nullable": row[2]}
+                        for row in cursor.fetchall()
+                    ]
+                
+                info[logical_name] = table_info
+                
+                cursor.close()
+                conn.close()
+                
+            except Exception as e:
+                # If connection fails, mark table as not existing
+                info[logical_name] = {
+                    "exists": False,
+                    "schema": schema,
+                    "database": target_schema if schema_mode == "databases" else schema,
+                    "table_name": target_table,
+                    "full_name": f"{target_schema}.{target_table}" if schema_mode == "databases" else f"{schema}.{target_table}",
+                    "row_count": 0,
+                    "columns": [],
+                    "error": str(e)
+                }
         
     except Exception as e:
         # Return empty info on error

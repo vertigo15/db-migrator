@@ -86,6 +86,161 @@ def test_connection(config: ConnectionConfig) -> Tuple[bool, str]:
         return False, f"Error: {str(e)}"
 
 
+def test_target_databases_and_tables(config: ConnectionConfig, schema_mode: str = "databases") -> Dict:
+    """
+    Comprehensive test of target databases and tables.
+    
+    For schema_mode='databases', checks:
+    - Server connectivity
+    - user_db, document_db, completion_db existence
+    - Required tables in each database
+    
+    Args:
+        config: Connection configuration (base database)
+        schema_mode: 'databases' or 'schemas'
+        
+    Returns:
+        Dict with test results including:
+        - success: bool
+        - message: str
+        - server_connected: bool
+        - databases: Dict[db_name, {exists, tables}]
+    """
+    from utils.loader import TARGET_TABLES
+    
+    result = {
+        "success": False,
+        "message": "",
+        "server_connected": False,
+        "databases": {},
+        "version": None
+    }
+    
+    # Test server connection
+    try:
+        conn = get_connection(config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT version();")
+        version = cursor.fetchone()[0]
+        result["version"] = version
+        result["server_connected"] = True
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        result["message"] = f"Server connection failed: {str(e)}"
+        return result
+    
+    if schema_mode == "databases":
+        # Group tables by target database
+        db_tables = {}
+        for table_name, table_config in TARGET_TABLES.items():
+            target_db = table_config.get("target_schema", "public")
+            target_table = table_config.get("target_table", table_name)
+            if target_db not in db_tables:
+                db_tables[target_db] = []
+            db_tables[target_db].append({"logical": table_name, "physical": target_table})
+        
+        # Test each database
+        all_dbs_ok = True
+        messages = []
+        
+        for db_name, expected_tables in db_tables.items():
+            db_result = {
+                "exists": False,
+                "tables": {},
+                "error": None
+            }
+            
+            # Try to connect to this database
+            try:
+                db_config = ConnectionConfig(
+                    host=config.host,
+                    port=config.port,
+                    database=db_name,
+                    username=config.username,
+                    password=config.password
+                )
+                conn = get_connection(db_config)
+                db_result["exists"] = True
+                
+                cursor = conn.cursor()
+                
+                # Check each expected table
+                for table_info in expected_tables:
+                    table_name = table_info["physical"]
+                    cursor.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_schema = 'public' 
+                            AND table_name = %s
+                        );
+                    """, (table_name,))
+                    exists = cursor.fetchone()[0]
+                    
+                    # Get row count if exists
+                    row_count = 0
+                    if exists:
+                        try:
+                            cursor.execute(f"SELECT COUNT(*) FROM public.{table_name};")
+                            row_count = cursor.fetchone()[0]
+                        except:
+                            row_count = -1
+                    
+                    db_result["tables"][table_info["logical"]] = {
+                        "physical_name": table_name,
+                        "exists": exists,
+                        "row_count": row_count
+                    }
+                    
+                    if not exists:
+                        all_dbs_ok = False
+                        messages.append(f"❌ {db_name}.{table_name} not found")
+                    else:
+                        messages.append(f"✅ {db_name}.{table_name} ({row_count} rows)")
+                
+                cursor.close()
+                conn.close()
+                
+            except psycopg2.OperationalError as e:
+                db_result["error"] = f"Cannot connect: {str(e)}"
+                all_dbs_ok = False
+                messages.append(f"❌ Database '{db_name}' not accessible")
+            except Exception as e:
+                db_result["error"] = str(e)
+                all_dbs_ok = False
+                messages.append(f"❌ Error checking {db_name}: {str(e)}")
+            
+            result["databases"][db_name] = db_result
+        
+        result["success"] = all_dbs_ok
+        result["message"] = "\n".join(messages)
+        
+    else:  # schema_mode == "schemas"
+        # For schemas mode, just test if schemas exist
+        try:
+            conn = get_connection(config)
+            cursor = conn.cursor()
+            
+            for schema_name in ["user_db", "document_db", "completion_db"]:
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.schemata 
+                        WHERE schema_name = %s
+                    );
+                """, (schema_name,))
+                exists = cursor.fetchone()[0]
+                result["databases"][schema_name] = {"exists": exists, "tables": {}}
+            
+            cursor.close()
+            conn.close()
+            result["success"] = all(db["exists"] for db in result["databases"].values())
+            
+        except Exception as e:
+            result["message"] = f"Error checking schemas: {str(e)}"
+    
+    return result
+
+
 def check_tables_exist(config: ConnectionConfig, prefix: str) -> Dict[str, bool]:
     """
     Check which tables exist in the database for the given prefix.

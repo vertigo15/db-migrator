@@ -8,6 +8,54 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 import pandas as pd
 from pathlib import Path
+import glob
+
+
+# ============================================================
+# Deterministic Namespace UUIDs for cross-database UUID generation
+# ============================================================
+# Each entity type uses a SEPARATE namespace to prevent UUID collisions.
+# uuid_generate_v5(namespace, old_id) always produces the same UUID
+# for the same inputs, allowing independent computation across databases.
+# ============================================================
+USER_NAMESPACE_UUID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'   # Users (step 01)
+DOC_NAMESPACE_UUID  = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step 03)
+NAMESPACE_UUID      = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'   # Folders, agents, chunks, embeddings
+
+
+def cleanup_old_migration_files(output_file: str, file_prefix: str):
+    """
+    Delete old migration SQL files with the same prefix to avoid confusion.
+    
+    Args:
+        output_file: The new file being created (e.g., 'output/migrations/06_agents_20260228_123456.sql')
+        file_prefix: The file prefix to match (e.g., '06_agents_')
+        
+    Example:
+        cleanup_old_migration_files('output/migrations/06_agents_20260228_123456.sql', '06_agents_')
+        # Deletes: 06_agents_20260228_120000.sql, 06_agents_20260227_*.sql, etc.
+    """
+    output_dir = os.path.dirname(output_file)
+    if not os.path.exists(output_dir):
+        return
+    
+    # Find all files matching the pattern
+    pattern = os.path.join(output_dir, f"{file_prefix}*.sql")
+    old_files = glob.glob(pattern)
+    
+    deleted_count = 0
+    for old_file in old_files:
+        # Don't delete the file we're about to create
+        if os.path.abspath(old_file) != os.path.abspath(output_file):
+            try:
+                os.remove(old_file)
+                deleted_count += 1
+                print(f"Deleted old migration file: {os.path.basename(old_file)}")
+            except Exception as e:
+                print(f"Warning: Could not delete {old_file}: {e}")
+    
+    if deleted_count > 0:
+        print(f"Cleaned up {deleted_count} old migration file(s) with prefix '{file_prefix}'")
 
 
 def clean_string(val):
@@ -25,11 +73,69 @@ def escape_sql_string(val):
     return f"'{str(val).replace(chr(39), chr(39)+chr(39))}'"
 
 
+def escape_sql_string_with_dollar_quotes(val, tag='CONTENT'):
+    """Escape string using PostgreSQL dollar quotes for content with special characters.
+    
+    This is safer for large text content that might contain quotes, backslashes, or $$ symbols.
+    Uses a dollar-quote tag like $CONTENT$ to avoid conflicts with nested $$ in the content.
+    
+    PostgreSQL dollar-quoting syntax:  $tag$content$tag$
+    """
+    if val is None or pd.isna(val):
+        return 'NULL'
+    
+    # Convert to string
+    content = str(val)
+    
+    # If content is empty, use NULL
+    if not content:
+        return 'NULL'
+    
+    # Use dollar quoting with a unique tag
+    # Ensure the delimiter $tag$ does not appear inside the content
+    while f'${tag}$' in content:
+        tag = tag + '_'
+    
+    return f'${tag}${content}${tag}$'
+
+
+def _safe_json_default(obj):
+    """Custom JSON encoder for pandas/numpy types."""
+    import numpy as np
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        if np.isnan(obj):
+            return None
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if hasattr(obj, 'item'):  # numpy scalar
+        return obj.item()
+    return str(obj)
+
+
+def _is_scalar_na(val):
+    """Safely check if a scalar value is NA/NaN (without blowing up on lists/dicts)."""
+    if val is None:
+        return True
+    if isinstance(val, (list, dict, tuple)):
+        return False
+    try:
+        return pd.isna(val)
+    except (ValueError, TypeError):
+        return False
+
+
 def escape_json_for_sql(json_data):
     """Escape JSON data for inclusion in SQL."""
     if json_data is None:
         return 'NULL'
-    json_str = json.dumps(json_data, ensure_ascii=False)
+    json_str = json.dumps(json_data, ensure_ascii=False, default=_safe_json_default)
     # Escape single quotes in the JSON string
     return f"'{json_str.replace(chr(39), chr(39)+chr(39))}'::jsonb"
 
@@ -42,16 +148,117 @@ def generate_username(email):
     return username
 
 
+def generate_migration_schema_setup() -> str:
+    """
+    Generate SQL to create migration schema and mapping tables.
+    This will be included in every migration SQL file.
+    Uses IF NOT EXISTS so it's idempotent - safe to run multiple times.
+    
+    Returns:
+        SQL setup string
+    """
+    setup_sql = """-- ============================================================
+-- MIGRATION MAPPING TABLE SETUP (idempotent)
+-- ============================================================
+-- Creates schema and tables for tracking ID mappings
+-- Safe to run multiple times - uses IF NOT EXISTS
+-- ============================================================
+
+-- Create migration schema
+CREATE SCHEMA IF NOT EXISTS migration;
+
+-- Create ID mappings table
+CREATE TABLE IF NOT EXISTS migration.id_mappings (
+    id SERIAL PRIMARY KEY,
+    table_name VARCHAR(100) NOT NULL,
+    old_id VARCHAR(255) NOT NULL,
+    new_id UUID NOT NULL,
+    migration_batch VARCHAR(50),
+    migrated_at TIMESTAMP DEFAULT now(),
+    notes TEXT,
+    CONSTRAINT uq_table_old_id UNIQUE (table_name, old_id),
+    CONSTRAINT uq_table_new_id UNIQUE (table_name, new_id)
+);
+
+-- Create indexes for fast lookups
+CREATE INDEX IF NOT EXISTS idx_mappings_table_old_id 
+    ON migration.id_mappings(table_name, old_id);
+CREATE INDEX IF NOT EXISTS idx_mappings_table_new_id 
+    ON migration.id_mappings(table_name, new_id);
+CREATE INDEX IF NOT EXISTS idx_mappings_batch 
+    ON migration.id_mappings(migration_batch);
+
+-- Create batch tracking table
+CREATE TABLE IF NOT EXISTS migration.batch_log (
+    batch_id VARCHAR(50) PRIMARY KEY,
+    table_name VARCHAR(100) NOT NULL,
+    started_at TIMESTAMP DEFAULT now(),
+    completed_at TIMESTAMP,
+    record_count INTEGER,
+    status VARCHAR(20) DEFAULT 'in_progress',
+    error_message TEXT,
+    source_info JSONB
+);
+
+-- Helper function: Get new ID from old ID
+CREATE OR REPLACE FUNCTION migration.get_new_id(
+    p_table_name VARCHAR,
+    p_old_id VARCHAR
+) RETURNS UUID AS $$
+DECLARE
+    v_new_id UUID;
+BEGIN
+    SELECT new_id INTO v_new_id
+    FROM migration.id_mappings
+    WHERE table_name = p_table_name AND old_id = p_old_id;
+    RETURN v_new_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Helper function: Check if record already migrated
+CREATE OR REPLACE FUNCTION migration.is_migrated(
+    p_table_name VARCHAR,
+    p_old_id VARCHAR
+) RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM migration.id_mappings
+        WHERE table_name = p_table_name AND old_id = p_old_id
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Progress summary view
+CREATE OR REPLACE VIEW migration.progress_summary AS
+SELECT 
+    table_name,
+    COUNT(*) as migrated_count,
+    MIN(migrated_at) as first_migrated,
+    MAX(migrated_at) as last_migrated,
+    COUNT(DISTINCT migration_batch) as batch_count
+FROM migration.id_mappings
+GROUP BY table_name
+ORDER BY table_name;
+
+-- ============================================================
+-- MIGRATION MAPPING TABLE SETUP COMPLETE
+-- ============================================================
+
+"""
+    return setup_sql
+
+
 def generate_sql_header(
     table_name: str,
     target_schema: str,
     target_table: str,
     source_info: str,
     record_count: int,
-    org_id: Optional[str] = None
+    org_id: Optional[str] = None,
+    include_mapping_setup: bool = True
 ) -> str:
     """
-    Generate SQL file header with confirmation prompt.
+    Generate SQL file header with confirmation prompt and migration setup.
     
     Args:
         table_name: Logical table name (e.g., 'users')
@@ -60,6 +267,7 @@ def generate_sql_header(
         source_info: Source database info
         record_count: Number of records to migrate
         org_id: Optional organization ID
+        include_mapping_setup: Include migration.id_mappings table setup
         
     Returns:
         SQL header string
@@ -81,9 +289,19 @@ def generate_sql_header(
 -- IMPORTANT: Review organization_id and other constants before execution!
 --
 -- Each INSERT checks if record already exists before inserting.
+-- Uses migration.id_mappings table for fast ID lookups and tracking.
 -- ============================================================
 
--- CONFIRMATION PROMPT: User must confirm before execution
+-- Ensure PostgreSQL interprets this file as UTF-8 (required for Hebrew/multilingual content)
+SET client_encoding = 'UTF8';
+
+"""
+    
+    # Add migration schema setup if requested
+    if include_mapping_setup:
+        header += generate_migration_schema_setup()
+    
+    header += f"""-- CONFIRMATION PROMPT: User must confirm before execution
 DO $$
 DECLARE
     user_confirmation TEXT;
@@ -234,47 +452,73 @@ def generate_user_insert(row: pd.Series, org_id: str = '356b50f7-bcbd-42aa-9392-
     
     metadata_sql = escape_json_for_sql(metadata)
     
-    # Generate SQL with existence check
+    # Generate SQL with mapping table integration
     sql = f"""
 -- User: {email}
 DO $$
+DECLARE
+    v_old_id VARCHAR := {escape_sql_string(old_id)};
+    v_email VARCHAR := {escape_sql_string(email)};
+    v_new_id UUID;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM user_db.public.users 
-        WHERE email = '{email}' OR metadata->'legacyData'->>'id' = '{old_id}'
-    ) THEN
-        INSERT INTO user_db.public.users (
-            email,
-            first_name,
-            last_name,
-            username,
-            avatar_url,
-            metadata,
-            created_at,
-            updated_at,
-            deleted_at,
-            id,
-            zitadel_user_id,
-            organization_id,
-            is_owner,
-            preferred_language
-        ) VALUES (
-            '{email}',
-            {escape_sql_string(first_name)},
-            {escape_sql_string(last_name)},
-            {escape_sql_string(username)},
-            NULL,
-            {metadata_sql},
-            {created_at_sql},
-            now(),
-            NULL,
-            gen_random_uuid(),
-            NULL,
-            '{org_id}'::uuid,
-            false,
-            NULL
-        );
+    -- Check if already migrated using mapping table (FAST)
+    IF migration.is_migrated('users', v_old_id) THEN
+        RAISE NOTICE 'User % already migrated (old_id: %)', v_email, v_old_id;
+        RETURN;
     END IF;
+    
+    -- Generate deterministic UUID (same namespace+input = same UUID across all databases)
+    v_new_id := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
+    
+    -- Insert user
+    INSERT INTO user_db.public.users (
+        id,
+        email,
+        first_name,
+        last_name,
+        username,
+        avatar_url,
+        metadata,
+        created_at,
+        updated_at,
+        deleted_at,
+        zitadel_user_id,
+        organization_id,
+        is_owner,
+        preferred_language
+    ) VALUES (
+        v_new_id,
+        {escape_sql_string(email)},
+        {escape_sql_string(first_name)},
+        {escape_sql_string(last_name)},
+        {escape_sql_string(username)},
+        NULL,
+        {metadata_sql},
+        {created_at_sql},
+        now(),
+        NULL,
+        NULL,
+        '{org_id}'::uuid,
+        false,
+        NULL
+    );
+    
+    -- Store ID mapping for fast future lookups
+    INSERT INTO migration.id_mappings (
+        table_name,
+        old_id,
+        new_id,
+        migration_batch,
+        notes
+    ) VALUES (
+        'users',
+        v_old_id,
+        v_new_id,
+        'batch_{{{{TIMESTAMP}}}}',
+        'Migrated from V4 users table'
+    );
+    
+    RAISE NOTICE 'Migrated user %: % → %', v_email, v_old_id, v_new_id;
 END $$;
 """
     
@@ -301,6 +545,12 @@ def generate_users_migration_sql(
     """
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
+    # Clean up old users migration files
+    cleanup_old_migration_files(output_file, '01_users_')
+    
+    # Generate batch ID for tracking
+    batch_id = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
     record_count = 0
     skipped_count = 0
     
@@ -316,24 +566,47 @@ def generate_users_migration_sql(
         )
         sql_file.write(header)
         
-        # Write individual INSERT statements
+        # Write UUID extension and batch tracking start
+        source_json = json.dumps({"source": source_info})
+        batch_start = f"""-- Ensure UUID extensions are available
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Start batch tracking
+INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
+VALUES ('{batch_id}', 'users', {len(users_df)}, '{source_json}'::jsonb)
+ON CONFLICT (batch_id) DO NOTHING;
+
+"""
+        sql_file.write(batch_start)
+        
+        # Write individual INSERT statements with batch_id substitution
         for _, row in users_df.iterrows():
             sql = generate_user_insert(row, org_id)
             if sql:
+                # Replace batch placeholder with actual batch_id
+                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
                 sql_file.write(sql)
                 sql_file.write('\n')
                 record_count += 1
             else:
                 skipped_count += 1
         
-        # Write footer
-        sql_file.write(f'\n-- Total records processed: {record_count}\n')
-        sql_file.write(f'-- Skipped (no email): {skipped_count}\n')
+        # Write batch completion and footer
+        footer = f"""-- Complete batch tracking
+UPDATE migration.batch_log 
+SET completed_at = now(), status = 'completed' 
+WHERE batch_id = '{batch_id}';
+
+-- Total records processed: {record_count}
+-- Skipped (no email): {skipped_count}
+"""
+        sql_file.write(footer)
     
     return {
         'file': output_file,
         'processed': record_count,
-        'skipped': skipped_count
+        'skipped': skipped_count,
+        'batch_id': batch_id
     }
 
 
@@ -380,50 +653,57 @@ def generate_folder_insert(row: pd.Series, namespace_uuid: str = '0b1e4c6a-1f4a-
     else:
         parent_id_sql = 'NULL'
     
-    # Generate SQL with existence check
+    # Generate SQL with mapping table integration
     sql = f"""
 -- Folder: {folder_name or old_id} (owner: {owner_id})
 DO $$
 DECLARE
-    v_folder_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{old_id}');
-    v_user_id uuid;
+    v_old_folder_id VARCHAR := {escape_sql_string(old_id)};
+    v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
+    v_folder_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, v_old_folder_id);
+    v_user_id uuid := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_owner_id);
 BEGIN
-    -- Lookup user_id from migrated users via legacy owner_id
-    SELECT id INTO v_user_id
-    FROM user_db.public.users
-    WHERE metadata->'legacyData'->>'id' = '{owner_id}';
-    
-    -- Skip if user not found
-    IF v_user_id IS NULL THEN
-        RAISE NOTICE 'Skipping folder % - user % not found', '{old_id}', '{owner_id}';
+    -- Check if folder already migrated using mapping table (FAST)
+    IF migration.is_migrated('folders', v_old_folder_id) THEN
+        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
         RETURN;
     END IF;
     
-    -- Insert folder if not exists
-    IF NOT EXISTS (
-        SELECT 1 FROM user_db.public.folders
-        WHERE id = v_folder_id
-    ) THEN
-        INSERT INTO user_db.public.folders (
-            id,
-            folder_name,
-            parent_id,
-            folder_type,
-            user_id,
-            created_at,
-            updated_at,
-            deleted_at
-        ) VALUES (
-            v_folder_id,
-            {escape_sql_string(folder_name)},
-            {parent_id_sql},
-            '{folder_type}'::public.folders_folder_type_enum,
-            v_user_id,
-            {created_at_sql},
-            now(),
-            NULL
-        );
-    END IF;
+    -- Insert folder
+    INSERT INTO document_db.public.folders (
+        id,
+        folder_name,
+        parent_id,
+        folder_type,
+        user_id,
+        created_at,
+        updated_at,
+        deleted_at
+    ) VALUES (
+        v_folder_id,
+        {escape_sql_string(folder_name)},
+        {parent_id_sql},
+        '{folder_type}'::public.folders_folder_type_enum,
+        v_user_id,
+        {created_at_sql},
+        now(),
+        NULL
+    );
+    
+    -- Store folder ID mapping
+    INSERT INTO migration.id_mappings (
+        table_name,
+        old_id,
+        new_id,
+        migration_batch
+    ) VALUES (
+        'folders',
+        v_old_folder_id,
+        v_folder_id,
+        'batch_{{{{TIMESTAMP}}}}'
+    );
+    
+    RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;
 """
     
@@ -451,6 +731,12 @@ def generate_folders_migration_sql(
     """
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
+    # Clean up old folders migration files
+    cleanup_old_migration_files(output_file, '02_folders_')
+    
+    # Generate batch ID
+    batch_id = f"folders_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
     # Sort folders: parents (NULL parent_id) first, then by parent_id, then by id
     folders_sorted = folders_df.copy()
     folders_sorted['parent_id_sort'] = folders_sorted['parent_id'].fillna('')
@@ -460,80 +746,59 @@ def generate_folders_migration_sql(
     skipped_count = 0
     
     with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
--- FOLDERS MIGRATION SQL
--- ============================================================
--- Generated: {datetime.now().isoformat()}
--- Source: {source_info}
--- Destination: user_db.public.folders
--- Records to migrate: {len(folders_df)}
--- 
--- IMPORTANT: This script will INSERT folders into the target database!
--- IMPORTANT: Folders are inserted in parent-first order to maintain relationships.
---
--- Uses deterministic UUID generation (uuid_generate_v5) to preserve parent-child links.
--- Namespace UUID: {namespace_uuid}
--- Each INSERT checks if folder already exists before inserting.
--- ============================================================
-
--- Ensure uuid-ossp extension is available
+        # Write header using standard function
+        header = generate_sql_header(
+            table_name='folders',
+            target_schema='document_db',
+            target_table='public.folders',
+            source_info=source_info,
+            record_count=len(folders_df)
+        )
+        sql_file.write(header)
+        
+        # Write extension and batch tracking
+        source_json = json.dumps({"source": source_info})
+        batch_start = f"""-- Ensure uuid-ossp extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- CONFIRMATION PROMPT: User must confirm before execution
-DO $$
-DECLARE
-    user_confirmation TEXT;
-BEGIN
-    RAISE NOTICE '';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'FOLDERS MIGRATION - CONFIRMATION REQUIRED';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'This script will migrate {len(folders_df)} folders to: user_db.public.folders';
-    RAISE NOTICE 'Namespace UUID: {namespace_uuid}';
-    RAISE NOTICE 'Generated: {datetime.now().isoformat()}';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE '';
-    
-    user_confirmation := NULL;
-    
-    IF current_setting('is_superuser') = 'off' THEN
-        RAISE NOTICE 'Ready to proceed. Press Ctrl+C to cancel or Enter to continue...';
-    END IF;
-    
-    RAISE NOTICE 'Starting migration...';
-    RAISE NOTICE '';
-END $$;
-
--- Uncomment the lines below to require manual confirmation (recommended for first run)
--- Note: These are psql meta-commands that work in interactive psql sessions
--- \\\\prompt 'Type YES to confirm and continue with migration: ' user_confirmation
--- \\\\if :'user_confirmation' != 'YES'
---   \\\\echo 'Migration cancelled by user.'
---   \\\\quit
--- \\\\endif
+-- Start batch tracking
+INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
+VALUES ('{batch_id}', 'folders', {len(folders_df)}, '{source_json}'::jsonb)
+ON CONFLICT (batch_id) DO NOTHING;
 
 """
-        sql_file.write(header)
+        sql_file.write(batch_start)
         
         # Write individual INSERT statements (sorted order)
         for _, row in folders_sorted.iterrows():
             sql = generate_folder_insert(row, namespace_uuid)
             if sql:
+                # Replace batch placeholder with actual batch_id
+                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
                 sql_file.write(sql)
                 sql_file.write('\n')
                 record_count += 1
             else:
                 skipped_count += 1
         
-        # Write footer
-        sql_file.write(f'\n-- Total folders processed: {record_count}\n')
-        sql_file.write(f'-- Skipped (no ID): {skipped_count}\n')
+        # Write batch completion and footer
+        footer = f"""-- Complete batch tracking
+UPDATE migration.batch_log 
+SET completed_at = now(), status = 'completed' 
+WHERE batch_id = '{batch_id}';
+
+-- Total folders processed: {record_count}
+-- Skipped (no ID): {skipped_count}
+-- Note: Folders inserted in parent-first order using deterministic UUIDs (uuid_generate_v5)
+-- Namespace UUID: {namespace_uuid}
+"""
+        sql_file.write(footer)
     
     return {
         'file': output_file,
         'processed': record_count,
-        'skipped': skipped_count
+        'skipped': skipped_count,
+        'batch_id': batch_id
     }
 
 
@@ -643,7 +908,11 @@ def generate_document_insert(
             tags = json.loads(tags.replace("'", '"'))
         except:
             tags = []
-    elif pd.isna(tags):
+    elif isinstance(tags, (list, dict)):
+        pass  # already parsed from JSONB
+    elif _is_scalar_na(tags):
+        tags = []
+    else:
         tags = []
     
     vector_methods = row.get('vector_methods')
@@ -652,6 +921,10 @@ def generate_document_insert(
             vector_methods = json.loads(vector_methods.replace("'", '"'))
         except:
             vector_methods = None
+    elif isinstance(vector_methods, (list, dict)):
+        pass  # already parsed from JSONB
+    elif _is_scalar_na(vector_methods):
+        vector_methods = None
     
     data_integration_doc_metadata = row.get('data_integration_doc_metadata')
     if isinstance(data_integration_doc_metadata, str):
@@ -659,6 +932,10 @@ def generate_document_insert(
             data_integration_doc_metadata = json.loads(data_integration_doc_metadata.replace("'", '"'))
         except:
             data_integration_doc_metadata = None
+    elif isinstance(data_integration_doc_metadata, (list, dict)):
+        pass  # already parsed from JSONB
+    elif _is_scalar_na(data_integration_doc_metadata):
+        data_integration_doc_metadata = None
     
     # Build metadata
     metadata = {
@@ -682,67 +959,82 @@ def generate_document_insert(
     
     metadata_sql = escape_json_for_sql(metadata)
     
-    # Generate SQL with existence check
+    # Generate SQL with mapping table integration
     sql = f"""
 -- Document: {file_name} (owner: {owner_id})
 DO $$
 DECLARE
-    v_user_id varchar(255);
+    v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
+    v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
+    v_old_folder_id VARCHAR := {escape_sql_string(folder_id) if folder_id else 'NULL'};
+    v_new_doc_id UUID := uuid_generate_v5('{DOC_NAMESPACE_UUID}'::uuid, v_old_doc_id);
+    v_user_id UUID := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_owner_id);
+    v_folder_id UUID;
 BEGIN
-    -- Lookup user_id from migrated users via legacy owner_id
-    SELECT id::varchar(255) INTO v_user_id
-    FROM user_db.public.users
-    WHERE metadata->'legacyData'->>'id' = '{owner_id}';
-    
-    -- Skip if user not found
-    IF v_user_id IS NULL THEN
-        RAISE NOTICE 'Skipping document % - user % not found', '{doc_id}', '{owner_id}';
+    -- Check if document already migrated using mapping table (FAST)
+    IF migration.is_migrated('documents', v_old_doc_id) THEN
+        RAISE NOTICE 'Document % already migrated', v_old_doc_id;
         RETURN;
     END IF;
     
-    -- Insert document if not exists
-    IF NOT EXISTS (
-        SELECT 1 FROM user_db.public.documents
-        WHERE metadata->'legacyData'->>'doc_id' = '{doc_id}'
-    ) THEN
-        INSERT INTO user_db.public.documents (
-            id,
-            status,
-            file_name,
-            file_size,
-            storage_type,
-            storage_path,
-            storage_id,
-            metadata,
-            created_at,
-            updated_at,
-            deleted_at,
-            folder_id,
-            user_id,
-            content_type,
-            parsing_technique_id,
-            source_type,
-            organization_id
-        ) VALUES (
-            gen_random_uuid(),
-            'PROCESSED'::public.documents_status_enum,
-            {escape_sql_string(file_name)},
-            {file_size},
-            {escape_sql_string(storage_type) if storage_type else 'NULL'},
-            '{doc_id}',
-            NULL,
-            {metadata_sql},
-            {created_at_sql},
-            now(),
-            NULL,
-            {folder_id_sql},
-            v_user_id,
-            '{content_type}',
-            NULL,
-            'upload'::public.documents_source_type_enum,
-            NULL
-        );
+    -- Lookup folder via mapping table if folder specified (same DB - document_db)
+    IF v_old_folder_id IS NOT NULL THEN
+        v_folder_id := migration.get_new_id('folders', v_old_folder_id);
     END IF;
+    
+    -- Insert document
+    INSERT INTO document_db.public.documents (
+        id,
+        status,
+        file_name,
+        file_size,
+        storage_type,
+        storage_path,
+        storage_id,
+        metadata,
+        created_at,
+        updated_at,
+        deleted_at,
+        folder_id,
+        user_id,
+        content_type,
+        parsing_technique_id,
+        source_type,
+        organization_id
+    ) VALUES (
+        v_new_doc_id,
+        'PROCESSED'::public.documents_status_enum,
+        {escape_sql_string(file_name)},
+        {file_size},
+        {escape_sql_string(storage_type) if storage_type else 'NULL'},
+        '{doc_id}',
+        NULL,
+        {metadata_sql},
+        {created_at_sql},
+        now(),
+        NULL,
+        v_folder_id,
+        v_user_id::varchar(255),
+        '{content_type}',
+        NULL,
+        'upload'::public.documents_source_type_enum,
+        NULL
+    );
+    
+    -- Store document ID mapping
+    INSERT INTO migration.id_mappings (
+        table_name,
+        old_id,
+        new_id,
+        migration_batch
+    ) VALUES (
+        'documents',
+        v_old_doc_id,
+        v_new_doc_id,
+        'batch_{{{{TIMESTAMP}}}}'
+    );
+    
+    RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
 """
     
@@ -769,86 +1061,79 @@ def generate_documents_migration_sql(
     """
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
+    # Clean up old documents migration files
+    cleanup_old_migration_files(output_file, '03_documents_')
+    
     record_count = 0
     skipped_count = 0
     
+    # Generate batch ID for tracking
+    batch_id = f"documents_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
     with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
--- DOCUMENTS MIGRATION SQL
--- ============================================================
--- Generated: {datetime.now().isoformat()}
--- Source: {source_info}
--- Destination: user_db.public.documents
--- Records to migrate: {len(documents_df)}
--- 
--- IMPORTANT: This script will INSERT documents into the target database!
--- IMPORTANT: Run users and folders migrations first (documents reference both).
---
--- Uses deterministic UUID generation (uuid_generate_v5) for folder_id conversion.
--- Namespace UUID: {namespace_uuid}
--- Each INSERT checks if document already exists before inserting.
--- ============================================================
-
--- Ensure uuid-ossp extension is available
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- CONFIRMATION PROMPT: User must confirm before execution
-DO $$
-DECLARE
-    user_confirmation TEXT;
-BEGIN
-    RAISE NOTICE '';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'DOCUMENTS MIGRATION - CONFIRMATION REQUIRED';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'This script will migrate {len(documents_df)} documents to: user_db.public.documents';
-    RAISE NOTICE 'Namespace UUID: {namespace_uuid}';
-    RAISE NOTICE 'Generated: {datetime.now().isoformat()}';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'PREREQUISITE: Users and folders must be migrated first!';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE '';
-    
-    user_confirmation := NULL;
-    
-    IF current_setting('is_superuser') = 'off' THEN
-        RAISE NOTICE 'Ready to proceed. Press Ctrl+C to cancel or Enter to continue...';
-    END IF;
-    
-    RAISE NOTICE 'Starting migration...';
-    RAISE NOTICE '';
-END $$;
-
--- Uncomment the lines below to require manual confirmation (recommended for first run)
--- Note: These are psql meta-commands that work in interactive psql sessions
--- \\\\prompt 'Type YES to confirm and continue with migration: ' user_confirmation
--- \\\\if :'user_confirmation' != 'YES'
---   \\\\echo 'Migration cancelled by user.'
---   \\\\quit
--- \\\\endif
-
-"""
+        # Write header with migration setup
+        header = generate_sql_header(
+            table_name='documents',
+            target_schema='document_db',
+            target_table='public.documents',
+            source_info=source_info,
+            record_count=len(documents_df),
+            include_mapping_setup=True
+        )
         sql_file.write(header)
         
-        # Write individual INSERT statements
+        # Write UUID extensions and batch tracking
+        source_json = json.dumps({"source": source_info, "namespace_uuid": namespace_uuid})
+        batch_start = f"""-- Ensure UUID extensions are available
+-- Note: gen_random_uuid() is built-in for PostgreSQL 13+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Start batch tracking
+INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
+VALUES ('{batch_id}', 'documents', {len(documents_df)}, '{source_json}'::jsonb)
+ON CONFLICT (batch_id) DO NOTHING;
+
+-- IMPORTANT: Users and folders must be migrated FIRST!
+-- Documents reference both users (owner_id) and folders (folder_id)
+
+"""
+        sql_file.write(batch_start)
+        
+        # Write individual INSERT statements with batch_id substitution
         for _, row in documents_df.iterrows():
-            sql = generate_document_insert(row, namespace_uuid)
-            if sql:
-                sql_file.write(sql)
-                sql_file.write('\n')
-                record_count += 1
-            else:
+            try:
+                sql = generate_document_insert(row, namespace_uuid)
+                if sql:
+                    # Replace batch placeholder with actual batch_id
+                    sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
+                    sql_file.write(sql)
+                    sql_file.write('\n')
+                    record_count += 1
+                else:
+                    skipped_count += 1
+            except Exception as e:
+                import sys, traceback
+                doc_id = row.get('doc_id', 'unknown')
+                print(f"Warning: Failed to generate SQL for document {doc_id}: {e}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
                 skipped_count += 1
         
-        # Write footer
-        sql_file.write(f'\n-- Total documents processed: {record_count}\n')
-        sql_file.write(f'-- Skipped (no doc_id): {skipped_count}\n')
+        # Write batch completion and footer
+        footer = f"""-- Complete batch tracking
+UPDATE migration.batch_log 
+SET completed_at = now(), status = 'completed' 
+WHERE batch_id = '{batch_id}';
+
+-- Total documents processed: {record_count}
+-- Skipped (no doc_id): {skipped_count}
+"""
+        sql_file.write(footer)
     
     return {
         'file': output_file,
         'processed': record_count,
-        'skipped': skipped_count
+        'skipped': skipped_count,
+        'batch_id': batch_id
     }
 
 
@@ -889,7 +1174,7 @@ def generate_chunk_and_embedding_inserts(
     row: pd.Series,
     chunk_index: int,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    default_embedding_model: str = 'BAAI/bge-m3',
+    default_embedding_model: str = 'text-embedding-ada-002',
     skip_empty_embeddings: bool = False
 ) -> Optional[str]:
     """
@@ -1005,22 +1290,29 @@ def generate_chunk_and_embedding_inserts(
     else:
         created_at_sql = 'now()'
     
+    # Generate a unique tag for the outer DO block so that $$ inside
+    # dollar-quoted content (e.g. Hebrew text containing "$$") cannot
+    # prematurely close the PL/pgSQL block.
+    outer_tag = 'chunk_fn'
+    all_content = (original_content or '') + (translated_content or '')
+    while f'${outer_tag}$' in all_content:
+        outer_tag = outer_tag + '_'
+    
     # Generate chunk INSERT
     chunk_sql = f"""
 -- Chunk from legacy ID: {legacy_id} (doc_id: {doc_id})
-DO $$
+DO ${outer_tag}$
 DECLARE
     v_chunk_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}');
+    v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
 BEGIN
-    -- Lookup document_id from migrated documents via legacy doc_id
-    SELECT id INTO v_document_id
-    FROM documents
-    WHERE metadata->'legacyData'->>'doc_id' = '{doc_id}';
+    -- Lookup document_id from migration mapping table (FAST)
+    v_document_id := migration.get_new_id('documents', v_old_doc_id);
     
     -- Skip if document not found
     IF v_document_id IS NULL THEN
-        RAISE NOTICE 'Skipping chunk % - document % not found', '{legacy_id}', '{doc_id}';
+        RAISE NOTICE 'Skipping chunk % - document % not migrated', '{legacy_id}', v_old_doc_id;
         RETURN;
     END IF;
     
@@ -1046,7 +1338,7 @@ BEGIN
             v_chunk_id,
             v_document_id,
             {chunk_index},
-            {escape_sql_string(original_content)},
+            {escape_sql_string_with_dollar_quotes(original_content, 'ORIG')},
             {content_hash},
             'text'::chunks_content_type_enum,
             NULL,
@@ -1054,10 +1346,10 @@ BEGIN
             {word_count},
             {chunk_metadata_sql},
             {created_at_sql},
-            {escape_sql_string(translated_content) if translated_content else 'NULL'}
+            {escape_sql_string_with_dollar_quotes(translated_content, 'TRANS') if translated_content else 'NULL'}
         );
     END IF;
-END $$;
+END ${outer_tag}$;
 """
     
     # Generate embedding INSERT (only if embeddings exist)
@@ -1069,17 +1361,19 @@ END $$;
         else:
             embeddings_value = str(embeddings)
         
+        # Use a named tag for the outer DO block (consistent with chunk block)
+        emb_tag = 'emb_fn'
+        
         embedding_sql = f"""
 -- Embedding for chunk {legacy_id}
-DO $$
+DO ${emb_tag}$
 DECLARE
     v_chunk_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}');
+    v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
 BEGIN
-    -- Get document_id (same as chunk)
-    SELECT id INTO v_document_id
-    FROM documents
-    WHERE metadata->'legacyData'->>'doc_id' = '{doc_id}';
+    -- Lookup document_id from migration mapping table (FAST)
+    v_document_id := migration.get_new_id('documents', v_old_doc_id);
     
     IF v_document_id IS NULL THEN
         RETURN;
@@ -1106,7 +1400,7 @@ BEGIN
             {created_at_sql}
         );
     END IF;
-END $$;
+END ${emb_tag}$;
 """
     
     # Combine both SQLs
@@ -1122,7 +1416,7 @@ def generate_chunks_embeddings_migration_sql(
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    default_embedding_model: str = 'BAAI/bge-m3',
+    default_embedding_model: str = 'text-embedding-ada-002',
     skip_empty_embeddings: bool = False
 ) -> Dict[str, Any]:
     """
@@ -1141,6 +1435,9 @@ def generate_chunks_embeddings_migration_sql(
         Dictionary with generation stats
     """
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    # Clean up old chunks/embeddings migration files
+    cleanup_old_migration_files(output_file, '04_chunks_embeddings_')
     
     # Group by doc_id to assign chunk_index
     jeen_dev_df['doc_id_from_metadata'] = jeen_dev_df['metadata'].apply(
@@ -1179,6 +1476,9 @@ def generate_chunks_embeddings_migration_sql(
 -- Default embedding model: {default_embedding_model}
 -- Skip rows without embeddings: {skip_empty_embeddings}
 -- ============================================================
+
+-- Ensure PostgreSQL interprets this file as UTF-8 (required for Hebrew/multilingual content)
+SET client_encoding = 'UTF8';
 
 -- Ensure uuid-ossp extension is available
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -1221,6 +1521,10 @@ END $$;
 
 """
         sql_file.write(header)
+        
+        # Include migration schema setup (idempotent - safe if already exists in this DB)
+        sql_file.write(generate_migration_schema_setup())
+        sql_file.write('\n')
         
         # Write individual INSERT statements
         for _, row in jeen_dev_sorted.iterrows():
@@ -1304,6 +1608,9 @@ def generate_conversations_logs_migration_sql(
     """
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
+    # Clean up old conversations migration files
+    cleanup_old_migration_files(output_file, '05_conversations_')
+    
     # Filter: only rows with user_id and chat_id
     logs_df = logs_df[
         logs_df['user_id'].notna() & 
@@ -1355,6 +1662,9 @@ def generate_conversations_logs_migration_sql(
 -- Multi-INSERT format: grouped by user, max {max_records_per_insert} conversations per INSERT
 -- ============================================================
 
+-- Ensure PostgreSQL interprets this file as UTF-8 (required for Hebrew/multilingual content)
+SET client_encoding = 'UTF8';
+
 -- Ensure uuid-ossp extension is available
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -1396,6 +1706,10 @@ END $$;
 """
         sql_file.write(header)
         
+        # Include migration schema setup (idempotent - safe if already exists in this DB)
+        sql_file.write(generate_migration_schema_setup())
+        sql_file.write('\n')
+        
         # Group by user_id
         for user_id, user_logs in logs_df.groupby('user_id'):
             users_processed += 1
@@ -1411,7 +1725,7 @@ END $$;
                 
                 # Aggregate conversation data
                 latest_row = chat_logs_sorted.iloc[-1]
-                title = clean_string(latest_row.get('title', f'Conversation {chat_id[:8]}'))
+                title = clean_string(latest_row.get('title')) or f'Conversation {chat_id[:8]}'
                 message_count = len(chat_logs_sorted) * 2  # user + assistant per row
                 total_tokens = int(chat_logs_sorted['token_amount'].fillna(0).sum())
                 created_at = chat_logs_sorted['created_at'].min()
@@ -1443,9 +1757,9 @@ END $$;
                     conv_values.append(
                         f"    ('{conv['chat_id']}'::uuid, {escape_sql_string(conv['title'])}, "
                         f"{conv['message_count']}, {conv['total_tokens']}, "
-                        f"true, NULL, '{created_at_str}'::timestamptz, '{updated_at_str}'::timestamptz, "
+                        f"true, NULL::timestamp, '{created_at_str}'::timestamptz, '{updated_at_str}'::timestamptz, "
                         f"'{updated_at_str}'::timestamptz, "
-                        f"(SELECT id FROM users WHERE metadata->'legacyData'->>'id' = '{user_id}'))"
+                        f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)}))"
                     )
                 
                 conv_values_joined = ',\n'.join(conv_values)
@@ -1455,8 +1769,7 @@ SELECT * FROM (
   VALUES
 {conv_values_joined}
 ) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
-WHERE v.user_id IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
+WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 
 """)
                 conversations_processed += len(conv_batch)
@@ -1478,13 +1791,13 @@ WHERE v.user_id IS NOT NULL
                         assistant_msg_id = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-assistant')"
                         
                         # User message
-                        user_parent = f"'{prev_assistant_msg_id}'" if prev_assistant_msg_id else 'NULL'
+                        user_parent = f"'{prev_assistant_msg_id}'" if prev_assistant_msg_id else 'NULL::uuid'
                         user_created_at = f"'{created_at_str}'::timestamptz - interval '1 second'" if pd.notna(created_at) else 'now()'
                         
                         msg_values.append(
                             f"    ({user_msg_id}, '{conv['chat_id']}'::uuid, {user_parent}, 'user'::messages_role_enum, "
-                            f"false, 1, 1, NULL, {user_created_at}, {user_created_at}, NULL, "
-                            f"(SELECT id FROM users WHERE metadata->'legacyData'->>'id' = '{user_id}'), '{{}}'::jsonb)"
+                            f"false, 1, 1, NULL::text, {user_created_at}, {user_created_at}, NULL::timestamp, "
+                            f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)}), '{{}}'::jsonb)"
                         )
                         
                         # Assistant message
@@ -1530,8 +1843,8 @@ WHERE v.user_id IS NOT NULL
                         
                         msg_values.append(
                             f"    ({assistant_msg_id}, '{conv['chat_id']}'::uuid, {user_msg_id}, 'assistant'::messages_role_enum, "
-                            f"false, 1, 1, 'stop', '{created_at_str}'::timestamptz, '{created_at_str}'::timestamptz, NULL, "
-                            f"(SELECT id FROM users WHERE metadata->'legacyData'->>'id' = '{user_id}'), {metadata_escaped})"
+                            f"false, 1, 1, 'stop', '{created_at_str}'::timestamptz, '{created_at_str}'::timestamptz, NULL::timestamp, "
+                            f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)}), {metadata_escaped})"
                         )
                         
                         # Content blocks
@@ -1551,7 +1864,7 @@ WHERE v.user_id IS NOT NULL
                         block_values.append(
                             f"    (uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-user-block-0'), "
                             f"{user_msg_id}, 0, 'message'::message_content_blocks_type_enum, "
-                            f"{user_content_escaped}, NULL, {user_created_at})"
+                            f"{user_content_escaped}, NULL::integer, {user_created_at})"
                         )
                         
                         # Assistant content block
@@ -1564,7 +1877,7 @@ WHERE v.user_id IS NOT NULL
                         assistant_content_escaped = escape_json_for_sql(assistant_content)
                         
                         calc_time = int(log_row.get('calculated_time', 0)) if pd.notna(log_row.get('calculated_time')) else None
-                        exec_time_sql = str(calc_time) if calc_time is not None else 'NULL'
+                        exec_time_sql = str(calc_time) if calc_time is not None else 'NULL::integer'
                         
                         block_values.append(
                             f"    (uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-assistant-block-0'), "
@@ -1586,8 +1899,7 @@ SELECT * FROM (
   VALUES
 {msg_values_joined}
 ) AS v(id, conversation_id, parent_message_id, role, has_tool_calls, iteration_count, content_block_count, finish_reason, created_at, updated_at, deleted_at, user_id, metadata)
-WHERE v.user_id IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id);
+WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id);
 
 """)
                 
@@ -1624,4 +1936,450 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
     }
 
 
-# TODO: Add agents migration if needed
+def _parse_jsonb(val) -> Optional[dict]:
+    """Parse a JSONB column from DataFrame (could be dict, JSON string, or None)."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val.replace("'", '"'))
+        except:
+            return None
+    return None
+
+
+def _safe_get(d: Optional[dict], key: str, default=None):
+    """Safely get a key from a dict that might be None."""
+    if d is None:
+        return default
+    return d.get(key, default)
+
+
+def generate_agent_insert(
+    row: pd.Series,
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+) -> Optional[str]:
+    """
+    Generate INSERT statements for a single agent (agents + agent_settings + agent_documents).
+    
+    Extracts all JSONB fields in Python and generates a self-contained DO block.
+    
+    Args:
+        row: Pandas Series with playground_bot_generator_config data
+        namespace_uuid: Fixed namespace UUID for deterministic IDs
+        
+    Returns:
+        SQL statements or None to skip
+    """
+    bot_id = clean_string(row.get('bot_id'))
+    user_id = clean_string(row.get('user_id'))
+    folder_id = clean_string(row.get('folder_id'))
+    
+    if not bot_id:
+        return None
+    
+    # Parse JSONB columns
+    bot_data = _parse_jsonb(row.get('bot_data'))
+    toolkit_settings = _parse_jsonb(row.get('toolkit_settings'))
+    character_prompts = _parse_jsonb(row.get('character_prompts'))
+    hack_prompt = _parse_jsonb(row.get('hack_prompt'))
+    analysis_prompt = _parse_jsonb(row.get('analysis_prompt'))
+    grade_prompt = _parse_jsonb(row.get('grade_prompt'))
+    relevant_answer_prompt = _parse_jsonb(row.get('relevant_answer_prompt'))
+    additional_links_title = _parse_jsonb(row.get('additional_links_title'))
+    
+    # Extract fields
+    bot_name = clean_string(_safe_get(bot_data, 'bot_name')) or 'Unnamed Agent'
+    bot_description = (_safe_get(bot_data, 'bot_description') or '')[:2048]
+    first_message = clean_string(row.get('first_message'))
+    
+    # Derive agent_type
+    if _safe_get(toolkit_settings, 'workflow_mode') is not None:
+        agent_type = 'workflow'
+    elif (str(_safe_get(analysis_prompt, 'is_selected', '')).lower() == 'true' or
+          str(_safe_get(grade_prompt, 'is_selected', '')).lower() == 'true' or
+          str(_safe_get(relevant_answer_prompt, 'is_selected', '')).lower() == 'true'):
+        agent_type = 'cortex'
+    else:
+        agent_type = 'spark'
+    
+    # Avatar URL
+    avatar_url = None
+    if toolkit_settings:
+        assistant_icon = _safe_get(toolkit_settings, 'assistantIcon')
+        if isinstance(assistant_icon, dict):
+            avatar_url = _safe_get(assistant_icon, 'url')
+        if not avatar_url:
+            avatar_url = _safe_get(toolkit_settings, 'logo_url')
+    if avatar_url:
+        avatar_url = str(avatar_url)[:512]
+    
+    # is_active
+    is_active = True
+    if toolkit_settings and _safe_get(toolkit_settings, 'is_active') == 'Yes':
+        is_active = True
+    elif toolkit_settings and _safe_get(toolkit_settings, 'is_active') is not None:
+        is_active = _safe_get(toolkit_settings, 'is_active') == 'Yes'
+    
+    # Model (fallback chain)
+    model = None
+    for prompt_data in [character_prompts, hack_prompt, analysis_prompt, relevant_answer_prompt]:
+        m = clean_string(_safe_get(prompt_data, 'model'))
+        if m:
+            model = m[:128]
+            break
+    
+    # Instructions
+    instructions = clean_string(_safe_get(character_prompts, 'content'))
+    
+    # Enabled tools
+    enabled_tools = []
+    ts_data = _safe_get(toolkit_settings, 'data') if toolkit_settings else None
+    if isinstance(ts_data, dict):
+        enabled_tools = [k for k, v in ts_data.items() if str(v).lower() == 'true']
+    enabled_tools_sql = escape_json_for_sql(enabled_tools)
+    
+    # Conversation starters
+    if first_message and first_message.strip():
+        conversation_starters_sql = escape_json_for_sql([first_message])
+    else:
+        conversation_starters_sql = escape_json_for_sql([])
+    
+    # RAG settings
+    base_answers_on_files_only = False
+    for src in [toolkit_settings, relevant_answer_prompt]:
+        val = _safe_get(src, 'isAnswerBasedOnBestGrade')
+        if val is not None:
+            base_answers_on_files_only = str(val).lower() == 'true'
+            break
+    
+    retrieved_context_size = None
+    for src_key in [('vectorsNumber', toolkit_settings), ('vectorsNumber', _safe_get(grade_prompt, 'vectors') if grade_prompt else None)]:
+        val = _safe_get(src_key[1], src_key[0])
+        if val is not None:
+            try:
+                retrieved_context_size = int(val)
+            except:
+                pass
+            break
+    
+    re_rank_score = None
+    for src_key in [('passingGrade', toolkit_settings), ('passingGrade', _safe_get(grade_prompt, 'vectors') if grade_prompt else None)]:
+        val = _safe_get(src_key[1], src_key[0])
+        if val is not None:
+            try:
+                re_rank_score = round(float(val) / 100.0, 4)
+            except:
+                pass
+            break
+    
+    search_in_english = False
+    if toolkit_settings and _safe_get(toolkit_settings, 'inputVectorsLanguage') == 'To English':
+        search_in_english = True
+    
+    # Questions selected flags
+    qs = _safe_get(toolkit_settings, 'questions_selected') if toolkit_settings else None
+    show_source_links = False
+    show_source_text = False
+    follow_up_questions = False
+    if isinstance(qs, (list, dict)):
+        qs_items = qs if isinstance(qs, list) else list(qs.keys())
+        show_source_links = 'Display the source link' in qs_items
+        show_source_text = 'Display the source text' in qs_items
+        follow_up_questions = 'Follow-up questions' in qs_items
+    
+    additional_links = False
+    if additional_links_title and str(_safe_get(additional_links_title, 'is_selected', '')).lower() == 'true':
+        additional_links = True
+    
+    # Parse timestamps
+    created_at_val = row.get('created_at')
+    if pd.notna(created_at_val):
+        try:
+            created_at_sql = f"'{pd.to_datetime(created_at_val).isoformat()}'::timestamptz"
+        except:
+            created_at_sql = 'now()'
+    else:
+        created_at_sql = 'now()'
+    
+    updated_at_val = row.get('updated_at')
+    if pd.notna(updated_at_val):
+        try:
+            updated_at_sql = f"'{pd.to_datetime(updated_at_val).isoformat()}'::timestamptz"
+        except:
+            updated_at_sql = created_at_sql
+    else:
+        updated_at_sql = created_at_sql
+    
+    last_activity_val = row.get('last_activity')
+    if pd.notna(last_activity_val):
+        try:
+            last_activity_sql = f"'{pd.to_datetime(last_activity_val).isoformat()}'::timestamptz"
+        except:
+            last_activity_sql = 'NULL::timestamp'
+    else:
+        last_activity_sql = 'NULL::timestamp'
+    
+    # Folder UUID SQL
+    if folder_id:
+        folder_id_sql = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{folder_id}')"
+    else:
+        folder_id_sql = 'NULL::uuid'
+    
+    # Parse docs_chosen and chosen_docs_folders
+    docs_chosen_raw = row.get('docs_chosen')
+    docs_chosen = []
+    if docs_chosen_raw is not None and not (isinstance(docs_chosen_raw, float) and pd.isna(docs_chosen_raw)):
+        if isinstance(docs_chosen_raw, list):
+            docs_chosen = [str(d).strip() for d in docs_chosen_raw if d and str(d).strip()]
+        elif isinstance(docs_chosen_raw, str):
+            # Could be PostgreSQL array format: {val1,val2,...}
+            cleaned = docs_chosen_raw.strip('{}')
+            if cleaned:
+                docs_chosen = [d.strip().strip('"') for d in cleaned.split(',') if d.strip()]
+    
+    folders_chosen_raw = row.get('chosen_docs_folders')
+    folders_chosen = []
+    if folders_chosen_raw is not None and not (isinstance(folders_chosen_raw, float) and pd.isna(folders_chosen_raw)):
+        if isinstance(folders_chosen_raw, list):
+            folders_chosen = [str(f).strip() for f in folders_chosen_raw if f is not None]
+        elif isinstance(folders_chosen_raw, str):
+            cleaned = folders_chosen_raw.strip('{}')
+            if cleaned:
+                folders_chosen = [f.strip() for f in cleaned.split(',') if f.strip()]
+    
+    # Build agent_documents SQL fragments
+    doc_inserts = ''
+    for doc_id in docs_chosen:
+        doc_inserts += f"""
+    -- Link document: {doc_id}
+    INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
+    SELECT
+        uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}'),
+        v_agent_id,
+        uuid_generate_v5('{DOC_NAMESPACE_UUID}'::uuid, '{doc_id}'),
+        true,
+        'document'::agent_documents_type_enum
+    WHERE NOT EXISTS (
+        SELECT 1 FROM agent_documents
+        WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}')
+    );
+    v_docs_linked := v_docs_linked + 1;
+"""
+    
+    for fid in folders_chosen:
+        doc_inserts += f"""
+    -- Link folder: {fid}
+    INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
+    SELECT
+        uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}'),
+        v_agent_id,
+        uuid_generate_v5('{namespace_uuid}'::uuid, '{fid}'),
+        true,
+        'folder'::agent_documents_type_enum
+    WHERE NOT EXISTS (
+        SELECT 1 FROM agent_documents
+        WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}')
+    );
+    v_docs_linked := v_docs_linked + 1;
+"""
+    
+    # Build the DO block
+    sql = f"""
+-- Agent: {bot_name[:60]} (bot_id: {bot_id})
+DO $agent_fn$
+DECLARE
+    v_agent_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-agent');
+    v_settings_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-settings');
+    v_user_id uuid := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)});
+    v_docs_linked integer := 0;
+BEGIN
+    -- Insert agent if not exists
+    IF NOT EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id) THEN
+        INSERT INTO agents (
+            id, name, description, type, user_id, avatar_url,
+            is_active, is_public, is_prebuilt, is_draft,
+            folder_id, created_at, updated_at, last_interacted_at, deleted_at
+        ) VALUES (
+            v_agent_id,
+            {escape_sql_string(bot_name[:128])},
+            {escape_sql_string(bot_description) if bot_description else 'NULL'},
+            '{agent_type}'::agents_type_enum,
+            v_user_id,
+            {escape_sql_string(avatar_url) if avatar_url else 'NULL'},
+            {str(is_active).lower()},
+            false,
+            false,
+            false,
+            {folder_id_sql},
+            {created_at_sql},
+            {updated_at_sql},
+            {last_activity_sql},
+            NULL::timestamp
+        );
+    END IF;
+    
+    -- Insert agent settings if not exists
+    IF NOT EXISTS (SELECT 1 FROM agent_settings WHERE agent_id = v_agent_id) THEN
+        INSERT INTO agent_settings (
+            id, agent_id, model, instructions, enabled_tools, conversation_starters,
+            workflow_flow_id, base_answers_on_files_only, combines_multiple_answers,
+            retrieved_context_size, re_rank_score, query_instructions,
+            search_in_english, show_source_links, show_source_text,
+            follow_up_questions, additional_links
+        ) VALUES (
+            v_settings_id,
+            v_agent_id,
+            {escape_sql_string(model) if model else 'NULL'},
+            {escape_sql_string_with_dollar_quotes(instructions, 'INSTR') if instructions else 'NULL'},
+            {enabled_tools_sql},
+            {conversation_starters_sql},
+            NULL::uuid,
+            {str(base_answers_on_files_only).lower()},
+            true,
+            {str(retrieved_context_size) if retrieved_context_size is not None else 'NULL::integer'},
+            {str(re_rank_score) if re_rank_score is not None else 'NULL::numeric'},
+            NULL::text,
+            {str(search_in_english).lower()},
+            {str(show_source_links).lower()},
+            {str(show_source_text).lower()},
+            {str(follow_up_questions).lower()},
+            {str(additional_links).lower()}
+        );
+    END IF;
+{doc_inserts}
+    -- Track in migration.id_mappings
+    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+    VALUES ('agents', '{bot_id}', v_agent_id, 'agents_migration',
+            'Type: {agent_type}. Docs linked: ' || v_docs_linked)
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+    
+    -- Track in legacy mapping table
+    INSERT INTO legacy_bot_to_agent_mapping (old_bot_id, new_agent_id, agent_type, bot_name)
+    VALUES ('{bot_id}', v_agent_id, '{agent_type}', {escape_sql_string(bot_name[:255])})
+    ON CONFLICT (old_bot_id) DO NOTHING;
+    
+    RAISE NOTICE 'Migrated agent: % (%) → %', {escape_sql_string(bot_name[:60])}, '{agent_type}', v_agent_id;
+END $agent_fn$;
+"""
+    return sql
+
+
+def generate_agents_migration_sql(
+    agents_df: pd.DataFrame,
+    output_file: str,
+    source_info: str,
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+) -> Dict[str, Any]:
+    """
+    Generate SQL migration file for agents from playground_bot_generator_config.
+    
+    Creates entries in 3 target tables:
+      - agents (main agent record)
+      - agent_settings (1:1 with agent)
+      - agent_documents (many-to-many with documents/folders)
+    
+    Uses pre-extracted DataFrame data to generate self-contained INSERT statements.
+    
+    Args:
+        agents_df: DataFrame with playground_bot_generator_config data
+        output_file: Path to output SQL file
+        source_info: Source database info string
+        namespace_uuid: Fixed namespace UUID for deterministic IDs
+        
+    Returns:
+        Dictionary with generation stats
+    """
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    # Clean up old agents migration files
+    cleanup_old_migration_files(output_file, '06_agents_')
+    
+    if len(agents_df) == 0:
+        return {
+            'file': output_file,
+            'agents_processed': 0,
+            'settings_processed': 0,
+            'documents_linked': 0
+        }
+    
+    agents_processed = 0
+    skipped_count = 0
+    
+    with open(output_file, 'w', encoding='utf-8') as sql_file:
+        # Write header
+        header = f"""-- ============================================================
+-- AGENTS MIGRATION SQL (from playground_bot_generator_config)
+-- ============================================================
+-- Generated: {datetime.now().isoformat()}
+-- Source: {source_info}
+-- Destination: agents + agent_settings + agent_documents
+-- Source rows: {len(agents_df)}
+-- 
+-- IMPORTANT: This script will INSERT data into 3 tables!
+-- IMPORTANT: Run users, folders, and documents migrations first!
+--
+-- Creates:
+--   1. agents (main agent record with deterministic UUID)
+--   2. agent_settings (1:1 settings for each agent)
+--   3. agent_documents (links to documents and folders)
+--   4. legacy_bot_to_agent_mapping (tracking table)
+--
+-- Uses deterministic UUID generation (uuid_generate_v5).
+-- Namespace UUID: {namespace_uuid}
+-- ============================================================
+
+-- Ensure PostgreSQL interprets this file as UTF-8 (required for Hebrew/multilingual content)
+SET client_encoding = 'UTF8';
+
+-- Ensure uuid-ossp extension is available
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+"""
+        sql_file.write(header)
+        
+        # Include migration schema setup (idempotent)
+        sql_file.write(generate_migration_schema_setup())
+        sql_file.write('\n')
+        
+        # Create legacy mapping table
+        sql_file.write("""-- ============================================================
+-- CREATE MAPPING TABLE FOR TRACKING
+-- ============================================================
+CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
+    old_bot_id VARCHAR(255) PRIMARY KEY,
+    new_agent_id UUID NOT NULL,
+    agent_type VARCHAR(50),
+    bot_name VARCHAR(255),
+    migrated_at TIMESTAMP DEFAULT now()
+);
+
+""")
+        
+        # Generate per-agent INSERT blocks
+        for _, row in agents_df.iterrows():
+            sql = generate_agent_insert(row, namespace_uuid)
+            if sql:
+                sql_file.write(sql)
+                sql_file.write('\n')
+                agents_processed += 1
+            else:
+                skipped_count += 1
+        
+        # Write summary footer
+        sql_file.write(f"""\n-- ============================================================
+-- MIGRATION SUMMARY
+-- ============================================================
+-- Agents processed: {agents_processed}
+-- Skipped (no bot_id): {skipped_count}
+-- ============================================================
+""")
+    
+    return {
+        'file': output_file,
+        'agents_processed': agents_processed,
+        'settings_processed': agents_processed,
+        'documents_linked': 0  # Tracked per-agent at runtime via RAISE NOTICE
+    }

@@ -767,7 +767,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         with col4:
             embedding_model = st.text_input(
                 "Embedding Model",
-                value="BAAI/bge-m3",
+                value="text-embedding-ada-002",
                 help="Default embedding model name for chunks/embeddings migration"
             )
         with col5:
@@ -778,7 +778,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             )
     else:
         org_id = "356b50f7-bcbd-42aa-9392-e1605f42f7a1"
-        embedding_model = "BAAI/bge-m3"
+        embedding_model = "text-embedding-ada-002"
         skip_empty_embeddings = False
     
     if st.button("🚀 Start Extraction", type="primary", use_container_width=True):
@@ -799,7 +799,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             generate_sql=generate_sql,
             export_csv=export_csv,
             organization_id=org_id if generate_sql else None,
-            embedding_model=embedding_model if generate_sql else 'BAAI/bge-m3',
+            embedding_model=embedding_model if generate_sql else 'text-embedding-ada-002',
             skip_empty_embeddings=skip_empty_embeddings if generate_sql else False
         )
         
@@ -857,8 +857,8 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             st.info("💡 These SQL files can be executed directly with: `psql -h <host> -U <user> -d <database> -f <file>.sql`")
             
             # Show the host folder path (volume mounted)
-            # Container path: /app/output/extract -> Host path: ./output/extract
-            host_folder = "output/extract"  # Relative to project root on host
+            # Container path: /app/output/migrations -> Host path: ./output/migrations
+            host_folder = "output/migrations"  # Relative to project root on host
             st.info(f"📂 **SQL files location (copy to File Explorer):**")
             st.code(host_folder, language=None)
             cols_sql = st.columns(3)
@@ -866,10 +866,12 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 if os.path.exists(filepath):
                     with cols_sql[i % 3]:
                         with open(filepath, "rb") as f:
+                            # Use actual filename with numbered prefix
+                            display_name = os.path.basename(filepath)
                             st.download_button(
-                                label=f"🗃️ {table}.sql",
+                                label=f"🗃️ {display_name}",
                                 data=f,
-                                file_name=os.path.basename(filepath),
+                                file_name=display_name,
                                 mime="text/plain",
                                 key=f"dl_sql_{table}"
                             )
@@ -880,21 +882,31 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 if os.path.exists(filepath):
                     file_size = os.path.getsize(filepath)
                     size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024 * 1024):.1f} MB"
-                    with st.expander(f"🗃️ {table}.sql ({size_str})"):
+                    # Use actual filename with numbered prefix
+                    display_name = os.path.basename(filepath)
+                    
+                    # Expander with inline download button
+                    col_exp, col_btn = st.columns([10, 1])
+                    with col_exp:
+                        expander_label = f"🗃️ {display_name} ({size_str})"
+                    with col_btn:
+                        with open(filepath, "rb") as f:
+                            st.download_button(
+                                label="💾",
+                                data=f,
+                                file_name=display_name,
+                                mime="text/plain",
+                                key=f"save_sql_{table}",
+                                help="Save SQL file"
+                            )
+                    
+                    with st.expander(expander_label):
                         with open(filepath, "r", encoding="utf-8") as f:
                             # Read first 50KB for preview (large files truncated)
                             content = f.read(50000)
                             if file_size > 50000:
                                 content += "\n\n-- [TRUNCATED - File too large for full preview] --"
                         st.code(content, language="sql")
-        
-        # Preview expanders
-        st.subheader("👁️ Data Preview")
-        for table, filepath in results.get("files", {}).items():
-            if os.path.exists(filepath):
-                with st.expander(f"📄 {table} ({results['summary'].get(table, 0)} rows)"):
-                    preview_df = pd.read_csv(filepath, nrows=100)
-                    st.dataframe(preview_df, use_container_width=True)
 
 
 def main():

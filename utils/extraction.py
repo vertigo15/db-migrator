@@ -37,7 +37,7 @@ class ExtractionEngine:
         generate_sql: bool = True,
         export_csv: bool = True,
         organization_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
-        embedding_model: str = 'BAAI/bge-m3',
+        embedding_model: str = 'text-embedding-ada-002',
         skip_empty_embeddings: bool = False
     ):
         """
@@ -172,7 +172,7 @@ class ExtractionEngine:
         
         # Generate SQL migration file if enabled
         if self.generate_sql and len(df) > 0:
-            sql_output_path = os.path.join(self.sql_output_dir, f"migrate_users_{self.timestamp}.sql")
+            sql_output_path = os.path.join(self.sql_output_dir, f"01_users_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
             try:
                 generate_users_migration_sql(
@@ -216,7 +216,7 @@ class ExtractionEngine:
         
         # Generate SQL migration file if enabled
         if self.generate_sql and len(df) > 0:
-            sql_output_path = os.path.join(self.sql_output_dir, f"migrate_folders_{self.timestamp}.sql")
+            sql_output_path = os.path.join(self.sql_output_dir, f"02_folders_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
             try:
                 generate_folders_migration_sql(
@@ -301,7 +301,7 @@ class ExtractionEngine:
         
         # Generate SQL migration file if enabled
         if self.generate_sql and len(df) > 0:
-            sql_output_path = os.path.join(self.sql_output_dir, f"migrate_documents_{self.timestamp}.sql")
+            sql_output_path = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
             try:
                 generate_documents_migration_sql(
@@ -311,7 +311,9 @@ class ExtractionEngine:
                 )
             except Exception as e:
                 # Log error but don't fail extraction
-                print(f"Warning: Failed to generate SQL for documents: {str(e)}")
+                import sys, traceback
+                print(f"Warning: Failed to generate SQL for documents: {str(e)}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
         
         return df, output_path
     
@@ -365,7 +367,7 @@ class ExtractionEngine:
         
         # Generate SQL migration file if enabled (chunks + embeddings combined)
         if self.generate_sql and len(df) > 0:
-            sql_output_path = os.path.join(self.sql_output_dir, f"migrate_chunks_embeddings_{self.timestamp}.sql")
+            sql_output_path = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (table: {get_table_name('embeddings', self.prefix)})"
             try:
                 generate_chunks_embeddings_migration_sql(
@@ -397,14 +399,22 @@ class ExtractionEngine:
         """
         table_name = get_table_name("agents", self.prefix)
         query = f"""
-            SELECT bot_id, user_id, bot_data, tags, folder_id, created_at
+            SELECT bot_id, user_id, bot_data, toolkit_settings, character_prompts,
+                   hack_prompt, analysis_prompt, grade_prompt, relevant_answer_prompt,
+                   first_message, additional_links_title, docs_chosen, chosen_docs_folders,
+                   folder_id, created_at, updated_at, last_activity, deleted_at, tags
             FROM public.{table_name}
-            WHERE 1=1
+            WHERE deleted_at IS NULL
         """
         params = []
         if selected_agent_ids is not None:
             if not selected_agent_ids:
-                empty_df = pd.DataFrame(columns=["bot_id", "user_id", "bot_data", "tags", "folder_id", "created_at"])
+                empty_df = pd.DataFrame(columns=[
+                    "bot_id", "user_id", "bot_data", "toolkit_settings", "character_prompts",
+                    "hack_prompt", "analysis_prompt", "grade_prompt", "relevant_answer_prompt",
+                    "first_message", "additional_links_title", "docs_chosen", "chosen_docs_folders",
+                    "folder_id", "created_at", "updated_at", "last_activity", "deleted_at", "tags"
+                ])
                 output_path = os.path.join(self.output_dir, f"agents_{self.timestamp}.csv")
                 if self.export_csv:
                     empty_df.to_csv(output_path, index=False)
@@ -421,6 +431,21 @@ class ExtractionEngine:
         output_path = os.path.join(self.output_dir, f"agents_{self.timestamp}.csv")
         if self.export_csv:
             df.to_csv(output_path, index=False)
+        
+        # Generate SQL migration file if enabled
+        if self.generate_sql and len(df) > 0:
+            sql_output_path = os.path.join(self.sql_output_dir, f"06_agents_{self.timestamp}.sql")
+            source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (table: playground_bot_generator_config)"
+            try:
+                from utils.sql_generator import generate_agents_migration_sql
+                generate_agents_migration_sql(
+                    agents_df=df,
+                    output_file=sql_output_path,
+                    source_info=source_info
+                )
+            except Exception as e:
+                # Log error but don't fail extraction
+                print(f"Warning: Failed to generate SQL for agents: {str(e)}")
         
         return df, output_path
     
@@ -456,7 +481,7 @@ class ExtractionEngine:
         
         # Generate SQL migration file if enabled (conversations + messages + blocks)
         if self.generate_sql and len(df) > 0:
-            sql_output_path = os.path.join(self.sql_output_dir, f"migrate_conversations_{self.timestamp}.sql")
+            sql_output_path = os.path.join(self.sql_output_dir, f"05_conversations_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
             try:
                 generate_conversations_logs_migration_sql(
@@ -513,7 +538,7 @@ class ExtractionEngine:
             
             # Track SQL generation
             if self.generate_sql and len(users_df) > 0:
-                sql_path = os.path.join(self.sql_output_dir, f"migrate_users_{self.timestamp}.sql")
+                sql_path = os.path.join(self.sql_output_dir, f"01_users_{self.timestamp}.sql")
                 if os.path.exists(sql_path):
                     results["sql_files"]["users"] = sql_path
             
@@ -546,7 +571,7 @@ class ExtractionEngine:
             
             # Track SQL generation
             if self.generate_sql and len(folders_df) > 0:
-                sql_path = os.path.join(self.sql_output_dir, f"migrate_folders_{self.timestamp}.sql")
+                sql_path = os.path.join(self.sql_output_dir, f"02_folders_{self.timestamp}.sql")
                 if os.path.exists(sql_path):
                     results["sql_files"]["folders"] = sql_path
             
@@ -561,7 +586,7 @@ class ExtractionEngine:
             
             # Track SQL generation
             if self.generate_sql and len(docs_df) > 0:
-                sql_path = os.path.join(self.sql_output_dir, f"migrate_documents_{self.timestamp}.sql")
+                sql_path = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
                 if os.path.exists(sql_path):
                     results["sql_files"]["documents"] = sql_path
             
@@ -578,7 +603,7 @@ class ExtractionEngine:
                 
                 # Track SQL generation (chunks + embeddings combined)
                 if self.generate_sql and len(embeddings_df) > 0:
-                    sql_path = os.path.join(self.sql_output_dir, f"migrate_chunks_embeddings_{self.timestamp}.sql")
+                    sql_path = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
                     if os.path.exists(sql_path):
                         results["sql_files"]["chunks_embeddings"] = sql_path
             else:
@@ -591,6 +616,12 @@ class ExtractionEngine:
             results["files"]["agents"] = agents_path
             results["summary"]["agents"] = len(agents_df)
             
+            # Track SQL generation for agents
+            if self.generate_sql and len(agents_df) > 0:
+                sql_path = os.path.join(self.sql_output_dir, f"06_agents_{self.timestamp}.sql")
+                if os.path.exists(sql_path):
+                    results["sql_files"]["agents"] = sql_path
+            
             # 7. Extract logs (conversations/messages)
             current_step += 1
             self._report_progress("logs", current_step, total_steps)
@@ -600,7 +631,7 @@ class ExtractionEngine:
             
             # Track SQL generation (conversations + messages + content_blocks)
             if self.generate_sql and len(logs_df) > 0:
-                sql_path = os.path.join(self.sql_output_dir, f"migrate_conversations_{self.timestamp}.sql")
+                sql_path = os.path.join(self.sql_output_dir, f"05_conversations_{self.timestamp}.sql")
                 if os.path.exists(sql_path):
                     results["sql_files"]["conversations"] = sql_path
             
