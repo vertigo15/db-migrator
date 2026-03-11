@@ -1,7 +1,7 @@
 -- ============================================================
 -- USERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-01T16:47:23.311805
+-- Generated: 2026-03-02T14:15:34.154602
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: user_db.public.users
 -- Records to migrate: 1
@@ -114,7 +114,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: user_db.public.users';
     RAISE NOTICE 'Organization ID: 356b50f7-bcbd-42aa-9392-e1605f42f7a1';
-    RAISE NOTICE 'Generated: 2026-03-01T16:47:23.311805';
+    RAISE NOTICE 'Generated: 2026-03-02T14:15:34.154602';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -141,7 +141,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('users_20260301_164723', 'users', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('users_20260302_141534', 'users', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
@@ -205,7 +205,7 @@ BEGIN
         'users',
         v_old_id,
         v_new_id,
-        'users_20260301_164723',
+        'users_20260302_141534',
         'Migrated from V4 users table'
     );
     
@@ -215,7 +215,7 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'users_20260301_164723';
+WHERE batch_id = 'users_20260302_141534';
 
 -- Total records processed: 1
 -- Skipped (no email): 0

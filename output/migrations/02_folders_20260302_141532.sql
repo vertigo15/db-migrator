@@ -1,9 +1,9 @@
 -- ============================================================
--- DOCUMENTS MIGRATION SQL
+-- FOLDERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-01T16:47:25.773686
+-- Generated: 2026-03-02T14:15:35.447643
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
--- Destination: document_db.public.documents
+-- Destination: document_db.public.folders
 -- Records to migrate: 1
 -- 
 -- IMPORTANT: This script will INSERT records into the target database!
@@ -110,11 +110,11 @@ DECLARE
 BEGIN
     RAISE NOTICE '';
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'DOCUMENTS MIGRATION - CONFIRMATION REQUIRED';
+    RAISE NOTICE 'FOLDERS MIGRATION - CONFIRMATION REQUIRED';
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'This script will migrate 1 records to: document_db.public.documents';
+    RAISE NOTICE 'This script will migrate 1 records to: document_db.public.folders';
     
-    RAISE NOTICE 'Generated: 2026-03-01T16:47:25.773686';
+    RAISE NOTICE 'Generated: 2026-03-02T14:15:35.447643';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -136,99 +136,72 @@ END $$;
 --   \\quit
 -- \\endif
 
--- Ensure UUID extensions are available
--- Note: gen_random_uuid() is built-in for PostgreSQL 13+
+-- Ensure uuid-ossp extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('documents_20260301_164725', 'documents', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)", "namespace_uuid": "0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b"}'::jsonb)
+VALUES ('folders_20260302_141535', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
--- IMPORTANT: Users and folders must be migrated FIRST!
--- Documents reference both users (owner_id) and folders (folder_id)
 
-
--- Document: סיכום למבחן אחזור מידע (1).pdf (owner: de0ff05457533c93fdf3e0d1cdd0f808)
+-- Folder: adi test (owner: de0ff05457533c93fdf3e0d1cdd0f808)
 DO $$
 DECLARE
-    v_old_doc_id VARCHAR := 'de0ff05457533c93fdf3e0d1cdd0f808/data/1756207659351-0c8cd1917d00e951630029e4978e9147.pdf';
+    v_old_folder_id VARCHAR := '1168';
     v_old_owner_id VARCHAR := 'de0ff05457533c93fdf3e0d1cdd0f808';
-    v_old_folder_id VARCHAR := NULL;
-    v_new_doc_id UUID := uuid_generate_v5('b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'::uuid, v_old_doc_id);
-    v_user_id UUID := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, v_old_owner_id);
-    v_folder_id UUID;
+    v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
+    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, v_old_owner_id);
 BEGIN
-    -- Check if document already migrated using mapping table (FAST)
-    IF migration.is_migrated('documents', v_old_doc_id) THEN
-        RAISE NOTICE 'Document % already migrated', v_old_doc_id;
+    -- Check if folder already migrated using mapping table (FAST)
+    IF migration.is_migrated('folders', v_old_folder_id) THEN
+        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
         RETURN;
     END IF;
     
-    -- Lookup folder via mapping table if folder specified (same DB - document_db)
-    IF v_old_folder_id IS NOT NULL THEN
-        v_folder_id := migration.get_new_id('folders', v_old_folder_id);
-    END IF;
-    
-    -- Insert document
-    INSERT INTO document_db.public.documents (
+    -- Insert folder
+    INSERT INTO document_db.public.folders (
         id,
-        status,
-        file_name,
-        file_size,
-        storage_type,
-        storage_path,
-        storage_id,
-        metadata,
+        folder_name,
+        parent_id,
+        folder_type,
+        user_id,
         created_at,
         updated_at,
-        deleted_at,
-        folder_id,
-        user_id,
-        content_type,
-        parsing_technique_id,
-        source_type,
-        organization_id
+        deleted_at
     ) VALUES (
-        v_new_doc_id,
-        'PROCESSED'::public.documents_status_enum,
-        'סיכום למבחן אחזור מידע (1).pdf',
-        1713056,
-        'azure',
-        'de0ff05457533c93fdf3e0d1cdd0f808/data/1756207659351-0c8cd1917d00e951630029e4978e9147.pdf',
-        NULL,
-        '{"name": "סיכום למבחן אחזור מידע (1).pdf", "source": "legacy-migration", "legacyData": {"doc_id": "de0ff05457533c93fdf3e0d1cdd0f808/data/1756207659351-0c8cd1917d00e951630029e4978e9147.pdf", "doc_title": "סיכום למבחן אחזור מידע (1).pdf", "doc_description": null, "doc_summery": null, "doc_summery_modified_by": null, "doc_summery_modified_at": null, "tags": [], "embedding_model": null, "vector_methods": null, "version": "2", "doc_checksum": "a6afc94d6461f26718147db40ad29e52b244ad35801386154f6f7078c307e184", "data_integration_doc_metadata": null}}'::jsonb,
-        '2025-08-26T11:27:40.618916',
-        now(),
-        NULL,
         v_folder_id,
-        v_user_id::varchar(255),
-        'application/pdf',
+        'adi test',
         NULL,
-        'upload'::public.documents_source_type_enum,
+        'document'::public.folders_folder_type_enum,
+        v_user_id,
+        '2025-08-26T11:25:49.823742',
+        now(),
         NULL
     );
     
-    -- Store document ID mapping
+    -- Store folder ID mapping
     INSERT INTO migration.id_mappings (
         table_name,
         old_id,
         new_id,
         migration_batch
     ) VALUES (
-        'documents',
-        v_old_doc_id,
-        v_new_doc_id,
-        'documents_20260301_164725'
+        'folders',
+        v_old_folder_id,
+        v_folder_id,
+        'folders_20260302_141535'
     );
     
-    RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
+    RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;
 
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'documents_20260301_164725';
+WHERE batch_id = 'folders_20260302_141535';
 
--- Total documents processed: 1
--- Skipped (no doc_id): 0
+-- Total folders processed: 1
+-- Skipped (no ID): 0
+-- Note: Folders inserted in parent-first order using deterministic UUIDs (uuid_generate_v5)
+-- Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b

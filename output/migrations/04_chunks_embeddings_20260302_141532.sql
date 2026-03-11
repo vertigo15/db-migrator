@@ -1,7 +1,7 @@
 -- ============================================================
 -- CHUNKS & EMBEDDINGS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-01T16:47:28.330107
+-- Generated: 2026-03-02T14:15:37.495155
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (table: jeen_dev)
 -- Destination: chunks + embeddings tables
 -- Records to migrate: 223
@@ -37,7 +37,7 @@ BEGIN
     RAISE NOTICE 'This script will migrate 223 chunks/embeddings';
     RAISE NOTICE 'Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b';
     RAISE NOTICE 'Default embedding model: text-embedding-ada-002';
-    RAISE NOTICE 'Generated: 2026-03-01T16:47:28.330161';
+    RAISE NOTICE 'Generated: 2026-03-02T14:15:37.495198';
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'PREREQUISITE: Users, folders, and documents must be migrated first!';
     RAISE NOTICE '============================================================';
