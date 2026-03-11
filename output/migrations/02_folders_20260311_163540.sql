@@ -1,9 +1,9 @@
 -- ============================================================
--- USERS MIGRATION SQL
+-- FOLDERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-11T08:24:43.069872
+-- Generated: 2026-03-11T16:35:42.988902
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
--- Destination: user_db.public.users
+-- Destination: document_db.public.folders
 -- Records to migrate: 1
 -- 
 -- IMPORTANT: This script will INSERT records into the target database!
@@ -110,11 +110,11 @@ DECLARE
 BEGIN
     RAISE NOTICE '';
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'USERS MIGRATION - CONFIRMATION REQUIRED';
+    RAISE NOTICE 'FOLDERS MIGRATION - CONFIRMATION REQUIRED';
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'This script will migrate 1 records to: user_db.public.users';
-    RAISE NOTICE 'Organization ID: 356b50f7-bcbd-42aa-9392-e1605f42f7a1';
-    RAISE NOTICE 'Generated: 2026-03-11T08:24:43.069872';
+    RAISE NOTICE 'This script will migrate 1 records to: document_db.public.folders';
+    
+    RAISE NOTICE 'Generated: 2026-03-11T16:35:42.988902';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -136,86 +136,72 @@ END $$;
 --   \\quit
 -- \\endif
 
--- Ensure UUID extensions are available
+-- Ensure uuid-ossp extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('users_20260311_082443', 'users', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('folders_20260311_163542', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
--- User: adi@jeen.ai
+-- Folder: adi test (owner: de0ff05457533c93fdf3e0d1cdd0f808)
 DO $$
 DECLARE
-    v_old_id VARCHAR := 'de0ff05457533c93fdf3e0d1cdd0f808';
-    v_email VARCHAR := 'adi@jeen.ai';
-    v_new_id UUID;
+    v_old_folder_id VARCHAR := '1168';
+    v_old_owner_id VARCHAR := 'de0ff05457533c93fdf3e0d1cdd0f808';
+    v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
+    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808');
 BEGIN
-    -- Check if already migrated using mapping table (FAST)
-    IF migration.is_migrated('users', v_old_id) THEN
-        RAISE NOTICE 'User % already migrated (old_id: %)', v_email, v_old_id;
+    -- Check if folder already migrated using mapping table (FAST)
+    IF migration.is_migrated('folders', v_old_folder_id) THEN
+        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
         RETURN;
     END IF;
     
-    -- Generate deterministic UUID (same namespace+input = same UUID across all databases)
-    v_new_id := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, v_old_id);
-    
-    -- Insert user
-    INSERT INTO user_db.public.users (
+    -- Insert folder
+    INSERT INTO document_db.public.folders (
         id,
-        email,
-        first_name,
-        last_name,
-        username,
-        avatar_url,
-        metadata,
+        folder_name,
+        parent_id,
+        folder_type,
+        user_id,
         created_at,
         updated_at,
-        deleted_at,
-        zitadel_user_id,
-        organization_id,
-        is_owner,
-        preferred_language
+        deleted_at
     ) VALUES (
-        v_new_id,
-        'adi@jeen.ai',
-        'adi',
+        v_folder_id,
+        'adi test',
         NULL,
-        'adi',
-        NULL,
-        '{"legacyData": {"id": "de0ff05457533c93fdf3e0d1cdd0f808", "job": null, "model": ["gemini-2.5-pro-preview-06-05", "gpt-oss-120b", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-4o"], "group_id": "1", "azure_oid": null, "department": null, "token_used": "287", "words_used": "141", "subfeatures": {"reasoning": false, "web_search": true, "control_panel": true, "reasoning_web": true, "see_all_agents": false, "create_new_agent": true, "read_aloud_message": false, "organizational_files": false}, "token_limit": "1000000", "company_name": null, "phone_number": null, "last_connected": "1770025989837", "letter_checkbox": null, "times_connected": "11", "enabled_features": ["admin", "sources", "automation", "chat", "voice"], "history_categories": ["tech", "tools", "ai"], "company_name_in_hebrew": null}}'::jsonb,
-        '2025-08-25T07:15:18.828417',
+        'document'::public.folders_folder_type_enum,
+        v_user_id,
+        '2025-08-26T11:25:49.823742',
         now(),
-        NULL,
-        NULL,
-        '356b50f7-bcbd-42aa-9392-e1605f42f7a1'::uuid,
-        false,
         NULL
     );
     
-    -- Store ID mapping for fast future lookups
+    -- Store folder ID mapping
     INSERT INTO migration.id_mappings (
         table_name,
         old_id,
         new_id,
-        migration_batch,
-        notes
+        migration_batch
     ) VALUES (
-        'users',
-        v_old_id,
-        v_new_id,
-        'users_20260311_082443',
-        'Migrated from V4 users table'
+        'folders',
+        v_old_folder_id,
+        v_folder_id,
+        'folders_20260311_163542'
     );
     
-    RAISE NOTICE 'Migrated user %: % → %', v_email, v_old_id, v_new_id;
+    RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;
 
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'users_20260311_082443';
+WHERE batch_id = 'folders_20260311_163542';
 
--- Total records processed: 1
--- Skipped (no email): 0
+-- Total folders processed: 1
+-- Skipped (no ID): 0
+-- Note: Folders inserted in parent-first order using deterministic UUIDs (uuid_generate_v5)
+-- Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b

@@ -1,7 +1,7 @@
 -- ============================================================
 -- DOCUMENTS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-11T08:24:45.138401
+-- Generated: 2026-03-11T16:35:43.649201
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: document_db.public.documents
 -- Records to migrate: 1
@@ -114,7 +114,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: document_db.public.documents';
     
-    RAISE NOTICE 'Generated: 2026-03-11T08:24:45.138401';
+    RAISE NOTICE 'Generated: 2026-03-11T16:35:43.649201';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -142,7 +142,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('documents_20260311_082445', 'documents', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)", "namespace_uuid": "0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b"}'::jsonb)
+VALUES ('documents_20260311_163543', 'documents', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)", "namespace_uuid": "0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 -- IMPORTANT: Users and folders must be migrated FIRST!
@@ -156,7 +156,7 @@ DECLARE
     v_old_owner_id VARCHAR := 'de0ff05457533c93fdf3e0d1cdd0f808';
     v_old_folder_id VARCHAR := NULL;
     v_new_doc_id UUID := uuid_generate_v5('b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'::uuid, v_old_doc_id);
-    v_user_id UUID := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, v_old_owner_id);
+    v_user_id UUID := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808');
     v_folder_id UUID;
 BEGIN
     -- Check if document already migrated using mapping table (FAST)
@@ -219,7 +219,7 @@ BEGIN
         'documents',
         v_old_doc_id,
         v_new_doc_id,
-        'documents_20260311_082445'
+        'documents_20260311_163543'
     );
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
@@ -228,7 +228,7 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'documents_20260311_082445';
+WHERE batch_id = 'documents_20260311_163543';
 
 -- Total documents processed: 1
 -- Skipped (no doc_id): 0

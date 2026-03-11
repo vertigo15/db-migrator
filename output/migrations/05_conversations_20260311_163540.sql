@@ -1,7 +1,7 @@
 -- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-11T08:24:49.065214
+-- Generated: 2026-03-11T16:35:46.956810
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: conversations + messages + message_content_blocks
 -- Source rows: 12
@@ -37,7 +37,7 @@ BEGIN
     RAISE NOTICE 'This script will migrate conversations and messages';
     RAISE NOTICE 'Source rows: 12';
     RAISE NOTICE 'Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b';
-    RAISE NOTICE 'Generated: 2026-03-11T08:24:49.065273';
+    RAISE NOTICE 'Generated: 2026-03-11T16:35:46.956991';
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'PREREQUISITE: Users must be migrated first!';
     RAISE NOTICE '============================================================';

@@ -45,6 +45,145 @@ TABLE_MAPPING = {
 }
 
 
+def verify_migration_result(base_config: ConnectionConfig, filename: str) -> dict:
+    """
+    After a successful migration, connect to the destination DB and return
+    live row counts for every affected table plus the latest batch_log entry.
+    """
+    # Resolve target DB and table list from the filename prefix
+    table_info = None
+    target_db = "user_db"
+    for prefix, info in TABLE_MAPPING.items():
+        if filename.startswith(prefix):
+            table_info = info
+            break
+    for prefix, db in DB_MAPPING.items():
+        if filename.startswith(prefix):
+            target_db = db
+            break
+
+    if not table_info:
+        return {"error": "Unknown migration type"}
+
+    db_config = ConnectionConfig(
+        host=base_config.host,
+        port=base_config.port,
+        database=target_db,
+        username=base_config.username,
+        password=base_config.password,
+    )
+
+    result = {
+        "target_db": target_db,
+        "tables": {},        # table -> total row count in destination
+        "batch_log": None,   # latest migration.batch_log entry
+        "migrated_ids": None,# count from migration.id_mappings
+        "error": None,
+    }
+
+    try:
+        conn = get_connection(db_config)
+        cursor = conn.cursor()
+
+        # ── Per-table row counts ──────────────────────────────────────────
+        for table in table_info["tables"]:
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM public.{table};")
+                result["tables"][table] = cursor.fetchone()[0]
+            except Exception:
+                result["tables"][table] = None
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+        # ── Latest batch_log entry ────────────────────────────────────────
+        try:
+            cursor.execute("""
+                SELECT batch_id, record_count, status, started_at, completed_at
+                FROM migration.batch_log
+                WHERE table_name = %s
+                ORDER BY started_at DESC
+                LIMIT 1
+            """, (table_info["mapping_table"],))
+            row = cursor.fetchone()
+            if row:
+                result["batch_log"] = {
+                    "batch_id":    row[0],
+                    "record_count": row[1],
+                    "status":      row[2],
+                    "started_at":  row[3],
+                    "completed_at": row[4],
+                }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        # ── Total tracked IDs ─────────────────────────────────────────────
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM migration.id_mappings
+                WHERE table_name = %s
+            """, (table_info["mapping_table"],))
+            result["migrated_ids"] = cursor.fetchone()[0]
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
+def render_verification(verif: dict) -> None:
+    """Render the destination verification block inside an expander."""
+    with st.expander("🔍 Destination Verification", expanded=True):
+        if verif.get("error"):
+            st.error(f"Verification error: {verif['error']}")
+            return
+
+        # Batch summary
+        bl = verif.get("batch_log")
+        if bl:
+            ts = bl["completed_at"].strftime("%Y-%m-%d %H:%M:%S") if bl.get("completed_at") else "—"
+            status_icon = "✅" if bl["status"] == "completed" else "⚠️"
+            st.markdown(
+                f"{status_icon} **Batch:** `{bl['batch_id']}`  "
+                f"| **Status:** `{bl['status']}`  "
+                f"| **Records in batch:** {bl['record_count']:,}  "
+                f"| **Completed:** {ts}"
+            )
+
+        # Per-table row counts as metrics
+        tables = verif.get("tables", {})
+        if tables:
+            cols = st.columns(max(len(tables), 1))
+            for i, (tbl, cnt) in enumerate(tables.items()):
+                with cols[i]:
+                    if cnt is not None:
+                        st.metric(label=f"📊 {tbl}", value=f"{cnt:,}")
+                    else:
+                        st.metric(label=f"📊 {tbl}", value="N/A")
+
+        # Tracked IDs footnote
+        mid = verif.get("migrated_ids")
+        if mid is not None:
+            st.caption(
+                f"🗂️ Total IDs tracked in `migration.id_mappings` "
+                f"for this table type: **{mid:,}**"
+            )
+
+        st.caption(f"Database: `{verif.get('target_db', '—')}`")
+
+
 def get_migration_files():
     """Get all migration SQL files sorted by prefix."""
     if not os.path.exists(MIGRATIONS_DIR):
@@ -285,14 +424,22 @@ def render_migration_files():
                     with st.spinner(f"Executing {filename} on {target_db}..."):
                         success, message, rows = execute_sql_file(db_config, file_info["path"])
                         
-                        # Store status
-                        st.session_state.migration_status[filename] = {
+                        status_entry = {
                             "success": success,
                             "message": message,
                             "rows_affected": rows,
                             "timestamp": datetime.now()
                         }
-                        
+
+                        # Verify destination tables on success
+                        if success:
+                            with st.spinner("Verifying destination tables..."):
+                                base_config = st.session_state["target_config"]
+                                status_entry["verification"] = verify_migration_result(
+                                    base_config, filename
+                                )
+
+                        st.session_state.migration_status[filename] = status_entry
                         st.rerun()
             
             with col4:
@@ -343,6 +490,10 @@ def render_migration_files():
                 
                 if status.get("timestamp"):
                     st.caption(f"Executed at: {status['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+
+                # Destination verification (only shown after a successful run)
+                if status.get("success") and "verification" in status:
+                    render_verification(status["verification"])
             
             # Show SQL preview
             with st.expander(f"📄 View SQL ({filename})"):
@@ -405,18 +556,24 @@ def render_migration_files():
                 )
                 
                 success, message, rows = execute_sql_file(db_config, file_info["path"])
-                
-                # Store status
-                st.session_state.migration_status[filename] = {
+
+                status_entry = {
                     "success": success,
                     "message": message,
                     "rows_affected": rows,
                     "timestamp": datetime.now()
                 }
-                
+
+                # Verify destination tables on success
+                if success:
+                    status_text.text(f"Verifying {idx + 1}/{len(migration_files)}: {filename}")
+                    status_entry["verification"] = verify_migration_result(base_config, filename)
+
+                st.session_state.migration_status[filename] = status_entry
+
                 # Update progress
                 progress_bar.progress((idx + 1) / len(migration_files))
-                
+
                 # Stop on first error
                 if not success:
                     st.error(f"Stopped at {filename}: {message}")
