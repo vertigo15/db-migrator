@@ -1,7 +1,7 @@
 -- ============================================================
 -- AGENTS MIGRATION SQL (from playground_bot_generator_config)
 -- ============================================================
--- Generated: 2026-03-02T14:15:38.595446
+-- Generated: 2026-03-11T08:24:48.292851
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (table: playground_bot_generator_config)
 -- Destination: agents + agent_settings + agent_documents
 -- Source rows: 1

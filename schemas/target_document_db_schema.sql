@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS public.chunks (
     document_id UUID NOT NULL,  -- References documents.id (FK possible!)
     chunk_text TEXT,
     chunk_index INTEGER,
-    embedding vector(1536),     -- Adjust dimension as needed
+    embedding vector(1024),     -- 1024 dims (E5-large); adjust if using a different model
     metadata JSONB,
     created_at TIMESTAMP DEFAULT now(),
     
@@ -100,7 +100,7 @@ COMMENT ON CONSTRAINT fk_chunks_document ON public.chunks IS 'FK to documents wi
 -- Next steps:
 -- 1. Ensure pgvector extension is installed if using embeddings:
 --    CREATE EXTENSION IF NOT EXISTS vector;
--- 2. Review vector dimension (default: 1536 for OpenAI)
+-- 2. Review vector dimension (default: 1024 for E5-large)
 -- 3. Run migration SQL files in order:
 --    - 02_folders_*.sql
 --    - 03_documents_*.sql

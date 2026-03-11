@@ -1137,6 +1137,62 @@ WHERE batch_id = '{batch_id}';
     }
 
 
+def truncate_embedding_vector(
+    embeddings_value: str,
+    target_dim: int = 1024,
+    warn_nonzero_tail: bool = True
+) -> str:
+    """
+    Truncate an embedding vector string from source dimension to target dimension.
+    
+    Used when the source embeddings were produced by a smaller model (e.g. E5-large
+    at 1024 dims) and zero-padded to a larger size (e.g. 1536) for storage.
+    Truncation strips the trailing zero-padded dimensions.
+    
+    Args:
+        embeddings_value: pgvector-format string, e.g. "[0.1,0.2,...,0.0]"
+        target_dim: Target dimension count (default 1024)
+        warn_nonzero_tail: If True, print a warning when truncated dims are non-zero
+        
+    Returns:
+        Truncated pgvector-format string with target_dim dimensions
+    """
+    if not embeddings_value:
+        return embeddings_value
+    
+    # Strip surrounding brackets and whitespace
+    cleaned = embeddings_value.strip()
+    if cleaned.startswith('['):
+        cleaned = cleaned[1:]
+    if cleaned.endswith(']'):
+        cleaned = cleaned[:-1]
+    
+    # Split into individual float strings
+    parts = [p.strip() for p in cleaned.split(',') if p.strip()]
+    source_dim = len(parts)
+    
+    # If already at or below target dim, return as-is
+    if source_dim <= target_dim:
+        return embeddings_value
+    
+    # Warn if truncated tail contains non-zero values
+    if warn_nonzero_tail:
+        tail = parts[target_dim:]
+        nonzero_count = sum(1 for v in tail if abs(float(v)) > 1e-9)
+        if nonzero_count > 0:
+            import sys
+            print(
+                f"WARNING: Truncating embedding from {source_dim} to {target_dim} dims, "
+                f"but {nonzero_count}/{len(tail)} truncated values are non-zero. "
+                f"This may indicate the vector was NOT zero-padded.",
+                file=sys.stderr
+            )
+    
+    # Truncate and re-serialize
+    truncated = parts[:target_dim]
+    return '[' + ','.join(truncated) + ']'
+
+
 def extract_content_from_document(document_text: str) -> tuple:
     """
     Extract original_content and translated_content from legacy document field.
@@ -1175,7 +1231,8 @@ def generate_chunk_and_embedding_inserts(
     chunk_index: int,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     default_embedding_model: str = 'text-embedding-ada-002',
-    skip_empty_embeddings: bool = False
+    skip_empty_embeddings: bool = False,
+    target_embedding_dim: Optional[int] = None
 ) -> Optional[str]:
     """
     Generate INSERT statements for BOTH chunk and embedding from a single source row.
@@ -1186,6 +1243,7 @@ def generate_chunk_and_embedding_inserts(
         namespace_uuid: Fixed namespace UUID for chunk_id generation
         default_embedding_model: Default model name if not specified
         skip_empty_embeddings: If True, skip rows without embeddings
+        target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
         
     Returns:
         SQL statements (both chunk and embedding) or None to skip
@@ -1361,6 +1419,12 @@ END ${outer_tag}$;
         else:
             embeddings_value = str(embeddings)
         
+        # Truncate embedding vector if target dimension is specified
+        if target_embedding_dim is not None:
+            embeddings_value = truncate_embedding_vector(
+                embeddings_value, target_embedding_dim
+            )
+        
         # Use a named tag for the outer DO block (consistent with chunk block)
         emb_tag = 'emb_fn'
         
@@ -1417,7 +1481,8 @@ def generate_chunks_embeddings_migration_sql(
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     default_embedding_model: str = 'text-embedding-ada-002',
-    skip_empty_embeddings: bool = False
+    skip_empty_embeddings: bool = False,
+    target_embedding_dim: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for chunks and embeddings tables.
@@ -1430,6 +1495,7 @@ def generate_chunks_embeddings_migration_sql(
         namespace_uuid: Fixed namespace UUID for chunk_id generation
         default_embedding_model: Default embedding model name
         skip_empty_embeddings: If True, skip rows without embeddings
+        target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
         
     Returns:
         Dictionary with generation stats
@@ -1475,6 +1541,7 @@ def generate_chunks_embeddings_migration_sql(
 -- Namespace UUID: {namespace_uuid}
 -- Default embedding model: {default_embedding_model}
 -- Skip rows without embeddings: {skip_empty_embeddings}
+-- Target embedding dimension: {target_embedding_dim or 'None (keep original)'}
 -- ============================================================
 
 -- Ensure PostgreSQL interprets this file as UTF-8 (required for Hebrew/multilingual content)
@@ -1533,7 +1600,8 @@ END $$;
                 chunk_index=int(row['chunk_index']),
                 namespace_uuid=namespace_uuid,
                 default_embedding_model=default_embedding_model,
-                skip_empty_embeddings=skip_empty_embeddings
+                skip_empty_embeddings=skip_empty_embeddings,
+                target_embedding_dim=target_embedding_dim
             )
             if sql:
                 sql_file.write(sql)
@@ -2122,9 +2190,9 @@ def generate_agent_insert(
     else:
         last_activity_sql = 'NULL::timestamp'
     
-    # Folder UUID SQL
+    # Folder UUID SQL — use mapping lookup so agents land at root if folder wasn't migrated
     if folder_id:
-        folder_id_sql = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{folder_id}')"
+        folder_id_sql = f"migration.get_new_id('folders', {escape_sql_string(folder_id)})"
     else:
         folder_id_sql = 'NULL::uuid'
     
@@ -2171,19 +2239,23 @@ def generate_agent_insert(
     
     for fid in folders_chosen:
         doc_inserts += f"""
-    -- Link folder: {fid}
-    INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-    SELECT
-        uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}'),
-        v_agent_id,
-        uuid_generate_v5('{namespace_uuid}'::uuid, '{fid}'),
-        true,
-        'folder'::agent_documents_type_enum
-    WHERE NOT EXISTS (
-        SELECT 1 FROM agent_documents
-        WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}')
-    );
-    v_docs_linked := v_docs_linked + 1;
+    -- Link folder: {fid} (skip if folder wasn't migrated)
+    IF migration.get_new_id('folders', {escape_sql_string(fid)}) IS NOT NULL THEN
+        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
+        SELECT
+            uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}'),
+            v_agent_id,
+            migration.get_new_id('folders', {escape_sql_string(fid)}),
+            true,
+            'folder'::agent_documents_type_enum
+        WHERE NOT EXISTS (
+            SELECT 1 FROM agent_documents
+            WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}')
+        );
+        v_docs_linked := v_docs_linked + 1;
+    ELSE
+        RAISE NOTICE 'Agent {bot_id}: skipping folder link {fid} — folder not migrated';
+    END IF;
 """
     
     # Build the DO block

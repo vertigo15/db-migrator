@@ -757,7 +757,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
     
     # SQL-specific options (shown only if SQL generation is enabled)
     if generate_sql:
-        col3, col4, col5 = st.columns([2, 2, 1])
+        col3, col4, col5, col6 = st.columns([2, 2, 1, 1])
         with col3:
             org_id = st.text_input(
                 "Org ID",
@@ -776,10 +776,22 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 value=False,
                 help="Skip rows without embeddings"
             )
+        with col6:
+            target_embedding_dim = st.number_input(
+                "Target dim",
+                min_value=0,
+                max_value=4096,
+                value=1024,
+                step=1,
+                help="Target embedding dimension. Source 1536 will be truncated to this value. Set to 0 to keep original dimension."
+            )
+            if target_embedding_dim == 0:
+                target_embedding_dim = None
     else:
         org_id = "356b50f7-bcbd-42aa-9392-e1605f42f7a1"
         embedding_model = "text-embedding-ada-002"
         skip_empty_embeddings = False
+        target_embedding_dim = None
     
     if st.button("🚀 Start Extraction", type="primary", use_container_width=True):
         # Create progress containers
@@ -800,7 +812,8 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             export_csv=export_csv,
             organization_id=org_id if generate_sql else None,
             embedding_model=embedding_model if generate_sql else 'text-embedding-ada-002',
-            skip_empty_embeddings=skip_empty_embeddings if generate_sql else False
+            skip_empty_embeddings=skip_empty_embeddings if generate_sql else False,
+            target_embedding_dim=target_embedding_dim if generate_sql else None
         )
         
         # Run extraction

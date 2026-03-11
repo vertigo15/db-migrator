@@ -38,7 +38,8 @@ class ExtractionEngine:
         export_csv: bool = True,
         organization_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
         embedding_model: str = 'text-embedding-ada-002',
-        skip_empty_embeddings: bool = False
+        skip_empty_embeddings: bool = False,
+        target_embedding_dim: Optional[int] = None
     ):
         """
         Initialize extraction engine.
@@ -53,6 +54,7 @@ class ExtractionEngine:
             organization_id: Organization UUID for SQL generation
             embedding_model: Default embedding model name for chunks/embeddings
             skip_empty_embeddings: Skip rows without embeddings in chunks/embeddings migration
+            target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
         """
         self.config = config
         self.prefix = prefix
@@ -63,6 +65,7 @@ class ExtractionEngine:
         self.organization_id = organization_id
         self.embedding_model = embedding_model
         self.skip_empty_embeddings = skip_empty_embeddings
+        self.target_embedding_dim = target_embedding_dim
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Ensure output directories exist
@@ -375,7 +378,8 @@ class ExtractionEngine:
                     output_file=sql_output_path,
                     source_info=source_info,
                     default_embedding_model=self.embedding_model,
-                    skip_empty_embeddings=self.skip_empty_embeddings
+                    skip_empty_embeddings=self.skip_empty_embeddings,
+                    target_embedding_dim=self.target_embedding_dim
                 )
             except Exception as e:
                 # Log error but don't fail extraction

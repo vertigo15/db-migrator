@@ -1,7 +1,7 @@
 -- ============================================================
 -- USERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-02T14:15:34.154602
+-- Generated: 2026-03-11T08:24:43.069872
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: user_db.public.users
 -- Records to migrate: 1
@@ -114,7 +114,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: user_db.public.users';
     RAISE NOTICE 'Organization ID: 356b50f7-bcbd-42aa-9392-e1605f42f7a1';
-    RAISE NOTICE 'Generated: 2026-03-02T14:15:34.154602';
+    RAISE NOTICE 'Generated: 2026-03-11T08:24:43.069872';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -141,7 +141,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('users_20260302_141534', 'users', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('users_20260311_082443', 'users', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
@@ -184,7 +184,7 @@ BEGIN
         NULL,
         'adi',
         NULL,
-        '{"legacyData": {"id": "de0ff05457533c93fdf3e0d1cdd0f808", "job": null, "model": ["gemini-2.5-pro-preview-06-05", "gpt-oss-120b", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-4o"], "group_id": "1", "azure_oid": null, "department": null, "token_used": "287", "words_used": "141", "subfeatures": {"reasoning": false, "web_search": true, "control_panel": true, "reasoning_web": true, "see_all_agents": false, "create_new_agent": true, "read_aloud_message": false, "organizational_files": false}, "token_limit": "1000000", "company_name": null, "phone_number": null, "last_connected": "1770025989837", "letter_checkbox": null, "times_connected": "11", "enabled_features": ["admin", "voice", "sources", "automation", "chat", "workflow", "interactive"], "history_categories": ["tech", "tools", "ai"], "company_name_in_hebrew": null}}'::jsonb,
+        '{"legacyData": {"id": "de0ff05457533c93fdf3e0d1cdd0f808", "job": null, "model": ["gemini-2.5-pro-preview-06-05", "gpt-oss-120b", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-4o"], "group_id": "1", "azure_oid": null, "department": null, "token_used": "287", "words_used": "141", "subfeatures": {"reasoning": false, "web_search": true, "control_panel": true, "reasoning_web": true, "see_all_agents": false, "create_new_agent": true, "read_aloud_message": false, "organizational_files": false}, "token_limit": "1000000", "company_name": null, "phone_number": null, "last_connected": "1770025989837", "letter_checkbox": null, "times_connected": "11", "enabled_features": ["admin", "sources", "automation", "chat", "voice"], "history_categories": ["tech", "tools", "ai"], "company_name_in_hebrew": null}}'::jsonb,
         '2025-08-25T07:15:18.828417',
         now(),
         NULL,
@@ -205,7 +205,7 @@ BEGIN
         'users',
         v_old_id,
         v_new_id,
-        'users_20260302_141534',
+        'users_20260311_082443',
         'Migrated from V4 users table'
     );
     
@@ -215,7 +215,7 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'users_20260302_141534';
+WHERE batch_id = 'users_20260311_082443';
 
 -- Total records processed: 1
 -- Skipped (no email): 0
