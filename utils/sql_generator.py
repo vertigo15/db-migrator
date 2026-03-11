@@ -23,6 +23,37 @@ DOC_NAMESPACE_UUID  = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step
 NAMESPACE_UUID      = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'   # Folders, agents, chunks, embeddings
 
 
+def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None) -> str:
+    """
+    Return a SQL expression that resolves a V4 user hash ID to a V5 user UUID.
+
+    If old_id is present in the overrides dict (user already exists in V5 with
+    a known UUID), the real V5 UUID is embedded directly into the SQL at
+    generation time — no runtime lookup required.
+
+    Otherwise falls back to the deterministic uuid_generate_v5 formula, which
+    is the standard path for users being migrated fresh.
+
+    This approach avoids cross-database issues: each SQL file runs against a
+    different target DB (user_db / document_db / completion_db) and only has
+    access to its own local migration.id_mappings.  Resolving at generation
+    time means the correct UUID is always embedded regardless of which DB the
+    script runs against.
+
+    Args:
+        old_id:    V4 legacy hash ID (e.g. 'de0ff05457533c93fdf3e0d1cdd0f808')
+        overrides: Optional dict mapping v4_old_id -> existing_v5_uuid string
+
+    Returns:
+        SQL expression string, e.g.:
+          "'7a1b2c3d-...'::uuid"                          (override path)
+          "uuid_generate_v5('...'::uuid, 'de0ff054...')" (default path)
+    """
+    if overrides and old_id and old_id in overrides:
+        return f"'{overrides[old_id]}'::uuid"
+    return f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(old_id)})"
+
+
 def cleanup_old_migration_files(output_file: str, file_prefix: str):
     """
     Delete old migration SQL files with the same prefix to avoid confusion.
@@ -338,14 +369,23 @@ END $$;
     return header
 
 
-def generate_user_insert(row: pd.Series, org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1') -> Optional[str]:
+def generate_user_insert(
+    row: pd.Series,
+    org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
+    user_id_overrides: Optional[Dict[str, str]] = None
+) -> Optional[str]:
     """
     Generate INSERT statement for a single user.
-    
+
+    If user_id_overrides contains an entry for this user's V4 id, the user
+    already exists in V5 with a different UUID.  In that case we skip the
+    INSERT and only register the mapping in migration.id_mappings for audit.
+
     Args:
         row: Pandas Series with user data
         org_id: Organization UUID
-        
+        user_id_overrides: Optional dict {v4_old_id: existing_v5_uuid}
+
     Returns:
         SQL INSERT statement or None to skip
     """
@@ -354,11 +394,30 @@ def generate_user_insert(row: pd.Series, org_id: str = '356b50f7-bcbd-42aa-9392-
     email = clean_string(row.get('email'))
     first_name = clean_string(row.get('name'))
     last_name = clean_string(row.get('last_name'))
-    
+
     # Skip if no email
     if not email:
         return None
-    
+
+    # --- OVERRIDE PATH: user already exists in V5 with a known UUID ---
+    if user_id_overrides and old_id and old_id in user_id_overrides:
+        v5_uuid = user_id_overrides[old_id]
+        return f"""
+-- User: {email} (OVERRIDE — already exists in V5)
+-- V4 old_id: {old_id}  →  V5 UUID: {v5_uuid}
+DO $$
+BEGIN
+    -- User already exists in V5; skip INSERT.
+    -- Register mapping in migration.id_mappings for audit and downstream tracking.
+    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+    VALUES ('users', {escape_sql_string(old_id)}, '{v5_uuid}'::uuid,
+            'user_overrides', 'Pre-existing V5 user — override supplied at migration time')
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+    RAISE NOTICE 'Skipped INSERT for user % — already exists in V5 as %',
+                 {escape_sql_string(email)}, '{v5_uuid}';
+END $$;
+"""
+
     # Generate username
     username = generate_username(email)
     
@@ -529,7 +588,8 @@ def generate_users_migration_sql(
     users_df: pd.DataFrame,
     output_file: str,
     source_info: str,
-    org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1'
+    org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
+    user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for users table.
@@ -581,7 +641,7 @@ ON CONFLICT (batch_id) DO NOTHING;
         
         # Write individual INSERT statements with batch_id substitution
         for _, row in users_df.iterrows():
-            sql = generate_user_insert(row, org_id)
+            sql = generate_user_insert(row, org_id, user_id_overrides)
             if sql:
                 # Replace batch placeholder with actual batch_id
                 sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
@@ -610,7 +670,11 @@ WHERE batch_id = '{batch_id}';
     }
 
 
-def generate_folder_insert(row: pd.Series, namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b') -> Optional[str]:
+def generate_folder_insert(
+    row: pd.Series,
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    user_id_overrides: Optional[Dict[str, str]] = None
+) -> Optional[str]:
     """
     Generate INSERT statement for a single folder.
     Uses deterministic UUID generation to maintain parent-child relationships.
@@ -661,7 +725,7 @@ DECLARE
     v_old_folder_id VARCHAR := {escape_sql_string(old_id)};
     v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
     v_folder_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_owner_id);
+    v_user_id uuid := {resolve_user_id_sql(owner_id, user_id_overrides)};
 BEGIN
     -- Check if folder already migrated using mapping table (FAST)
     IF migration.is_migrated('folders', v_old_folder_id) THEN
@@ -714,7 +778,8 @@ def generate_folders_migration_sql(
     folders_df: pd.DataFrame,
     output_file: str,
     source_info: str,
-    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for folders table.
@@ -771,7 +836,7 @@ ON CONFLICT (batch_id) DO NOTHING;
         
         # Write individual INSERT statements (sorted order)
         for _, row in folders_sorted.iterrows():
-            sql = generate_folder_insert(row, namespace_uuid)
+            sql = generate_folder_insert(row, namespace_uuid, user_id_overrides)
             if sql:
                 # Replace batch placeholder with actual batch_id
                 sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
@@ -835,7 +900,8 @@ def get_content_type(doc_type: Optional[str]) -> str:
 
 def generate_document_insert(
     row: pd.Series,
-    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single document.
@@ -968,7 +1034,7 @@ DECLARE
     v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
     v_old_folder_id VARCHAR := {escape_sql_string(folder_id) if folder_id else 'NULL'};
     v_new_doc_id UUID := uuid_generate_v5('{DOC_NAMESPACE_UUID}'::uuid, v_old_doc_id);
-    v_user_id UUID := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_owner_id);
+    v_user_id UUID := {resolve_user_id_sql(owner_id, user_id_overrides)};
     v_folder_id UUID;
 BEGIN
     -- Check if document already migrated using mapping table (FAST)
@@ -1045,7 +1111,8 @@ def generate_documents_migration_sql(
     documents_df: pd.DataFrame,
     output_file: str,
     source_info: str,
-    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for documents table.
@@ -1102,7 +1169,7 @@ ON CONFLICT (batch_id) DO NOTHING;
         # Write individual INSERT statements with batch_id substitution
         for _, row in documents_df.iterrows():
             try:
-                sql = generate_document_insert(row, namespace_uuid)
+                sql = generate_document_insert(row, namespace_uuid, user_id_overrides)
                 if sql:
                     # Replace batch placeholder with actual batch_id
                     sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
@@ -1655,7 +1722,8 @@ def generate_conversations_logs_migration_sql(
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    max_records_per_insert: int = 50
+    max_records_per_insert: int = 50,
+    user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for jeen_dev_logs.
@@ -1827,7 +1895,7 @@ END $$;
                         f"{conv['message_count']}, {conv['total_tokens']}, "
                         f"true, NULL::timestamp, '{created_at_str}'::timestamptz, '{updated_at_str}'::timestamptz, "
                         f"'{updated_at_str}'::timestamptz, "
-                        f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)}))"
+                        f"{resolve_user_id_sql(str(user_id), user_id_overrides)})"
                     )
                 
                 conv_values_joined = ',\n'.join(conv_values)
@@ -1865,7 +1933,7 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         msg_values.append(
                             f"    ({user_msg_id}, '{conv['chat_id']}'::uuid, {user_parent}, 'user'::messages_role_enum, "
                             f"false, 1, 1, NULL::text, {user_created_at}, {user_created_at}, NULL::timestamp, "
-                            f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)}), '{{}}'::jsonb)"
+                            f"{resolve_user_id_sql(str(user_id), user_id_overrides)}, '{{}}'::jsonb)"
                         )
                         
                         # Assistant message
@@ -1912,7 +1980,7 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         msg_values.append(
                             f"    ({assistant_msg_id}, '{conv['chat_id']}'::uuid, {user_msg_id}, 'assistant'::messages_role_enum, "
                             f"false, 1, 1, 'stop', '{created_at_str}'::timestamptz, '{created_at_str}'::timestamptz, NULL::timestamp, "
-                            f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)}), {metadata_escaped})"
+                            f"{resolve_user_id_sql(str(user_id), user_id_overrides)}, {metadata_escaped})"
                         )
                         
                         # Content blocks
@@ -2027,7 +2095,8 @@ def _safe_get(d: Optional[dict], key: str, default=None):
 
 def generate_agent_insert(
     row: pd.Series,
-    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Optional[str]:
     """
     Generate INSERT statements for a single agent (agents + agent_settings + agent_documents).
@@ -2265,7 +2334,7 @@ DO $agent_fn$
 DECLARE
     v_agent_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-agent');
     v_settings_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-settings');
-    v_user_id uuid := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(user_id)});
+    v_user_id uuid := {resolve_user_id_sql(str(user_id), user_id_overrides)};
     v_docs_linked integer := 0;
 BEGIN
     -- Insert agent if not exists
@@ -2343,7 +2412,8 @@ def generate_agents_migration_sql(
     agents_df: pd.DataFrame,
     output_file: str,
     source_info: str,
-    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for agents from playground_bot_generator_config.
@@ -2432,7 +2502,7 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
         
         # Generate per-agent INSERT blocks
         for _, row in agents_df.iterrows():
-            sql = generate_agent_insert(row, namespace_uuid)
+            sql = generate_agent_insert(row, namespace_uuid, user_id_overrides)
             if sql:
                 sql_file.write(sql)
                 sql_file.write('\n')

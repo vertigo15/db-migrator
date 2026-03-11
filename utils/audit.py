@@ -51,7 +51,7 @@ def audit_top_users_by_documents(config: ConnectionConfig, prefix: str, limit: i
             u.name AS user_name,
             TRIM(u.email) AS email,
             COUNT(d.doc_id) AS total_documents,
-            SUM(COALESCE(d.doc_size, 0)) AS total_doc_size_bytes
+            ROUND(SUM(COALESCE(d.doc_size, 0))::numeric / (1024.0 * 1024.0), 2) AS total_size_mb
         FROM public.{docs_table} d
         JOIN public.{users_table} u ON u.id = d.owner_id
         GROUP BY u.id, u.name, u.email
@@ -220,24 +220,31 @@ def audit_problematic_doc_types(config: ConnectionConfig, prefix: str) -> pd.Dat
     """Documents with problematic doc_type values (will map to application/octet-stream)."""
     docs_table = get_table_name("custom_documents", prefix)
     
-    # Use subquery to get sample doc_ids (LIMIT not supported inside ARRAY_AGG)
+    # Use LATERAL to avoid "subquery uses ungrouped column from outer query" error
     query = f"""
         SELECT
-            TRIM(doc_type) AS doc_type,
-            COUNT(*) AS doc_count,
-            (SELECT ARRAY_AGG(sub.doc_id) FROM (
-                SELECT doc_id FROM public.{docs_table} d2 
-                WHERE TRIM(d2.doc_type) = TRIM(d.doc_type) 
+            dt.doc_type,
+            dt.doc_count,
+            samples.sample_doc_ids
+        FROM (
+            SELECT COALESCE(TRIM(doc_type), '(null)') AS doc_type, COUNT(*) AS doc_count
+            FROM public.{docs_table}
+            WHERE TRIM(LOWER(COALESCE(doc_type, ''))) NOT IN (
+                'pdf','docx','pptx','xlsx','doc','ppt','xls','txt','csv','html','json',
+                'png','jpg','jpeg','gif','svg','webp','md','mp3','mp4',
+                'application/pdf','image/png','image/jpeg'
+            )
+            GROUP BY COALESCE(TRIM(doc_type), '(null)')
+        ) dt
+        CROSS JOIN LATERAL (
+            SELECT ARRAY_AGG(doc_id) AS sample_doc_ids
+            FROM (
+                SELECT doc_id FROM public.{docs_table} d2
+                WHERE COALESCE(TRIM(d2.doc_type), '(null)') = dt.doc_type
                 ORDER BY doc_id LIMIT 3
-            ) sub) AS sample_doc_ids
-        FROM public.{docs_table} d
-        WHERE TRIM(LOWER(doc_type)) NOT IN (
-            'pdf','docx','pptx','xlsx','doc','ppt','xls','txt','csv','html','json',
-            'png','jpg','jpeg','gif','svg','webp','md','mp3','mp4',
-            'application/pdf','image/png','image/jpeg'
-        )
-        GROUP BY TRIM(doc_type)
-        ORDER BY doc_count DESC
+            ) sub
+        ) samples
+        ORDER BY dt.doc_count DESC
     """
     return execute_query(config, query)
 
@@ -370,12 +377,15 @@ def audit_embedding_dimensions(config: ConnectionConfig, prefix: str) -> pd.Data
     
     query = f"""
         SELECT
-            array_length(embeddings::text::float[], 1) AS vector_dimension,
+            array_length(
+                string_to_array(trim(both '[]' from embeddings::text), ','),
+                1
+            ) AS vector_dimension,
             COUNT(*) AS chunk_count
         FROM public.{embeddings_table}
         WHERE metadata->>'type' = 'chunk-data'
           AND embeddings IS NOT NULL
-        GROUP BY array_length(embeddings::text::float[], 1)
+        GROUP BY 1
         ORDER BY chunk_count DESC
         LIMIT 5
     """
@@ -393,6 +403,24 @@ def audit_chunk_type_distribution(config: ConnectionConfig, prefix: str) -> pd.D
         FROM public.{embeddings_table}
         GROUP BY metadata->>'type'
         ORDER BY row_count DESC
+    """
+    return execute_query(config, query)
+
+
+def audit_embeddings_by_model(config: ConnectionConfig, prefix: str) -> pd.DataFrame:
+    """Chunk count grouped by embedding model name (from custom_documents.embedding_model)."""
+    embeddings_table = get_table_name("embeddings", prefix)
+    docs_table = get_table_name("custom_documents", prefix)
+
+    query = f"""
+        SELECT
+            COALESCE(TRIM(d.embedding_model), '(unknown)') AS embedding_model,
+            COUNT(e.id) AS chunk_count
+        FROM public.{embeddings_table} e
+        LEFT JOIN public.{docs_table} d ON d.doc_id = e.metadata->>'doc_id'
+        WHERE e.metadata->>'type' = 'chunk-data'
+        GROUP BY COALESCE(TRIM(d.embedding_model), '(unknown)')
+        ORDER BY chunk_count DESC
     """
     return execute_query(config, query)
 
@@ -768,6 +796,7 @@ def run_full_audit(config: ConnectionConfig, prefix: str) -> Dict[str, Any]:
         results['chunks_embeddings']['without_embeddings'] = audit_chunks_without_embeddings(config, prefix)
         results['chunks_embeddings']['dimensions'] = audit_embedding_dimensions(config, prefix)
         results['chunks_embeddings']['type_distribution'] = audit_chunk_type_distribution(config, prefix)
+        results['chunks_embeddings']['by_model'] = audit_embeddings_by_model(config, prefix)
     except Exception as e:
         results['chunks_embeddings']['error'] = str(e)
     

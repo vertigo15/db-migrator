@@ -787,11 +787,39 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             )
             if target_embedding_dim == 0:
                 target_embedding_dim = None
+        
+        # User ID overrides for users who already exist in V5 with a different UUID
+        with st.expander("👤 User ID Overrides *(optional)*"):
+            st.caption(
+                "Use this when a user exists in both V4 and V5 but with different UUIDs. "
+                "Their content will be migrated and linked to their existing V5 UUID instead of generating a new one. "
+                "Enter one mapping per line in the format: `v4_uuid=v5_uuid`"
+            )
+            overrides_text = st.text_area(
+                "V4 UUID → V5 UUID mappings",
+                value="",
+                height=100,
+                placeholder="3fa85f64-5717-4562-b3fc-2c963f66afa6=7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                label_visibility="collapsed"
+            )
+        user_id_overrides = {}
+        if overrides_text.strip():
+            for _line in overrides_text.strip().splitlines():
+                _line = _line.strip()
+                if '=' in _line:
+                    _parts = _line.split('=', 1)
+                    if len(_parts) == 2:
+                        _v4, _v5 = _parts[0].strip(), _parts[1].strip()
+                        if _v4 and _v5:
+                            user_id_overrides[_v4] = _v5
+            if user_id_overrides:
+                st.info(f"🔀 {len(user_id_overrides)} user ID override(s) configured.")
     else:
         org_id = "356b50f7-bcbd-42aa-9392-e1605f42f7a1"
         embedding_model = "text-embedding-ada-002"
         skip_empty_embeddings = False
         target_embedding_dim = None
+        user_id_overrides = {}
     
     if st.button("🚀 Start Extraction", type="primary", use_container_width=True):
         # Create progress containers
@@ -813,7 +841,8 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             organization_id=org_id if generate_sql else None,
             embedding_model=embedding_model if generate_sql else 'text-embedding-ada-002',
             skip_empty_embeddings=skip_empty_embeddings if generate_sql else False,
-            target_embedding_dim=target_embedding_dim if generate_sql else None
+            target_embedding_dim=target_embedding_dim if generate_sql else None,
+            user_id_overrides=user_id_overrides if generate_sql else {}
         )
         
         # Run extraction

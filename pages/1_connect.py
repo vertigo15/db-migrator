@@ -3,6 +3,7 @@ Page 1: Connect to Source Database.
 Defaults are loaded from the project .env file.
 """
 import os
+from datetime import datetime
 import streamlit as st
 from dotenv import dotenv_values
 
@@ -16,7 +17,21 @@ from utils.db import (
 from utils.storage import save_connection, save_to_storage
 from utils.config import SessionKeys, get_all_table_names
 from utils.audit import run_full_audit
+from utils.pdf_export import generate_audit_pdf
 import pandas as pd
+
+
+def _fmt_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Format numeric DataFrame columns with comma thousand separators."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    result = df.copy()
+    for col in result.select_dtypes(include=['int64', 'int32', 'int16', 'int8']).columns:
+        result[col] = result[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "")
+    for col in result.select_dtypes(include=['float64', 'float32']).columns:
+        result[col] = result[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
+    return result
+
 
 # Page config
 st.set_page_config(page_title="Connect to Source DB", page_icon="🔌", layout="wide")
@@ -189,6 +204,7 @@ def render_audit_section():
                 summary_items.append({"table": logical_name, "count": count})
         
         if summary_items:
+            st.session_state["audit_counts"] = summary_items
             # Create a single row with all KPIs
             cols = st.columns(len(summary_items))
             for i, item in enumerate(summary_items):
@@ -210,7 +226,31 @@ def render_audit_section():
         return
     
     results = st.session_state["audit_results"]
-    
+
+    # ── PDF Export ──────────────────────────────────────────────────────────
+    _gap_col, _pdf_col = st.columns([3, 1])
+    with _pdf_col:
+        if st.button("📄 Export to PDF", use_container_width=True):
+            with st.spinner("Generating PDF report..."):
+                try:
+                    pdf_bytes = generate_audit_pdf(
+                        results,
+                        prefix,
+                        f"{config.host}/{config.database}",
+                        st.session_state.get("audit_counts", []),
+                    )
+                    st.session_state["audit_pdf_bytes"] = pdf_bytes
+                except Exception as pdf_err:
+                    st.error(f"PDF generation failed: {pdf_err}")
+        if "audit_pdf_bytes" in st.session_state:
+            st.download_button(
+                label="📥 Download PDF",
+                data=st.session_state["audit_pdf_bytes"],
+                file_name=f"audit_{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
     # Section 2: Users
     st.markdown("### 👥 Section 2: User Analytics")
     with st.expander("View User Analytics", expanded=False):
@@ -221,19 +261,19 @@ def render_audit_section():
             
             st.markdown("**Top 10 Users by Chat Activity**")
             if not users.get('top_by_logs', pd.DataFrame()).empty:
-                st.dataframe(users['top_by_logs'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(users['top_by_logs']), use_container_width=True, hide_index=True)
             else:
                 st.info("No data")
             
             st.markdown("**Top 10 Users by Documents**")
             if not users.get('top_by_documents', pd.DataFrame()).empty:
-                st.dataframe(users['top_by_documents'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(users['top_by_documents']), use_container_width=True, hide_index=True)
             else:
                 st.info("No data")
             
             st.markdown("**Top 10 Users by Chunks**")
             if not users.get('top_by_chunks', pd.DataFrame()).empty:
-                st.dataframe(users['top_by_chunks'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(users['top_by_chunks']), use_container_width=True, hide_index=True)
             else:
                 st.info("No data")
             
@@ -241,7 +281,7 @@ def render_audit_section():
             without_email = users.get('without_email', pd.DataFrame())
             if not without_email.empty:
                 st.warning(f"{len(without_email)} users have no email and will be skipped!")
-                st.dataframe(without_email, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(without_email), use_container_width=True, hide_index=True)
             else:
                 st.success("All users have email addresses ✓")
             
@@ -249,7 +289,7 @@ def render_audit_section():
             collisions = users.get('username_collisions', pd.DataFrame())
             if not collisions.empty:
                 st.warning(f"{len(collisions)} email prefixes are shared across multiple users")
-                st.dataframe(collisions, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(collisions), use_container_width=True, hide_index=True)
             else:
                 st.success("No username collisions detected ✓")
     
@@ -264,7 +304,7 @@ def render_audit_section():
             st.markdown("**Folder Hierarchy Depth**")
             depth_df = folders.get('hierarchy_depth', pd.DataFrame())
             if not depth_df.empty:
-                st.dataframe(depth_df, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(depth_df), use_container_width=True, hide_index=True)
                 max_depth = depth_df['depth'].max() if 'depth' in depth_df.columns else 0
                 if max_depth > 1:
                     st.warning(f"⚠️ Max depth is {max_depth}. Folders at depth > 1 will have parent_id set based on hierarchy.")
@@ -273,13 +313,13 @@ def render_audit_section():
             
             st.markdown("**Folder Type Distribution**")
             if not folders.get('type_distribution', pd.DataFrame()).empty:
-                st.dataframe(folders['type_distribution'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(folders['type_distribution']), use_container_width=True, hide_index=True)
             
             st.markdown("**⚠️ Orphaned Folders (parent references non-existent folder)**")
             orphaned = folders.get('orphaned', pd.DataFrame())
             if not orphaned.empty:
                 st.warning(f"{len(orphaned)} folders have orphaned parent references!")
-                st.dataframe(orphaned, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(orphaned), use_container_width=True, hide_index=True)
             else:
                 st.success("No orphaned folders ✓")
     
@@ -293,31 +333,31 @@ def render_audit_section():
             
             st.markdown("**Document Type Distribution**")
             if not docs.get('type_distribution', pd.DataFrame()).empty:
-                st.dataframe(docs['type_distribution'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(docs['type_distribution']), use_container_width=True, hide_index=True)
             
             st.markdown("**⚠️ Problematic Doc Types (will become application/octet-stream)**")
             problematic = docs.get('problematic_types', pd.DataFrame())
             if not problematic.empty:
                 st.warning(f"{len(problematic)} document types will need manual mapping")
-                st.dataframe(problematic, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(problematic), use_container_width=True, hide_index=True)
             else:
                 st.success("All document types are recognized ✓")
             
             st.markdown("**Blob Source Distribution**")
             if not docs.get('blob_source_distribution', pd.DataFrame()).empty:
-                st.dataframe(docs['blob_source_distribution'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(docs['blob_source_distribution']), use_container_width=True, hide_index=True)
             
             col1, col2 = st.columns(2)
             with col1:
                 orphaned_count = docs.get('orphaned_count', 0)
                 if orphaned_count > 0:
-                    st.error(f"⚠️ {orphaned_count} documents without valid owner")
+                    st.error(f"⚠️ {orphaned_count:,} documents without valid owner")
                 else:
                     st.success("All documents have valid owners ✓")
             with col2:
                 missing_folders = docs.get('missing_folders_count', 0)
                 if missing_folders > 0:
-                    st.warning(f"⚠️ {missing_folders} documents reference missing folders")
+                    st.warning(f"⚠️ {missing_folders:,} documents reference missing folders")
                 else:
                     st.success("All folder references valid ✓")
             
@@ -325,7 +365,7 @@ def render_audit_section():
             duplicates = docs.get('duplicate_ids', pd.DataFrame())
             if not duplicates.empty:
                 st.error(f"⚠️ {len(duplicates)} duplicate doc_ids found!")
-                st.dataframe(duplicates, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(duplicates), use_container_width=True, hide_index=True)
             else:
                 st.success("No duplicate doc_ids ✓")
     
@@ -339,25 +379,29 @@ def render_audit_section():
             
             st.markdown("**Top Documents by Chunk Count**")
             if not chunks.get('per_document', pd.DataFrame()).empty:
-                st.dataframe(chunks['per_document'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(chunks['per_document']), use_container_width=True, hide_index=True)
             
             st.markdown("**Chunk Type Distribution**")
             if not chunks.get('type_distribution', pd.DataFrame()).empty:
-                st.dataframe(chunks['type_distribution'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(chunks['type_distribution']), use_container_width=True, hide_index=True)
             
             st.markdown("**Embedding Vector Dimensions**")
             if not chunks.get('dimensions', pd.DataFrame()).empty:
-                st.dataframe(chunks['dimensions'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(chunks['dimensions']), use_container_width=True, hide_index=True)
+            
+            st.markdown("**Embeddings by Model**")
+            if not chunks.get('by_model', pd.DataFrame()).empty:
+                st.dataframe(_fmt_df(chunks['by_model']), use_container_width=True, hide_index=True)
             
             orphaned = chunks.get('orphaned', {})
             if orphaned.get('orphaned_chunks', 0) > 0:
-                st.warning(f"⚠️ {orphaned['orphaned_chunks']} chunks reference non-existent documents ({orphaned['orphaned_doc_ids']} unique doc_ids)")
+                st.warning(f"⚠️ {orphaned['orphaned_chunks']:,} chunks reference non-existent documents ({orphaned['orphaned_doc_ids']} unique doc_ids)")
             else:
                 st.success("All chunks have valid document references ✓")
             
             without_emb = chunks.get('without_embeddings', 0)
             if without_emb > 0:
-                st.info(f"ℹ️ {without_emb} chunks have NULL embeddings")
+                st.info(f"ℹ️ {without_emb:,} chunks have NULL embeddings")
     
     # Section 6: Conversations
     st.markdown("### 💬 Section 6: Conversation Analytics")
@@ -369,47 +413,47 @@ def render_audit_section():
             
             st.markdown("**Top 10 Users by Conversations**")
             if not convs.get('top_users', pd.DataFrame()).empty:
-                st.dataframe(convs['top_users'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(convs['top_users']), use_container_width=True, hide_index=True)
             
             st.markdown("**Conversation Size Distribution**")
             if not convs.get('size_distribution', pd.DataFrame()).empty:
-                st.dataframe(convs['size_distribution'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(convs['size_distribution']), use_container_width=True, hide_index=True)
             
             st.markdown("**Model Usage Distribution**")
             if not convs.get('model_usage', pd.DataFrame()).empty:
-                st.dataframe(convs['model_usage'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(convs['model_usage']), use_container_width=True, hide_index=True)
             
             st.markdown("**Bot/Agent Usage**")
             if not convs.get('bot_usage', pd.DataFrame()).empty:
-                st.dataframe(convs['bot_usage'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(convs['bot_usage']), use_container_width=True, hide_index=True)
             
             st.markdown("**Token Statistics**")
             if not convs.get('token_stats', pd.DataFrame()).empty:
-                st.dataframe(convs['token_stats'], use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(convs['token_stats']), use_container_width=True, hide_index=True)
             
             # Issues
             without_user = convs.get('without_user', {})
             if without_user.get('logs_without_user', 0) > 0:
-                st.warning(f"⚠️ {without_user['logs_without_user']} logs have NULL user_id ({without_user['conversations_affected']} conversations affected)")
+                st.warning(f"⚠️ {without_user['logs_without_user']:,} logs have NULL user_id ({without_user['conversations_affected']:,} conversations affected)")
             
             without_chat = convs.get('without_chat_id', 0)
             if without_chat > 0:
-                st.warning(f"⚠️ {without_chat} logs have NULL/empty chat_id")
+                st.warning(f"⚠️ {without_chat:,} logs have NULL/empty chat_id")
             
             invalid_uuids = convs.get('invalid_chat_ids', pd.DataFrame())
             if not invalid_uuids.empty:
                 st.warning(f"⚠️ {len(invalid_uuids)} chat_ids have invalid UUID format")
-                st.dataframe(invalid_uuids, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(invalid_uuids), use_container_width=True, hide_index=True)
             
             question_issues = convs.get('question_extraction_issues', pd.DataFrame())
             if not question_issues.empty:
                 st.warning(f"⚠️ {len(question_issues)} logs have question extraction issues")
                 with st.expander("View question extraction issues"):
-                    st.dataframe(question_issues, use_container_width=True, hide_index=True)
+                    st.dataframe(_fmt_df(question_issues), use_container_width=True, hide_index=True)
             
             orphaned = convs.get('orphaned', {})
             if orphaned.get('orphaned_logs', 0) > 0:
-                st.error(f"⚠️ {orphaned['orphaned_logs']} logs reference non-existent users ({orphaned['orphaned_user_ids']} unique user_ids)")
+                st.error(f"⚠️ {orphaned['orphaned_logs']:,} logs reference non-existent users ({orphaned['orphaned_user_ids']} unique user_ids)")
     
     # Section 7: Cross-Table Integrity (Most Critical)
     st.markdown("### ⚠️ Section 7: Cross-Table Integrity (DATA LOSS RISK)")
@@ -430,12 +474,12 @@ def render_audit_section():
                     st.error(f"⚠️ Total rows at risk: {total_risk:,}")
                 else:
                     st.success("No data loss risk detected ✓")
-                st.dataframe(risk_df, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(risk_df), use_container_width=True, hide_index=True)
             
             st.markdown("**Missing User References by Table**")
             missing_users = cross.get('missing_users', pd.DataFrame())
             if not missing_users.empty:
-                st.dataframe(missing_users, use_container_width=True, hide_index=True)
+                st.dataframe(_fmt_df(missing_users), use_container_width=True, hide_index=True)
             else:
                 st.success("All user references are valid ✓")
 

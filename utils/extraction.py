@@ -39,7 +39,8 @@ class ExtractionEngine:
         organization_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
         embedding_model: str = 'text-embedding-ada-002',
         skip_empty_embeddings: bool = False,
-        target_embedding_dim: Optional[int] = None
+        target_embedding_dim: Optional[int] = None,
+        user_id_overrides: Optional[Dict[str, str]] = None
     ):
         """
         Initialize extraction engine.
@@ -55,6 +56,8 @@ class ExtractionEngine:
             embedding_model: Default embedding model name for chunks/embeddings
             skip_empty_embeddings: Skip rows without embeddings in chunks/embeddings migration
             target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
+            user_id_overrides: Optional mapping of {v4_user_id: existing_v5_uuid} for users
+                               who already exist in V5 with a different UUID
         """
         self.config = config
         self.prefix = prefix
@@ -66,6 +69,7 @@ class ExtractionEngine:
         self.embedding_model = embedding_model
         self.skip_empty_embeddings = skip_empty_embeddings
         self.target_embedding_dim = target_embedding_dim
+        self.user_id_overrides = user_id_overrides or {}
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Ensure output directories exist
@@ -182,7 +186,8 @@ class ExtractionEngine:
                     users_df=df,
                     output_file=sql_output_path,
                     source_info=source_info,
-                    org_id=self.organization_id
+                    org_id=self.organization_id,
+                    user_id_overrides=self.user_id_overrides
                 )
             except Exception as e:
                 # Log error but don't fail extraction
@@ -225,7 +230,8 @@ class ExtractionEngine:
                 generate_folders_migration_sql(
                     folders_df=df,
                     output_file=sql_output_path,
-                    source_info=source_info
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides
                 )
             except Exception as e:
                 # Log error but don't fail extraction
@@ -310,7 +316,8 @@ class ExtractionEngine:
                 generate_documents_migration_sql(
                     documents_df=df,
                     output_file=sql_output_path,
-                    source_info=source_info
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides
                 )
             except Exception as e:
                 # Log error but don't fail extraction
@@ -445,7 +452,8 @@ class ExtractionEngine:
                 generate_agents_migration_sql(
                     agents_df=df,
                     output_file=sql_output_path,
-                    source_info=source_info
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides
                 )
             except Exception as e:
                 # Log error but don't fail extraction
@@ -491,7 +499,8 @@ class ExtractionEngine:
                 generate_conversations_logs_migration_sql(
                     logs_df=df,
                     output_file=sql_output_path,
-                    source_info=source_info
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides
                 )
             except Exception as e:
                 # Log error but don't fail extraction
