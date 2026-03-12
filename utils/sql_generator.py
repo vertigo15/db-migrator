@@ -2132,15 +2132,8 @@ def generate_agent_insert(
     bot_description = (_safe_get(bot_data, 'bot_description') or '')[:2048]
     first_message = clean_string(row.get('first_message'))
     
-    # Derive agent_type
-    if _safe_get(toolkit_settings, 'workflow_mode') is not None:
-        agent_type = 'workflow'
-    elif (str(_safe_get(analysis_prompt, 'is_selected', '')).lower() == 'true' or
-          str(_safe_get(grade_prompt, 'is_selected', '')).lower() == 'true' or
-          str(_safe_get(relevant_answer_prompt, 'is_selected', '')).lower() == 'true'):
-        agent_type = 'cortex'
-    else:
-        agent_type = 'spark'
+    # Derive agent_type — all legacy bots migrate as 'cortex'
+    agent_type = 'cortex'
     
     # Avatar URL
     avatar_url = None
@@ -2291,19 +2284,23 @@ def generate_agent_insert(
     doc_inserts = ''
     for doc_id in docs_chosen:
         doc_inserts += f"""
-    -- Link document: {doc_id}
-    INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-    SELECT
-        uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}'),
-        v_agent_id,
-        uuid_generate_v5('{DOC_NAMESPACE_UUID}'::uuid, '{doc_id}'),
-        true,
-        'document'::agent_documents_type_enum
-    WHERE NOT EXISTS (
-        SELECT 1 FROM agent_documents
-        WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}')
-    );
-    v_docs_linked := v_docs_linked + 1;
+    -- Link document: {doc_id} (skip if document wasn't migrated)
+    IF migration.get_new_id('documents', {escape_sql_string(doc_id)}) IS NOT NULL THEN
+        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
+        SELECT
+            uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}'),
+            v_agent_id,
+            migration.get_new_id('documents', {escape_sql_string(doc_id)}),
+            true,
+            'document'::agent_documents_type_enum
+        WHERE NOT EXISTS (
+            SELECT 1 FROM agent_documents
+            WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}')
+        );
+        v_docs_linked := v_docs_linked + 1;
+    ELSE
+        RAISE NOTICE 'Agent {bot_id}: skipping document link {doc_id} — document not migrated';
+    END IF;
 """
     
     for fid in folders_chosen:
