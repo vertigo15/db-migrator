@@ -254,6 +254,7 @@ class SessionKeys:
     TRANSFORMED_DATA = "transformed_data"
     MAPPING_CONFIG = "mapping_config"
     MIGRATION_LOG = "migration_log"
+    V5_ERASE_CONFIG = "v5_erase_config"
 
 def get_env_connection_defaults() -> Dict[str, str]:
     """

@@ -171,12 +171,13 @@ def main():
     2. **Select Data** - Choose users and documents to migrate
     3. **Target** - Connect to your target database
     4. **Run** - Execute the migration
+    5. **Erase User Data V5** - Delete specific user data from a V5 instance
     
     Use the sidebar to navigate between pages, or click on a page in the left navigation panel.
     """)
     
     # Quick status cards
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.info("### 🔌 Source DB\nConfigure your source database connection and verify tables.")
@@ -186,6 +187,9 @@ def main():
         
     with col3:
         st.info("### 🎯 Target\nConnect to your target database for migration execution.")
+    
+    with col4:
+        st.info("### 🗑️ Erase V5\nDelete specific user data from a V5 database instance.")
     
     # =========================================================================
     # DB LINEAGE CHART: V4 → V5 Migration
