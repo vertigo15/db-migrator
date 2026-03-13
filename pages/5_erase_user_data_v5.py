@@ -27,7 +27,8 @@ V5_DATABASES = {
     "user_db": {
         "label": "User DB",
         "tables": {
-            "users": {"pk": "id", "user_col": "id"},
+            "user_roles": {"pk": "id", "user_col": "user_id"},
+            "users":      {"pk": "id", "user_col": "id"},
         },
     },
     "document_db": {
@@ -53,27 +54,44 @@ V5_DATABASES = {
 # rows — but we still count children for the plan display.
 DELETION_STEPS = [
     # (database, table, description, query_template)
-    # completion_db — agents CASCADE to agent_settings + agent_documents
+    # --- Migration mappings (delete BEFORE data so subqueries still work) ---
+    ("completion_db", "migration.id_mappings (agents)", "Migration mappings for agents",
+     "DELETE FROM migration.id_mappings WHERE table_name = 'agents' AND new_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
+    ("document_db", "migration.id_mappings (documents)", "Migration mappings for documents",
+     "DELETE FROM migration.id_mappings WHERE table_name = 'documents' AND new_id IN (SELECT id FROM public.documents WHERE user_id IN ({placeholders}))"),
+    ("document_db", "migration.id_mappings (folders)", "Migration mappings for folders",
+     "DELETE FROM migration.id_mappings WHERE table_name = 'folders' AND new_id IN (SELECT id FROM public.folders WHERE user_id IN ({placeholders}))"),
+    ("user_db", "migration.id_mappings (users)", "Migration mappings for users",
+     "DELETE FROM migration.id_mappings WHERE table_name = 'users' AND new_id::text IN ({placeholders})"),
+    # --- completion_db — agents CASCADE to agent_settings + agent_documents ---
     ("completion_db", "agent_documents", "Agent ↔ Document links",
      "DELETE FROM public.agent_documents WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("completion_db", "agent_settings", "Agent settings",
      "DELETE FROM public.agent_settings WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("completion_db", "agents", "Agents",
      "DELETE FROM public.agents WHERE user_id IN ({placeholders})"),
-    # document_db — chunks CASCADE from documents
+    # --- document_db — chunks CASCADE from documents ---
     ("document_db", "chunks", "Chunks & embeddings",
      "DELETE FROM public.chunks WHERE document_id IN (SELECT id FROM public.documents WHERE user_id IN ({placeholders}))"),
     ("document_db", "documents", "Documents",
      "DELETE FROM public.documents WHERE user_id IN ({placeholders})"),
     ("document_db", "folders", "Folders",
      "DELETE FROM public.folders WHERE user_id IN ({placeholders})"),
-    # user_db — user record itself
+    # --- user_db — dynamic FK cleanup + user record (handled specially in execute) ---
     ("user_db", "users", "User account",
      "DELETE FROM public.users WHERE id IN ({placeholders})"),
 ]
 
 # Counting queries for the plan / verification (same order as DELETION_STEPS)
 COUNT_QUERIES = [
+    ("completion_db", "migration.id_mappings (agents)", "Migration mappings for agents",
+     "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'agents' AND new_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
+    ("document_db", "migration.id_mappings (documents)", "Migration mappings for documents",
+     "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'documents' AND new_id IN (SELECT id FROM public.documents WHERE user_id IN ({placeholders}))"),
+    ("document_db", "migration.id_mappings (folders)", "Migration mappings for folders",
+     "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'folders' AND new_id IN (SELECT id FROM public.folders WHERE user_id IN ({placeholders}))"),
+    ("user_db", "migration.id_mappings (users)", "Migration mappings for users",
+     "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'users' AND new_id::text IN ({placeholders})"),
     ("completion_db", "agent_documents", "Agent ↔ Document links",
      "SELECT COUNT(*) FROM public.agent_documents WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("completion_db", "agent_settings", "Agent settings",
@@ -130,6 +148,7 @@ def _run_delete(base_config: ConnectionConfig, db_name: str, query_template: str
     placeholders = ", ".join(["%s"] * len(user_ids))
     query = query_template.format(placeholders=placeholders)
     config = _make_config(base_config, db_name)
+    conn = None
     try:
         conn = get_connection(config)
         cur = conn.cursor()
@@ -140,7 +159,73 @@ def _run_delete(base_config: ConnectionConfig, db_name: str, query_template: str
         conn.close()
         return True, rows, None
     except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
         return False, 0, str(e)
+
+
+def _discover_user_fk_deps(base_config: ConnectionConfig) -> List[Tuple[str, str]]:
+    """Query user_db information_schema to find all tables with FK refs to users(id).
+    Returns list of (table_name, fk_column_name) excluding 'users' itself."""
+    config = _make_config(base_config, "user_db")
+    query = """
+        SELECT DISTINCT
+            kcu.table_name,
+            kcu.column_name
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage AS ccu
+            ON ccu.constraint_name = tc.constraint_name
+            AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND ccu.table_name = 'users'
+          AND ccu.column_name = 'id'
+          AND kcu.table_name != 'users'
+        ORDER BY kcu.table_name;
+    """
+    try:
+        conn = get_connection(config)
+        cur = conn.cursor()
+        cur.execute(query)
+        deps = cur.fetchall()  # [(table, column), ...]
+        cur.close()
+        conn.close()
+        return deps
+    except Exception as e:
+        st.warning(f"Could not discover FK deps on users: {e}")
+        return []
+
+
+def _delete_user_fk_deps(base_config: ConnectionConfig, user_ids: List[str],
+                         log_lines: List[str], log_area) -> bool:
+    """Dynamically discover and delete all FK dependencies on users table.
+    Returns True if all succeeded."""
+    deps = _discover_user_fk_deps(base_config)
+    if not deps:
+        return True
+
+    all_ok = True
+    for table_name, col_name in deps:
+        # Quote column name to handle camelCase (TypeORM)
+        query_tpl = f'DELETE FROM public."{table_name}" WHERE "{col_name}" IN ({{placeholders}})'
+        log_lines.append(f"▶ Deleting from **user_db.{table_name}** (FK dep on users)...")
+        log_area.markdown("\n\n".join(log_lines))
+
+        ok, rows, err = _run_delete(base_config, "user_db", query_tpl, user_ids)
+        if ok:
+            log_lines[-1] += f" ✅ {rows} rows deleted"
+        else:
+            log_lines[-1] += f" ❌ FAILED: {err}"
+            all_ok = False
+        log_area.markdown("\n\n".join(log_lines))
+
+    return all_ok
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -326,44 +411,33 @@ def render_execute_deletion(user_ids: List[str]):
     st.markdown("---")
     st.subheader("⚡ Execute Deletion")
 
-    st.error(
-        "⚠️ **This action is irreversible.** All data for the selected users will be "
-        "permanently deleted from user_db, document_db, and completion_db."
-    )
-
-    @st.dialog("Confirm Deletion")
-    def confirm_and_delete():
-        st.warning(
-            f"You are about to **permanently delete** all data for "
-            f"**{len(user_ids)}** user(s). This cannot be undone."
-        )
-        col_cancel, col_confirm = st.columns(2)
-        with col_cancel:
-            if st.button("Cancel", use_container_width=True):
-                st.rerun()
-        with col_confirm:
-            if st.button("🗑️ Yes, Delete", type="primary", use_container_width=True):
-                st.session_state["v5_erase_confirmed"] = True
-                st.rerun()
-
-    if st.button("🗑️ DELETE ALL SELECTED USER DATA", type="primary", use_container_width=True):
-        confirm_and_delete()
-
-    if not st.session_state.pop("v5_erase_confirmed", False):
+    if not st.button("🗑️ DELETE ALL SELECTED USER DATA", type="primary", use_container_width=True):
         return
 
-    # --- Confirmed: proceed with deletion ---
+    # --- Proceed with deletion ---
     if True:
         base = st.session_state["v5_erase_config"]
         progress = st.progress(0)
         log_area = st.empty()
         log_lines: List[str] = []
 
-        total_steps = len(DELETION_STEPS)
+        total_steps = len(DELETION_STEPS) + 1  # +1 for dynamic FK cleanup
         all_ok = True
 
         for i, (db_name, table, description, query_tpl) in enumerate(DELETION_STEPS):
-            progress.progress((i) / total_steps)
+            # Before deleting users, dynamically clean up all FK deps
+            if db_name == "user_db" and table == "users":
+                progress.progress(i / total_steps)
+                log_lines.append("▶ **Discovering FK dependencies on users table...**")
+                log_area.markdown("\n\n".join(log_lines))
+                fk_ok = _delete_user_fk_deps(base, user_ids, log_lines, log_area)
+                if not fk_ok:
+                    all_ok = False
+                    log_lines.append("❌ **Aborting: FK dependencies could not be fully removed. Users NOT deleted.**")
+                    log_area.markdown("\n\n".join(log_lines))
+                    break  # Stop — can't delete users with remaining FK refs
+
+            progress.progress((i + 1) / total_steps)
             log_lines.append(f"▶ Deleting from **{db_name}.{table}** ({description})...")
             log_area.markdown("\n\n".join(log_lines))
 

@@ -162,24 +162,25 @@ def render_verification(verif: dict) -> None:
                 f"| **Completed:** {ts}"
             )
 
-        # Per-table row counts as metrics
+        # Migrated count (from id_mappings) — shown prominently
+        mid = verif.get("migrated_ids")
+        if mid is not None:
+            st.metric(
+                label="✅ Added by migration",
+                value=f"{mid:,}",
+                help="Rows tracked in migration.id_mappings for this table type"
+            )
+
+        # Per-table total row counts
         tables = verif.get("tables", {})
         if tables:
             cols = st.columns(max(len(tables), 1))
             for i, (tbl, cnt) in enumerate(tables.items()):
                 with cols[i]:
                     if cnt is not None:
-                        st.metric(label=f"📊 {tbl}", value=f"{cnt:,}")
+                        st.metric(label=f"📊 {tbl} (total)", value=f"{cnt:,}")
                     else:
-                        st.metric(label=f"📊 {tbl}", value="N/A")
-
-        # Tracked IDs footnote
-        mid = verif.get("migrated_ids")
-        if mid is not None:
-            st.caption(
-                f"🗂️ Total IDs tracked in `migration.id_mappings` "
-                f"for this table type: **{mid:,}**"
-            )
+                        st.metric(label=f"📊 {tbl} (total)", value="N/A")
 
         st.caption(f"Database: `{verif.get('target_db', '—')}`")
 

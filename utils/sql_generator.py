@@ -529,38 +529,75 @@ BEGIN
     -- Generate deterministic UUID (same namespace+input = same UUID across all databases)
     v_new_id := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
     
-    -- Insert user
-    INSERT INTO user_db.public.users (
-        id,
-        email,
-        first_name,
-        last_name,
-        username,
-        avatar_url,
-        metadata,
-        created_at,
-        updated_at,
-        deleted_at,
-        zitadel_user_id,
-        organization_id,
-        is_owner,
-        preferred_language
-    ) VALUES (
-        v_new_id,
-        {escape_sql_string(email)},
-        {escape_sql_string(first_name)},
-        {escape_sql_string(last_name)},
-        {escape_sql_string(username)},
-        NULL,
-        {metadata_sql},
-        {created_at_sql},
-        now(),
-        NULL,
-        NULL,
-        '{org_id}'::uuid,
-        false,
-        NULL
-    );
+    -- Insert user (handle all unique constraint conflicts)
+    BEGIN
+        INSERT INTO user_db.public.users (
+            id,
+            email,
+            first_name,
+            last_name,
+            username,
+            avatar_url,
+            metadata,
+            created_at,
+            updated_at,
+            deleted_at,
+            zitadel_user_id,
+            organization_id,
+            is_owner,
+            preferred_language
+        ) VALUES (
+            v_new_id,
+            {escape_sql_string(email)},
+            {escape_sql_string(first_name)},
+            {escape_sql_string(last_name)},
+            {escape_sql_string(username)},
+            NULL,
+            {metadata_sql},
+            {created_at_sql},
+            now(),
+            NULL,
+            NULL,
+            '{org_id}'::uuid,
+            false,
+            NULL
+        )
+        ON CONFLICT (email) DO UPDATE SET
+            first_name = EXCLUDED.first_name,
+            last_name = EXCLUDED.last_name,
+            metadata = EXCLUDED.metadata,
+            updated_at = now()
+        RETURNING id INTO v_new_id;
+    EXCEPTION WHEN unique_violation THEN
+        -- Username conflict — check if this user already exists by email
+        SELECT id INTO v_new_id FROM user_db.public.users WHERE email = {escape_sql_string(email)};
+        IF v_new_id IS NOT NULL THEN
+            RAISE NOTICE 'User % already exists (matched by email), reusing id %', v_email, v_new_id;
+        ELSE
+            -- User doesn't exist yet, username is taken — retry with email as username
+            v_new_id := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
+            RAISE NOTICE 'User %: username conflict, using email as username instead', v_email;
+            INSERT INTO user_db.public.users (
+                id, email, first_name, last_name, username, avatar_url,
+                metadata, created_at, updated_at, deleted_at, zitadel_user_id,
+                organization_id, is_owner, preferred_language
+            ) VALUES (
+                v_new_id,
+                {escape_sql_string(email)},
+                {escape_sql_string(first_name)},
+                {escape_sql_string(last_name)},
+                {escape_sql_string(email)},
+                NULL, {metadata_sql}, {created_at_sql}, now(), NULL, NULL,
+                '{org_id}'::uuid, false, NULL
+            )
+            ON CONFLICT (email) DO UPDATE SET
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                metadata = EXCLUDED.metadata,
+                updated_at = now()
+            RETURNING id INTO v_new_id;
+        END IF;
+    END;
     
     -- Store ID mapping for fast future lookups
     INSERT INTO migration.id_mappings (
@@ -691,7 +728,16 @@ def generate_folder_insert(
     folder_name = clean_string(row.get('folder_name'))
     parent_id = clean_string(row.get('parent_id'))
     owner_id = clean_string(row.get('owner_id'))  # Legacy hash ID
-    folder_type = clean_string(row.get('folder_type')) or 'default'
+    # Map V4 folder_type to valid V5 enum values
+    # V5 enum: 'default', 'agent' (TypeORM folders_folder_type_enum)
+    raw_folder_type = clean_string(row.get('folder_type')) or 'default'
+    FOLDER_TYPE_MAP = {
+        'default': 'default',
+        'bot': 'agent',           # V4 'bot' → V5 'agent'
+        'agent': 'agent',
+        'document': 'document',   # V4 'document' → V5 'document'
+    }
+    folder_type = FOLDER_TYPE_MAP.get(raw_folder_type, 'default')
     
     # Skip if no ID
     if not old_id:
@@ -1652,6 +1698,23 @@ END $$;
 --   \\\\echo 'Migration cancelled by user.'
 --   \\\\quit
 -- \\\\endif
+
+-- Ensure embeddings column matches target dimension ({target_embedding_dim or 'original'})
+DO $$
+DECLARE
+    v_current_dim INTEGER;
+BEGIN
+    -- Check current vector dimension on the embeddings table
+    SELECT atttypmod INTO v_current_dim
+    FROM pg_attribute
+    WHERE attrelid = 'public.embeddings'::regclass
+      AND attname = 'embedding';
+
+    IF v_current_dim IS NOT NULL AND v_current_dim != {target_embedding_dim or 0} THEN
+        RAISE NOTICE '⚠️  DIMENSION TRIM: embeddings.embedding column resized from % to {target_embedding_dim or 'original'} dimensions. Source vectors will be truncated to fit.', v_current_dim;
+        ALTER TABLE public.embeddings ALTER COLUMN embedding TYPE vector({target_embedding_dim or 1024});
+    END IF;
+END $$;
 
 """
         sql_file.write(header)
