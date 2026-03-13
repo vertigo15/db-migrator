@@ -1,10 +1,10 @@
 -- ============================================================
 -- FOLDERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-13T14:54:46.373210
+-- Generated: 2026-03-13T19:26:18.993766
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: document_db.public.folders
--- Records to migrate: 6
+-- Records to migrate: 2
 -- 
 -- IMPORTANT: This script will INSERT records into the target database!
 -- IMPORTANT: Review organization_id and other constants before execution!
@@ -112,9 +112,9 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'FOLDERS MIGRATION - CONFIRMATION REQUIRED';
     RAISE NOTICE '============================================================';
-    RAISE NOTICE 'This script will migrate 6 records to: document_db.public.folders';
+    RAISE NOTICE 'This script will migrate 2 records to: document_db.public.folders';
     
-    RAISE NOTICE 'Generated: 2026-03-13T14:54:46.373210';
+    RAISE NOTICE 'Generated: 2026-03-13T19:26:18.993766';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -141,17 +141,17 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('folders_20260313_145446', 'folders', 6, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('folders_20260313_192618', 'folders', 2, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
--- Folder: Berca (owner: 306916b02924f0142a236cc978b0d013)
+-- Folder: Ariel Test (owner: e994b100cd7b6327b45618f254d1b708)
 DO $$
 DECLARE
-    v_old_folder_id VARCHAR := '1364';
-    v_old_owner_id VARCHAR := '306916b02924f0142a236cc978b0d013';
+    v_old_folder_id VARCHAR := '1393';
+    v_old_owner_id VARCHAR := 'e994b100cd7b6327b45618f254d1b708';
     v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, '306916b02924f0142a236cc978b0d013');
+    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708');
 BEGIN
     -- Check if folder already migrated using mapping table (FAST)
     IF migration.is_migrated('folders', v_old_folder_id) THEN
@@ -171,11 +171,11 @@ BEGIN
         deleted_at
     ) VALUES (
         v_folder_id,
-        'Berca',
+        'Ariel Test',
         NULL,
-        'bot'::public.folders_folder_type_enum,
+        'document'::public.folders_folder_type_enum,
         v_user_id,
-        '2026-01-16T10:18:48.777717',
+        '2026-03-11T12:40:50.253226',
         now(),
         NULL
     );
@@ -190,20 +190,20 @@ BEGIN
         'folders',
         v_old_folder_id,
         v_folder_id,
-        'folders_20260313_145446'
+        'folders_20260313_192618'
     );
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;
 
 
--- Folder: Bell (owner: 306916b02924f0142a236cc978b0d013)
+-- Folder: ArielTest2 (owner: e994b100cd7b6327b45618f254d1b708)
 DO $$
 DECLARE
-    v_old_folder_id VARCHAR := '1365';
-    v_old_owner_id VARCHAR := '306916b02924f0142a236cc978b0d013';
+    v_old_folder_id VARCHAR := '1396';
+    v_old_owner_id VARCHAR := 'e994b100cd7b6327b45618f254d1b708';
     v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, '306916b02924f0142a236cc978b0d013');
+    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708');
 BEGIN
     -- Check if folder already migrated using mapping table (FAST)
     IF migration.is_migrated('folders', v_old_folder_id) THEN
@@ -223,11 +223,11 @@ BEGIN
         deleted_at
     ) VALUES (
         v_folder_id,
-        'Bell',
+        'ArielTest2',
         NULL,
-        'bot'::public.folders_folder_type_enum,
+        'document'::public.folders_folder_type_enum,
         v_user_id,
-        '2026-01-16T10:19:15.834210',
+        '2026-03-12T09:25:28.992700',
         now(),
         NULL
     );
@@ -242,215 +242,7 @@ BEGIN
         'folders',
         v_old_folder_id,
         v_folder_id,
-        'folders_20260313_145446'
-    );
-    
-    RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
-END $$;
-
-
--- Folder: TLV Stock (owner: 306916b02924f0142a236cc978b0d013)
-DO $$
-DECLARE
-    v_old_folder_id VARCHAR := '1366';
-    v_old_owner_id VARCHAR := '306916b02924f0142a236cc978b0d013';
-    v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, '306916b02924f0142a236cc978b0d013');
-BEGIN
-    -- Check if folder already migrated using mapping table (FAST)
-    IF migration.is_migrated('folders', v_old_folder_id) THEN
-        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
-        RETURN;
-    END IF;
-    
-    -- Insert folder
-    INSERT INTO document_db.public.folders (
-        id,
-        folder_name,
-        parent_id,
-        folder_type,
-        user_id,
-        created_at,
-        updated_at,
-        deleted_at
-    ) VALUES (
-        v_folder_id,
-        'TLV Stock',
-        NULL,
-        'bot'::public.folders_folder_type_enum,
-        v_user_id,
-        '2026-01-16T10:19:39.201739',
-        now(),
-        NULL
-    );
-    
-    -- Store folder ID mapping
-    INSERT INTO migration.id_mappings (
-        table_name,
-        old_id,
-        new_id,
-        migration_batch
-    ) VALUES (
-        'folders',
-        v_old_folder_id,
-        v_folder_id,
-        'folders_20260313_145446'
-    );
-    
-    RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
-END $$;
-
-
--- Folder: Maccabi (owner: 306916b02924f0142a236cc978b0d013)
-DO $$
-DECLARE
-    v_old_folder_id VARCHAR := '1367';
-    v_old_owner_id VARCHAR := '306916b02924f0142a236cc978b0d013';
-    v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, '306916b02924f0142a236cc978b0d013');
-BEGIN
-    -- Check if folder already migrated using mapping table (FAST)
-    IF migration.is_migrated('folders', v_old_folder_id) THEN
-        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
-        RETURN;
-    END IF;
-    
-    -- Insert folder
-    INSERT INTO document_db.public.folders (
-        id,
-        folder_name,
-        parent_id,
-        folder_type,
-        user_id,
-        created_at,
-        updated_at,
-        deleted_at
-    ) VALUES (
-        v_folder_id,
-        'Maccabi',
-        NULL,
-        'bot'::public.folders_folder_type_enum,
-        v_user_id,
-        '2026-01-16T10:19:58.866280',
-        now(),
-        NULL
-    );
-    
-    -- Store folder ID mapping
-    INSERT INTO migration.id_mappings (
-        table_name,
-        old_id,
-        new_id,
-        migration_batch
-    ) VALUES (
-        'folders',
-        v_old_folder_id,
-        v_folder_id,
-        'folders_20260313_145446'
-    );
-    
-    RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
-END $$;
-
-
--- Folder: enterprise-search (owner: 306916b02924f0142a236cc978b0d013)
-DO $$
-DECLARE
-    v_old_folder_id VARCHAR := '1368';
-    v_old_owner_id VARCHAR := '306916b02924f0142a236cc978b0d013';
-    v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, '306916b02924f0142a236cc978b0d013');
-BEGIN
-    -- Check if folder already migrated using mapping table (FAST)
-    IF migration.is_migrated('folders', v_old_folder_id) THEN
-        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
-        RETURN;
-    END IF;
-    
-    -- Insert folder
-    INSERT INTO document_db.public.folders (
-        id,
-        folder_name,
-        parent_id,
-        folder_type,
-        user_id,
-        created_at,
-        updated_at,
-        deleted_at
-    ) VALUES (
-        v_folder_id,
-        'enterprise-search',
-        NULL,
-        'bot'::public.folders_folder_type_enum,
-        v_user_id,
-        '2026-01-16T10:20:27.639439',
-        now(),
-        NULL
-    );
-    
-    -- Store folder ID mapping
-    INSERT INTO migration.id_mappings (
-        table_name,
-        old_id,
-        new_id,
-        migration_batch
-    ) VALUES (
-        'folders',
-        v_old_folder_id,
-        v_folder_id,
-        'folders_20260313_145446'
-    );
-    
-    RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
-END $$;
-
-
--- Folder: finops (owner: 306916b02924f0142a236cc978b0d013)
-DO $$
-DECLARE
-    v_old_folder_id VARCHAR := '1369';
-    v_old_owner_id VARCHAR := '306916b02924f0142a236cc978b0d013';
-    v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, '306916b02924f0142a236cc978b0d013');
-BEGIN
-    -- Check if folder already migrated using mapping table (FAST)
-    IF migration.is_migrated('folders', v_old_folder_id) THEN
-        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
-        RETURN;
-    END IF;
-    
-    -- Insert folder
-    INSERT INTO document_db.public.folders (
-        id,
-        folder_name,
-        parent_id,
-        folder_type,
-        user_id,
-        created_at,
-        updated_at,
-        deleted_at
-    ) VALUES (
-        v_folder_id,
-        'finops',
-        NULL,
-        'bot'::public.folders_folder_type_enum,
-        v_user_id,
-        '2026-01-17T06:33:42.626170',
-        now(),
-        NULL
-    );
-    
-    -- Store folder ID mapping
-    INSERT INTO migration.id_mappings (
-        table_name,
-        old_id,
-        new_id,
-        migration_batch
-    ) VALUES (
-        'folders',
-        v_old_folder_id,
-        v_folder_id,
-        'folders_20260313_145446'
+        'folders_20260313_192618'
     );
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
@@ -459,9 +251,9 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'folders_20260313_145446';
+WHERE batch_id = 'folders_20260313_192618';
 
--- Total folders processed: 6
+-- Total folders processed: 2
 -- Skipped (no ID): 0
 -- Note: Folders inserted in parent-first order using deterministic UUIDs (uuid_generate_v5)
 -- Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b

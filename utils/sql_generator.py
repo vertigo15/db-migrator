@@ -1481,9 +1481,15 @@ BEGIN
     -- Lookup document_id from migration mapping table (FAST)
     v_document_id := migration.get_new_id('documents', v_old_doc_id);
     
-    -- Skip if document not found
+    -- Skip if document not found in mapping
     IF v_document_id IS NULL THEN
         RAISE NOTICE 'Skipping chunk % - document % not migrated', '{legacy_id}', v_old_doc_id;
+        RETURN;
+    END IF;
+    
+    -- Verify document actually exists (mapping can be stale)
+    IF NOT EXISTS (SELECT 1 FROM documents WHERE id = v_document_id) THEN
+        RAISE NOTICE 'Skipping chunk % - document % has stale mapping (not in documents table)', '{legacy_id}', v_old_doc_id;
         RETURN;
     END IF;
     
@@ -1553,6 +1559,11 @@ BEGIN
     v_document_id := migration.get_new_id('documents', v_old_doc_id);
     
     IF v_document_id IS NULL THEN
+        RETURN;
+    END IF;
+    
+    -- Verify document actually exists
+    IF NOT EXISTS (SELECT 1 FROM documents WHERE id = v_document_id) THEN
         RETURN;
     END IF;
     
