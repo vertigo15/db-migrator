@@ -207,7 +207,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -220,7 +221,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -284,7 +286,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -297,7 +300,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -361,7 +365,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -374,7 +379,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -438,7 +444,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -451,7 +458,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -515,7 +523,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -528,7 +537,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -592,7 +602,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -605,7 +616,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -669,7 +681,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -682,7 +695,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -746,7 +760,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -759,7 +774,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -823,7 +839,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -836,7 +853,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -900,7 +918,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -913,7 +932,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -977,7 +997,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -990,7 +1011,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -1054,7 +1076,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -1067,7 +1090,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -1131,7 +1155,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
@@ -1144,7 +1169,8 @@ BEGIN
         v_old_doc_id,
         v_new_doc_id,
         'documents_20260313_192619'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -1156,3 +1182,5 @@ WHERE batch_id = 'documents_20260313_192619';
 
 -- Total documents processed: 13
 -- Skipped (no doc_id): 0
+
+

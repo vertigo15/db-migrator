@@ -1,10 +1,10 @@
 -- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-13T19:26:27.100381
+-- Generated: 2026-03-16T17:43:55.189176
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: conversations + messages + message_content_blocks
--- Source rows: 28
+-- Source rows: 20
 -- 
 -- IMPORTANT: This script will INSERT data into 3 tables!
 -- IMPORTANT: Run users migration first.
@@ -35,9 +35,9 @@ BEGIN
     RAISE NOTICE 'CONVERSATIONS/MESSAGES MIGRATION - CONFIRMATION REQUIRED';
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate conversations and messages';
-    RAISE NOTICE 'Source rows: 28';
+    RAISE NOTICE 'Source rows: 20';
     RAISE NOTICE 'Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b';
-    RAISE NOTICE 'Generated: 2026-03-13T19:26:27.100437';
+    RAISE NOTICE 'Generated: 2026-03-16T17:43:55.189219';
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'PREREQUISITE: Users must be migrated first!';
     RAISE NOTICE '============================================================';
@@ -149,19 +149,15 @@ ORDER BY table_name;
 
 
 
--- User: e994b100cd7b6327b45618f254d1b708 (Batch 1, 7 conversations)
+-- User: e994b100cd7b6327b45618f254d1b708 (Batch 1, 3 conversations)
 
 -- Conversations INSERT
 INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 SELECT * FROM (
   VALUES
     ('59f17339-9dee-436e-b516-e1b2009938e3'::uuid, 'אתה יכול לגשת ל IQFRDJPOZiXMIJiK?', 28, 2705, true, NULL::timestamp, '2026-02-24T09:48:06.045027'::timestamptz, '2026-02-24T12:25:50.491686'::timestamptz, '2026-02-24T12:25:50.491686'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708')),
-    ('bb7275de-1f0c-40dc-a8e8-404753dc3552'::uuid, 'Current Temperature Inquiry in Tel Aviv', 4, 67, true, NULL::timestamp, '2026-03-12T12:02:03.904396'::timestamptz, '2026-03-12T12:02:13.153963'::timestamptz, '2026-03-12T12:02:13.153963'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708')),
-    ('c4d248a7-4412-4c27-8337-aba74743741d'::uuid, 'What colors is the Galaxy Flip available in?', 6, 127, true, NULL::timestamp, '2026-02-23T13:58:25.074495'::timestamptz, '2026-02-23T14:29:49.694920'::timestamptz, '2026-02-23T14:29:49.694920'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708')),
-    ('c95f2315-d09a-48c0-b6d9-579c56bd3f68'::uuid, 'Title Formal Tone Guidelines for Rewriting Documents', 4, 88, true, NULL::timestamp, '2026-02-23T12:31:36.480150'::timestamptz, '2026-02-23T12:32:16.923535'::timestamptz, '2026-02-23T12:32:16.923535'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708')),
-    ('d3745c56-d04b-4422-a0ef-57a2e3628c3c'::uuid, 'דרכי תמיכה ועזרה של AI', 6, 158, true, NULL::timestamp, '2026-03-11T08:55:31.750305'::timestamptz, '2026-03-11T10:12:04.779891'::timestamptz, '2026-03-11T10:12:04.779891'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708')),
-    ('d8f938b9-12cb-4770-9527-1456de0a952f'::uuid, 'Title Capabilities and Functions of AI GPT-4', 4, 68, true, NULL::timestamp, '2026-03-11T10:14:57.060622'::timestamptz, '2026-03-11T10:15:04.310787'::timestamptz, '2026-03-11T10:15:04.310787'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708')),
-    ('e21110bc-a66f-4234-9c2d-4dfd3732edbd'::uuid, 'Current Temperature Inquiry for Modiin', 4, 60, true, NULL::timestamp, '2026-03-12T12:02:23.528267'::timestamptz, '2026-03-12T12:02:31.249535'::timestamptz, '2026-03-12T12:02:31.249535'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708'))
+    ('99855df6-acd4-49b5-87b1-c5398c2ba538'::uuid, 'לא ספר משהו מעניין פשוט', 6, 121, true, NULL::timestamp, '2026-03-15T14:35:33.932198'::timestamptz, '2026-03-15T14:35:47.974038'::timestamptz, '2026-03-15T14:35:47.974038'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708')),
+    ('c4d248a7-4412-4c27-8337-aba74743741d'::uuid, 'What colors is the Galaxy Flip available in?', 6, 127, true, NULL::timestamp, '2026-02-23T13:58:25.074495'::timestamptz, '2026-02-23T14:29:49.694920'::timestamptz, '2026-02-23T14:29:49.694920'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708'))
 ) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 

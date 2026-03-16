@@ -178,7 +178,8 @@ BEGIN
         '2026-03-11T12:40:50.253226',
         now(),
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store folder ID mapping
     INSERT INTO migration.id_mappings (
@@ -191,13 +192,14 @@ BEGIN
         v_old_folder_id,
         v_folder_id,
         'folders_20260313_192618'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;
 
 
--- Folder: ArielTest2 (owner: e994b100cd7b6327b45618f254d1b708)
+-- Folder: ArielTest2
 DO $$
 DECLARE
     v_old_folder_id VARCHAR := '1396';
@@ -230,7 +232,8 @@ BEGIN
         '2026-03-12T09:25:28.992700',
         now(),
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store folder ID mapping
     INSERT INTO migration.id_mappings (
@@ -243,7 +246,8 @@ BEGIN
         v_old_folder_id,
         v_folder_id,
         'folders_20260313_192618'
-    );
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;

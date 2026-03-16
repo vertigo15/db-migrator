@@ -798,7 +798,8 @@ BEGIN
         {created_at_sql},
         now(),
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store folder ID mapping
     INSERT INTO migration.id_mappings (
@@ -1135,7 +1136,8 @@ BEGIN
         NULL,
         'upload'::public.documents_source_type_enum,
         NULL
-    );
+    )
+    ON CONFLICT (id) DO NOTHING;
     
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (

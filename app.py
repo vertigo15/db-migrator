@@ -254,6 +254,8 @@ def main():
         mid -.-> d
         mid -.-> c
         mid -.-> ag
+        mid -.-> ad
+        mid -.-> cv
     </div>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <script>
