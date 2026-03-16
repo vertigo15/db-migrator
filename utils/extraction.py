@@ -461,6 +461,90 @@ class ExtractionEngine:
         
         return df, output_path
     
+    def _topup_agent_documents(
+        self,
+        agents_df: pd.DataFrame,
+        docs_df: pd.DataFrame,
+        embeddings_df: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+        """
+        Auto-include documents referenced by agents that were not explicitly selected.
+
+        Collects all doc IDs from agents_df.docs_chosen, finds which are absent from
+        docs_df, fetches them unconditionally from the source DB, and appends them
+        together with their embeddings.
+
+        Returns:
+            (updated_docs_df, updated_embeddings_df, topup_count)
+        """
+        # Collect every doc ID referenced by any agent
+        agent_doc_ids: set = set()
+        for _, row in agents_df.iterrows():
+            docs_chosen_raw = row.get('docs_chosen')
+            if docs_chosen_raw is None or (isinstance(docs_chosen_raw, float) and pd.isna(docs_chosen_raw)):
+                continue
+            if isinstance(docs_chosen_raw, list):
+                for d in docs_chosen_raw:
+                    v = str(d).strip() if d is not None else ''
+                    if v:
+                        agent_doc_ids.add(v)
+            elif isinstance(docs_chosen_raw, str):
+                cleaned = docs_chosen_raw.strip('{}')
+                if cleaned:
+                    for d in cleaned.split(','):
+                        v = d.strip().strip('"')
+                        if v:
+                            agent_doc_ids.add(v)
+
+        if not agent_doc_ids:
+            return docs_df, embeddings_df, 0
+
+        # Determine which doc IDs are already in docs_df
+        existing_ids = set(docs_df["doc_id"].astype(str).tolist()) if len(docs_df) > 0 else set()
+        missing_ids = agent_doc_ids - existing_ids
+
+        if not missing_ids:
+            return docs_df, embeddings_df, 0
+
+        print(f"[topup] Fetching {len(missing_ids)} agent-referenced document(s) not in selection...")
+
+        # Fetch missing documents (no user / date / size filters — agent references override)
+        docs_table = get_table_name("custom_documents", self.prefix)
+        placeholders = ", ".join(["%s"] * len(missing_ids))
+        docs_query = f"""
+            SELECT doc_id, created_at, owner_id, doc_name_origin, doc_title, doc_size,
+                   folder_id, doc_description, doc_type, vector_methods, doc_summery,
+                   doc_summery_modified_by, doc_summery_modified_at, tags, embedding_model,
+                   blob_source, version, doc_checksum, data_integration_doc_metadata
+            FROM public.{docs_table}
+            WHERE doc_id IN ({placeholders})
+        """
+        new_docs_df = execute_query(self.config, docs_query, tuple(missing_ids))
+
+        if len(new_docs_df) == 0:
+            print(f"[topup] Warning: none of the {len(missing_ids)} referenced doc ID(s) were found "
+                  "(may have been deleted from source).")
+            return docs_df, embeddings_df, 0
+
+        topup_count = len(new_docs_df)
+        docs_df = pd.concat([docs_df, new_docs_df], ignore_index=True)
+
+        # Fetch embeddings for the newly added documents
+        new_doc_ids = new_docs_df["doc_id"].tolist()
+        emb_table = get_table_name("embeddings", self.prefix)
+        emb_placeholders = ", ".join(["%s"] * len(new_doc_ids))
+        emb_query = f"""
+            SELECT id, external_id, collection, document, metadata, embeddings
+            FROM public.{emb_table}
+            WHERE metadata->>'doc_id' IN ({emb_placeholders})
+        """
+        new_emb_df = execute_query(self.config, emb_query, tuple(new_doc_ids))
+        if len(new_emb_df) > 0:
+            embeddings_df = pd.concat([embeddings_df, new_emb_df], ignore_index=True)
+
+        print(f"[topup] Added {topup_count} document(s) and {len(new_emb_df)} embedding chunk(s).")
+        return docs_df, embeddings_df, topup_count
+
     def extract_logs(
         self,
         user_ids: List[str]
@@ -540,6 +624,7 @@ class ExtractionEngine:
         
         total_steps = 7
         current_step = 0
+        embeddings_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
         
         try:
             # 1. Extract users
@@ -621,6 +706,7 @@ class ExtractionEngine:
                         results["sql_files"]["chunks_embeddings"] = sql_path
             else:
                 results["summary"]["embeddings"] = 0
+                embeddings_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
             
             # 6. Extract agents
             current_step += 1
@@ -634,7 +720,61 @@ class ExtractionEngine:
                 sql_path = os.path.join(self.sql_output_dir, f"06_agents_{self.timestamp}.sql")
                 if os.path.exists(sql_path):
                     results["sql_files"]["agents"] = sql_path
-            
+
+            # 6.5 Auto-topup: pull in any agent-referenced documents that were not selected
+            if len(agents_df) > 0:
+                source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
+                docs_df, embeddings_df, topup_count = self._topup_agent_documents(
+                    agents_df, docs_df, embeddings_df
+                )
+                if topup_count > 0:
+                    results["summary"]["documents"] = len(docs_df)
+
+                    # Update documents CSV
+                    if self.export_csv:
+                        docs_csv_path = os.path.join(self.output_dir, f"documents_{self.timestamp}.csv")
+                        docs_df.to_csv(docs_csv_path, index=False)
+
+                    # Regenerate 03_documents SQL (overwrites the file written in step 4)
+                    if self.generate_sql:
+                        docs_sql_path = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
+                        try:
+                            generate_documents_migration_sql(
+                                documents_df=docs_df,
+                                output_file=docs_sql_path,
+                                source_info=source_info,
+                                user_id_overrides=self.user_id_overrides
+                            )
+                            results["sql_files"]["documents"] = docs_sql_path
+                        except Exception as e:
+                            results["errors"].append(f"[topup] Failed to regenerate documents SQL: {e}")
+
+                    # Regenerate 04_chunks_embeddings SQL (overwrites existing file)
+                    if self.generate_sql and len(embeddings_df) > 0:
+                        emb_sql_path = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
+                        emb_source_info = (
+                            f"{self.config.host}:{self.config.port}/{self.config.database}"
+                            f" (table: {get_table_name('embeddings', self.prefix)})"
+                        )
+                        try:
+                            generate_chunks_embeddings_migration_sql(
+                                jeen_dev_df=embeddings_df,
+                                output_file=emb_sql_path,
+                                source_info=emb_source_info,
+                                default_embedding_model=self.embedding_model,
+                                skip_empty_embeddings=self.skip_empty_embeddings,
+                                target_embedding_dim=self.target_embedding_dim
+                            )
+                            results["sql_files"]["chunks_embeddings"] = emb_sql_path
+                            results["summary"]["embeddings"] = len(embeddings_df)
+                        except Exception as e:
+                            results["errors"].append(f"[topup] Failed to regenerate embeddings SQL: {e}")
+
+                    # Update embeddings CSV
+                    if self.export_csv and len(embeddings_df) > 0:
+                        emb_csv_path = os.path.join(self.output_dir, f"embeddings_{self.timestamp}.csv")
+                        embeddings_df.to_csv(emb_csv_path, index=False)
+
             # 7. Extract logs (conversations/messages)
             current_step += 1
             self._report_progress("logs", current_step, total_steps)

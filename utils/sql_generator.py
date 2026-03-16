@@ -966,8 +966,18 @@ def generate_document_insert(
     doc_title = clean_string(row.get('doc_title'))
     doc_size = row.get('doc_size', 0)
     blob_source = clean_string(row.get('blob_source'))
-    folder_id = clean_string(row.get('folder_id'))
     doc_type = clean_string(row.get('doc_type'))
+
+    # folder_id is int4 in V4 — pandas may load it as float (e.g. 1393.0).
+    # Normalise to plain integer string so migration.id_mappings lookup matches.
+    _doc_folder_id_raw = row.get('folder_id')
+    if _doc_folder_id_raw is not None and not (isinstance(_doc_folder_id_raw, float) and pd.isna(_doc_folder_id_raw)):
+        try:
+            folder_id = str(int(float(_doc_folder_id_raw)))
+        except (ValueError, TypeError):
+            folder_id = clean_string(_doc_folder_id_raw)
+    else:
+        folder_id = None
     
     # Skip if no doc_id
     if not doc_id:
@@ -1003,12 +1013,6 @@ def generate_document_insert(
             created_at_sql = 'now()'
     else:
         created_at_sql = 'now()'
-    
-    # Generate folder_id SQL (deterministic UUID or NULL)
-    if folder_id:
-        folder_id_sql = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{folder_id}')"
-    else:
-        folder_id_sql = 'NULL'
     
     # Get content type
     content_type = get_content_type(doc_type)
@@ -2186,7 +2190,17 @@ def generate_agent_insert(
     """
     bot_id = clean_string(row.get('bot_id'))
     user_id = clean_string(row.get('user_id'))
-    folder_id = clean_string(row.get('folder_id'))
+
+    # folder_id is int4 in V4 — pandas may load it as float (e.g. 1393.0).
+    # Must normalise to plain integer string so migration.id_mappings lookup matches.
+    _folder_id_raw = row.get('folder_id')
+    if _folder_id_raw is not None and not (isinstance(_folder_id_raw, float) and pd.isna(_folder_id_raw)):
+        try:
+            folder_id = str(int(float(_folder_id_raw)))
+        except (ValueError, TypeError):
+            folder_id = clean_string(_folder_id_raw)
+    else:
+        folder_id = None
     
     if not bot_id:
         return None
@@ -2348,11 +2362,25 @@ def generate_agent_insert(
     folders_chosen = []
     if folders_chosen_raw is not None and not (isinstance(folders_chosen_raw, float) and pd.isna(folders_chosen_raw)):
         if isinstance(folders_chosen_raw, list):
-            folders_chosen = [str(f).strip() for f in folders_chosen_raw if f is not None]
+            # chosen_docs_folders is int4[] — normalise each element to plain integer string
+            for f in folders_chosen_raw:
+                if f is not None:
+                    try:
+                        folders_chosen.append(str(int(float(f))))
+                    except (ValueError, TypeError):
+                        v = str(f).strip()
+                        if v:
+                            folders_chosen.append(v)
         elif isinstance(folders_chosen_raw, str):
             cleaned = folders_chosen_raw.strip('{}')
             if cleaned:
-                folders_chosen = [f.strip() for f in cleaned.split(',') if f.strip()]
+                for f in cleaned.split(','):
+                    f = f.strip()
+                    if f:
+                        try:
+                            folders_chosen.append(str(int(float(f))))
+                        except (ValueError, TypeError):
+                            folders_chosen.append(f)
     
     # Build agent_documents SQL fragments
     doc_inserts = ''
