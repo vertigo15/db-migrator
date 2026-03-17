@@ -1,7 +1,7 @@
 -- ============================================================
 -- USERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-16T19:57:52.457076
+-- Generated: 2026-03-17T07:54:30.740694
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: user_db.public.users
 -- Records to migrate: 1
@@ -114,7 +114,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: user_db.public.users';
     RAISE NOTICE 'Organization ID: 356b50f7-bcbd-42aa-9392-e1605f42f7a1';
-    RAISE NOTICE 'Generated: 2026-03-16T19:57:52.457076';
+    RAISE NOTICE 'Generated: 2026-03-17T07:54:30.740694';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -141,15 +141,15 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('users_20260316_195752', 'users', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('users_20260317_075430', 'users', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
--- User: ariel221988@gmail.com
+-- User: maorne@jeen.ai
 DO $$
 DECLARE
-    v_old_id VARCHAR := '3759d1b241a964882cedf91c7033ab00';
-    v_email VARCHAR := 'ariel221988@gmail.com';
+    v_old_id VARCHAR := '306916b02924f0142a236cc978b0d013';
+    v_email VARCHAR := 'maorne@jeen.ai';
     v_new_id UUID;
 BEGIN
     -- Check if already migrated using mapping table (FAST)
@@ -180,13 +180,13 @@ BEGIN
             preferred_language
         ) VALUES (
             v_new_id,
-            'ariel221988@gmail.com',
-            'ariel221988',
+            'maorne@jeen.ai',
+            'maorne',
             NULL,
-            'ariel221988',
+            'maorne',
             NULL,
-            '{"legacyData": {"id": "3759d1b241a964882cedf91c7033ab00", "job": null, "model": ["gemini-2.5-pro-preview-06-05", "gpt-oss-120b", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-4o"], "group_id": "1", "azure_oid": null, "department": null, "token_used": "0", "words_used": "0", "subfeatures": {"reasoning": false, "web_search": true, "control_panel": true, "reasoning_web": true, "see_all_agents": false, "create_new_agent": true, "read_aloud_message": false, "organizational_files": false}, "token_limit": "1000000", "company_name": null, "phone_number": null, "last_connected": "1749551448790", "letter_checkbox": null, "times_connected": "0", "enabled_features": ["admin", "sources", "automation", "chat", "voice"], "history_categories": ["tech", "tools", "ai"], "company_name_in_hebrew": null}}'::jsonb,
-            '2025-06-10T10:30:54.330089',
+            '{"legacyData": {"id": "306916b02924f0142a236cc978b0d013", "job": null, "model": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-4o"], "group_id": "27", "azure_oid": null, "department": null, "token_used": "6675608", "words_used": "3880028", "subfeatures": {"reasoning": true, "web_search": true, "control_panel": true, "reasoning_web": true, "see_all_agents": true, "create_new_agent": true, "read_aloud_message": true, "organizational_files": true}, "token_limit": "350000000", "company_name": null, "phone_number": null, "last_connected": "1773659657377", "letter_checkbox": null, "times_connected": "152", "enabled_features": ["chat", "admin", "voice", "sources", "interactive", "workflow"], "history_categories": ["tech", "tools", "ai"], "company_name_in_hebrew": null}}'::jsonb,
+            '2025-12-01T08:09:37.429576',
             now(),
             NULL,
             NULL,
@@ -202,7 +202,7 @@ BEGIN
         RETURNING id INTO v_new_id;
     EXCEPTION WHEN unique_violation THEN
         -- Username conflict — check if this user already exists by email
-        SELECT id INTO v_new_id FROM user_db.public.users WHERE email = 'ariel221988@gmail.com';
+        SELECT id INTO v_new_id FROM user_db.public.users WHERE email = 'maorne@jeen.ai';
         IF v_new_id IS NOT NULL THEN
             RAISE NOTICE 'User % already exists (matched by email), reusing id %', v_email, v_new_id;
         ELSE
@@ -215,11 +215,11 @@ BEGIN
                 organization_id, is_owner, preferred_language
             ) VALUES (
                 v_new_id,
-                'ariel221988@gmail.com',
-                'ariel221988',
+                'maorne@jeen.ai',
+                'maorne',
                 NULL,
-                'ariel221988@gmail.com',
-                NULL, '{"legacyData": {"id": "3759d1b241a964882cedf91c7033ab00", "job": null, "model": ["gemini-2.5-pro-preview-06-05", "gpt-oss-120b", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-4o"], "group_id": "1", "azure_oid": null, "department": null, "token_used": "0", "words_used": "0", "subfeatures": {"reasoning": false, "web_search": true, "control_panel": true, "reasoning_web": true, "see_all_agents": false, "create_new_agent": true, "read_aloud_message": false, "organizational_files": false}, "token_limit": "1000000", "company_name": null, "phone_number": null, "last_connected": "1749551448790", "letter_checkbox": null, "times_connected": "0", "enabled_features": ["admin", "sources", "automation", "chat", "voice"], "history_categories": ["tech", "tools", "ai"], "company_name_in_hebrew": null}}'::jsonb, '2025-06-10T10:30:54.330089', now(), NULL, NULL,
+                'maorne@jeen.ai',
+                NULL, '{"legacyData": {"id": "306916b02924f0142a236cc978b0d013", "job": null, "model": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-4o"], "group_id": "27", "azure_oid": null, "department": null, "token_used": "6675608", "words_used": "3880028", "subfeatures": {"reasoning": true, "web_search": true, "control_panel": true, "reasoning_web": true, "see_all_agents": true, "create_new_agent": true, "read_aloud_message": true, "organizational_files": true}, "token_limit": "350000000", "company_name": null, "phone_number": null, "last_connected": "1773659657377", "letter_checkbox": null, "times_connected": "152", "enabled_features": ["chat", "admin", "voice", "sources", "interactive", "workflow"], "history_categories": ["tech", "tools", "ai"], "company_name_in_hebrew": null}}'::jsonb, '2025-12-01T08:09:37.429576', now(), NULL, NULL,
                 '356b50f7-bcbd-42aa-9392-e1605f42f7a1'::uuid, false, NULL
             )
             ON CONFLICT (email) DO UPDATE SET
@@ -242,7 +242,7 @@ BEGIN
         'users',
         v_old_id,
         v_new_id,
-        'users_20260316_195752',
+        'users_20260317_075430',
         'Migrated from V4 users table'
     );
     
@@ -252,7 +252,7 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'users_20260316_195752';
+WHERE batch_id = 'users_20260317_075430';
 
 -- Total records processed: 1
 -- Skipped (no email): 0
