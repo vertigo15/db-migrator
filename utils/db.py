@@ -53,13 +53,15 @@ def get_connection(config: ConnectionConfig) -> psycopg2.extensions.connection:
     Returns:
         psycopg2 connection object
     """
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=config.host,
         port=config.port,
         database=config.database,
         user=config.username,
         password=config.password,
+        options='-c client_encoding=UTF8',
     )
+    return conn
 
 
 def test_connection(config: ConnectionConfig) -> Tuple[bool, str]:

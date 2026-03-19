@@ -224,13 +224,16 @@ def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
         (success: bool, message: str, rows_affected: int)
     """
     try:
-        # Read SQL file
+        # Read SQL file as UTF-8 (required for Hebrew/multilingual content)
         with open(file_path, 'r', encoding='utf-8') as f:
             sql_content = f.read()
         
         # Connect and execute
+        # Note: get_connection() already sets client_encoding=UTF8 globally.
         conn = get_connection(config)
-        conn.autocommit = False  # Use transactions
+        # Use autocommit so DDL statements (CREATE EXTENSION, CREATE SCHEMA, etc.)
+        # in the migration file are not wrapped in a single implicit transaction.
+        conn.autocommit = True
         cursor = conn.cursor()
         
         rows_affected = 0
@@ -239,7 +242,6 @@ def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
             # Execute the SQL
             cursor.execute(sql_content)
             rows_affected = cursor.rowcount
-            conn.commit()
             
             cursor.close()
             conn.close()
@@ -247,7 +249,6 @@ def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
             return (True, f"✅ Successfully executed! Rows affected: {rows_affected}", rows_affected)
             
         except Exception as e:
-            conn.rollback()
             cursor.close()
             conn.close()
             return (False, f"❌ Execution failed: {str(e)}", 0)

@@ -531,7 +531,7 @@ BEGIN
     
     -- Insert user (handle all unique constraint conflicts)
     BEGIN
-        INSERT INTO user_db.public.users (
+        INSERT INTO public.users (
             id,
             email,
             first_name,
@@ -570,14 +570,14 @@ BEGIN
         RETURNING id INTO v_new_id;
     EXCEPTION WHEN unique_violation THEN
         -- Username conflict — check if this user already exists by email
-        SELECT id INTO v_new_id FROM user_db.public.users WHERE email = {escape_sql_string(email)};
+        SELECT id INTO v_new_id FROM public.users WHERE email = v_email;
         IF v_new_id IS NOT NULL THEN
             RAISE NOTICE 'User % already exists (matched by email), reusing id %', v_email, v_new_id;
         ELSE
             -- User doesn't exist yet, username is taken — retry with email as username
             v_new_id := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
             RAISE NOTICE 'User %: username conflict, using email as username instead', v_email;
-            INSERT INTO user_db.public.users (
+            INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
                 metadata, created_at, updated_at, deleted_at, zitadel_user_id,
                 organization_id, is_owner, preferred_language
@@ -780,7 +780,7 @@ BEGIN
     END IF;
     
     -- Insert folder
-    INSERT INTO document_db.public.folders (
+    INSERT INTO public.folders (
         id,
         folder_name,
         parent_id,
@@ -1100,7 +1100,7 @@ BEGIN
     END IF;
     
     -- Insert document
-    INSERT INTO document_db.public.documents (
+    INSERT INTO public.documents (
         id,
         status,
         file_name,
@@ -1120,7 +1120,7 @@ BEGIN
         organization_id
     ) VALUES (
         v_new_doc_id,
-        'PROCESSED'::public.documents_status_enum,
+        'UPLOADED'::public.documents_status_enum,
         {escape_sql_string(file_name)},
         {file_size},
         {escape_sql_string(storage_type) if storage_type else 'NULL'},
@@ -1131,7 +1131,7 @@ BEGIN
         now(),
         NULL,
         v_folder_id,
-        v_user_id::varchar(255),
+        v_user_id,
         '{content_type}',
         NULL,
         'upload'::public.documents_source_type_enum,

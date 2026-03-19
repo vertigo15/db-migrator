@@ -287,3 +287,20 @@ def get_env_target_defaults() -> Dict[str, str]:
         "password": os.getenv("TARGET_DB_PASSWORD", ""),
         "schema_mode": os.getenv("TARGET_SCHEMA_MODE", "schemas"),
     }
+
+
+def get_env_org_id() -> str:
+    """Load default organisation ID from .env file (DEFAULT_ORG_ID)."""
+    return os.getenv("DEFAULT_ORG_ID", "356b50f7-bcbd-42aa-9392-e1605f42f7a1")
+
+
+EMBEDDING_MODEL_OPTIONS = [
+    "text-embedding-ada-002",
+    "BAAI/bge-m3",
+    "multilingual-e5-large",
+]
+
+
+def get_env_embedding_model() -> str:
+    """Load default embedding model from .env file (DEFAULT_EMBEDDING_MODEL)."""
+    return os.getenv("DEFAULT_EMBEDDING_MODEL", "text-embedding-ada-002")

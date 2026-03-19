@@ -19,7 +19,7 @@ from utils.storage import (
     save_selected_users, load_selected_users,
     save_document_filters, load_document_filters
 )
-from utils.config import SessionKeys, get_table_name
+from utils.config import SessionKeys, get_table_name, get_env_org_id, get_env_embedding_model, EMBEDDING_MODEL_OPTIONS
 from utils.extraction import (
     ExtractionEngine,
     get_document_count_preview,
@@ -761,15 +761,33 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         with col3:
             org_id = st.text_input(
                 "Org ID",
-                value="356b50f7-bcbd-42aa-9392-e1605f42f7a1",
-                help="Organization UUID for SQL generation"
+                value=get_env_org_id(),
+                help="Organization UUID for SQL generation (set DEFAULT_ORG_ID in .env to change default)"
             )
         with col4:
-            embedding_model = st.text_input(
-                "Embedding Model",
-                value="text-embedding-ada-002",
-                help="Default embedding model name for chunks/embeddings migration"
+            _env_model = get_env_embedding_model()
+            _custom_label = "Custom..."
+            _preset_options = EMBEDDING_MODEL_OPTIONS + [_custom_label]
+            _default_index = (
+                _preset_options.index(_env_model)
+                if _env_model in EMBEDDING_MODEL_OPTIONS
+                else _preset_options.index(_custom_label)
             )
+            _selected_model = st.selectbox(
+                "Embedding Model",
+                options=_preset_options,
+                index=_default_index,
+                help="Embedding model name written into the embeddings table. Existing V5 embeddings are never overwritten."
+            )
+            if _selected_model == _custom_label:
+                embedding_model = st.text_input(
+                    "Custom model name",
+                    value=_env_model if _env_model not in EMBEDDING_MODEL_OPTIONS else "",
+                    placeholder="e.g. my-custom-model",
+                    label_visibility="collapsed"
+                )
+            else:
+                embedding_model = _selected_model
         with col5:
             skip_empty_embeddings = st.checkbox(
                 "Skip empty",
@@ -816,7 +834,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 st.info(f"🔀 {len(user_id_overrides)} user ID override(s) configured.")
     else:
         org_id = "356b50f7-bcbd-42aa-9392-e1605f42f7a1"
-        embedding_model = "text-embedding-ada-002"
+        embedding_model = get_env_embedding_model()
         skip_empty_embeddings = False
         target_embedding_dim = None
         user_id_overrides = {}
