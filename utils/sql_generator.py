@@ -2014,10 +2014,17 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         user_parent = prev_assistant_msg_id if prev_assistant_msg_id else 'NULL::uuid'
                         user_created_at = f"'{created_at_str}'::timestamptz - interval '1 second'" if pd.notna(created_at) else 'now()'
                         
+                        # Build user message metadata with ordering info
+                        user_metadata = {
+                            'message_order': turn_idx * 2,
+                            'turn_index': turn_idx
+                        }
+                        user_metadata_escaped = escape_json_for_sql(user_metadata)
+                        
                         msg_values.append(
                             f"    ({user_msg_id}, '{conv['chat_id']}'::uuid, {user_parent}, 'user'::messages_role_enum, "
                             f"false, 1, 1, NULL::text, {user_created_at}, {user_created_at}, NULL::timestamp, "
-                            f"{resolve_user_id_sql(str(user_id), user_id_overrides)}, '{{}}'::jsonb)"
+                            f"{resolve_user_id_sql(str(user_id), user_id_overrides)}, {user_metadata_escaped})"
                         )
                         
                         # Assistant message
@@ -2049,6 +2056,8 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                             'calculated_time': int(log_row.get('calculated_time', 0)) if pd.notna(log_row.get('calculated_time')) else None,
                             'category': clean_string(log_row.get('category')),
                             'sentiment': clean_string(log_row.get('sentiment')),
+                            'message_order': turn_idx * 2 + 1,
+                            'turn_index': turn_idx,
                             'legacyData': {
                                 'legacy_log_id': legacy_id,
                                 'title': clean_string(log_row.get('title')),

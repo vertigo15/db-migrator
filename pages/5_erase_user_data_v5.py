@@ -42,9 +42,12 @@ V5_DATABASES = {
     "completion_db": {
         "label": "Completion DB",
         "tables": {
-            "agents":          {"pk": "id", "user_col": "user_id"},
-            "agent_settings":  {"pk": "id", "user_col": None, "parent": "agents", "fk": "agent_id"},
-            "agent_documents": {"pk": "id", "user_col": None, "parent": "agents", "fk": "agent_id"},
+            "conversations":          {"pk": "id", "user_col": "user_id"},
+            "messages":               {"pk": "id", "user_col": "user_id", "parent": "conversations", "fk": "conversation_id"},
+            "message_content_blocks": {"pk": "id", "user_col": None, "parent": "messages", "fk": "message_id"},
+            "agents":                 {"pk": "id", "user_col": "user_id"},
+            "agent_settings":         {"pk": "id", "user_col": None, "parent": "agents", "fk": "agent_id"},
+            "agent_documents":        {"pk": "id", "user_col": None, "parent": "agents", "fk": "agent_id"},
         },
     },
 }
@@ -57,6 +60,10 @@ DELETION_STEPS = [
     # --- Migration tracking tables (delete BEFORE data so subqueries still work) ---
     ("completion_db", "legacy_bot_to_agent_mapping", "Legacy bot-to-agent tracking",
      "DELETE FROM public.legacy_bot_to_agent_mapping WHERE new_agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "migration.id_mappings (conversations)", "Migration mappings for conversations",
+     "DELETE FROM migration.id_mappings WHERE table_name = 'conversations' AND new_id IN (SELECT id FROM public.conversations WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "migration.id_mappings (messages)", "Migration mappings for messages",
+     "DELETE FROM migration.id_mappings WHERE table_name = 'messages' AND new_id IN (SELECT id FROM public.messages WHERE user_id IN ({placeholders}))"),
     ("completion_db", "migration.id_mappings (agents)", "Migration mappings for agents",
      "DELETE FROM migration.id_mappings WHERE table_name = 'agents' AND new_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("document_db", "migration.id_mappings (documents)", "Migration mappings for documents",
@@ -65,6 +72,13 @@ DELETION_STEPS = [
      "DELETE FROM migration.id_mappings WHERE table_name = 'folders' AND new_id IN (SELECT id FROM public.folders WHERE user_id IN ({placeholders}))"),
     ("user_db", "migration.id_mappings (users)", "Migration mappings for users",
      "DELETE FROM migration.id_mappings WHERE table_name = 'users' AND new_id::text IN ({placeholders})"),
+    # --- completion_db — message_content_blocks → messages → conversations (children first) ---
+    ("completion_db", "message_content_blocks", "Message content blocks",
+     "DELETE FROM public.message_content_blocks WHERE message_id IN (SELECT id FROM public.messages WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "messages", "Messages",
+     "DELETE FROM public.messages WHERE user_id IN ({placeholders})"),
+    ("completion_db", "conversations", "Conversations",
+     "DELETE FROM public.conversations WHERE user_id IN ({placeholders})"),
     # --- completion_db — agents CASCADE to agent_settings + agent_documents ---
     ("completion_db", "agent_documents", "Agent ↔ Document links",
      "DELETE FROM public.agent_documents WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
@@ -88,13 +102,17 @@ DELETION_STEPS = [
     ("document_db", "migration.batch_log", "Migration batch log (document_db)",
      "DELETE FROM migration.batch_log WHERE table_name IN ('folders', 'documents', 'chunks_embeddings')"),
     ("completion_db", "migration.batch_log", "Migration batch log (completion_db)",
-     "DELETE FROM migration.batch_log WHERE table_name IN ('agents', 'conversations')"),
+     "DELETE FROM migration.batch_log WHERE table_name IN ('agents', 'conversations', 'messages', 'message_content_blocks')"),
 ]
 
 # Counting queries for the plan / verification (same order as DELETION_STEPS)
 COUNT_QUERIES = [
     ("completion_db", "legacy_bot_to_agent_mapping", "Legacy bot-to-agent tracking",
      "SELECT COUNT(*) FROM public.legacy_bot_to_agent_mapping WHERE new_agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "migration.id_mappings (conversations)", "Migration mappings for conversations",
+     "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'conversations' AND new_id IN (SELECT id FROM public.conversations WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "migration.id_mappings (messages)", "Migration mappings for messages",
+     "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'messages' AND new_id IN (SELECT id FROM public.messages WHERE user_id IN ({placeholders}))"),
     ("completion_db", "migration.id_mappings (agents)", "Migration mappings for agents",
      "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'agents' AND new_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("document_db", "migration.id_mappings (documents)", "Migration mappings for documents",
@@ -103,6 +121,12 @@ COUNT_QUERIES = [
      "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'folders' AND new_id IN (SELECT id FROM public.folders WHERE user_id IN ({placeholders}))"),
     ("user_db", "migration.id_mappings (users)", "Migration mappings for users",
      "SELECT COUNT(*) FROM migration.id_mappings WHERE table_name = 'users' AND new_id::text IN ({placeholders})"),
+    ("completion_db", "message_content_blocks", "Message content blocks",
+     "SELECT COUNT(*) FROM public.message_content_blocks WHERE message_id IN (SELECT id FROM public.messages WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "messages", "Messages",
+     "SELECT COUNT(*) FROM public.messages WHERE user_id IN ({placeholders})"),
+    ("completion_db", "conversations", "Conversations",
+     "SELECT COUNT(*) FROM public.conversations WHERE user_id IN ({placeholders})"),
     ("completion_db", "agent_documents", "Agent ↔ Document links",
      "SELECT COUNT(*) FROM public.agent_documents WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("completion_db", "agent_settings", "Agent settings",
@@ -122,7 +146,7 @@ COUNT_QUERIES = [
     ("document_db", "migration.batch_log", "Migration batch log (document_db)",
      "SELECT COUNT(*) FROM migration.batch_log WHERE table_name IN ('folders', 'documents', 'chunks_embeddings')"),
     ("completion_db", "migration.batch_log", "Migration batch log (completion_db)",
-     "SELECT COUNT(*) FROM migration.batch_log WHERE table_name IN ('agents', 'conversations')"),
+     "SELECT COUNT(*) FROM migration.batch_log WHERE table_name IN ('agents', 'conversations', 'messages', 'message_content_blocks')"),
 ]
 
 
