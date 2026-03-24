@@ -1,7 +1,7 @@
 -- ============================================================
 -- FOLDERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-19T17:30:49.875788
+-- Generated: 2026-03-24T08:14:46.775520
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: document_db.public.folders
 -- Records to migrate: 1
@@ -114,7 +114,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: document_db.public.folders';
     
-    RAISE NOTICE 'Generated: 2026-03-19T17:30:49.875788';
+    RAISE NOTICE 'Generated: 2026-03-24T08:14:46.775520';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -141,7 +141,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('folders_20260319_173049', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('folders_20260324_081446', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
@@ -191,7 +191,7 @@ BEGIN
         'folders',
         v_old_folder_id,
         v_folder_id,
-        'folders_20260319_173049'
+        'folders_20260324_081446'
     );
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
@@ -200,7 +200,7 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'folders_20260319_173049';
+WHERE batch_id = 'folders_20260324_081446';
 
 -- Total folders processed: 1
 -- Skipped (no ID): 0

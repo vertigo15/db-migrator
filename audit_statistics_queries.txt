@@ -1,0 +1,561 @@
+================================================================================
+SQL QUERIES: "Calculate Audit Statistics" Button
+Source file : utils/audit.py  →  run_full_audit()
+Triggered by: pages/1_connect.py  line 215
+Table prefix: {prefix}  (default: jeen_dev)
+              embeddings table = {prefix}  (no suffix)
+              all others       = {prefix}_{logical_name}
+Total queries: 33
+================================================================================
+
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 2 — USER ANALYTICS  (5 queries)
+════════════════════════════════════════════════════════════════════════════════
+
+-- Q-01  audit_top_users_by_logs()
+-- Top 10 Users by Chat Activity
+SELECT
+    u.id                         AS legacy_user_id,
+    u.name                       AS user_name,
+    TRIM(u.email)                AS email,
+    COUNT(l.id)                  AS total_log_entries,
+    COUNT(DISTINCT l.chat_id)    AS total_conversations
+FROM public.{prefix}_logs l
+JOIN public.{prefix}_users u ON u.id = l.user_id
+WHERE l.user_id IS NOT NULL
+GROUP BY u.id, u.name, u.email
+ORDER BY total_log_entries DESC
+LIMIT 10;
+
+
+-- Q-02  audit_top_users_by_documents()
+-- Top 10 Users by Document Count
+SELECT
+    u.id                                                              AS legacy_user_id,
+    u.name                                                            AS user_name,
+    TRIM(u.email)                                                     AS email,
+    COUNT(d.doc_id)                                                   AS total_documents,
+    ROUND(SUM(COALESCE(d.doc_size, 0))::numeric / (1024.0 * 1024.0), 2) AS total_size_mb
+FROM public.{prefix}_custom_documents d
+JOIN public.{prefix}_users u ON u.id = d.owner_id
+GROUP BY u.id, u.name, u.email
+ORDER BY total_documents DESC
+LIMIT 10;
+
+
+-- Q-03  audit_top_users_by_chunks()
+-- Top 10 Users by Chunk/Embedding Count
+SELECT
+    u.id              AS legacy_user_id,
+    u.name            AS user_name,
+    TRIM(u.email)     AS email,
+    COUNT(c.id)       AS total_chunks
+FROM public.{prefix} c
+JOIN public.{prefix}_users u ON u.id = c.metadata->>'user_id'
+WHERE c.metadata->>'type' = 'chunk-data'
+GROUP BY u.id, u.name, u.email
+ORDER BY total_chunks DESC
+LIMIT 10;
+
+
+-- Q-04  audit_users_without_email()
+-- Users With No Email (will be SKIPPED by migration)
+SELECT
+    id    AS legacy_user_id,
+    name  AS user_name,
+    email
+FROM public.{prefix}_users
+WHERE TRIM(COALESCE(email, '')) = '';
+
+
+-- Q-05  audit_username_collisions()
+-- Potential Username Collisions (same email prefix across domains)
+SELECT
+    SPLIT_PART(TRIM(email), '@', 1)  AS username_prefix,
+    COUNT(*)                          AS user_count,
+    ARRAY_AGG(TRIM(email))            AS emails
+FROM public.{prefix}_users
+WHERE TRIM(COALESCE(email, '')) != ''
+GROUP BY SPLIT_PART(TRIM(email), '@', 1)
+HAVING COUNT(*) > 1
+ORDER BY user_count DESC;
+
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 3 — FOLDER ANALYTICS  (4 queries)
+════════════════════════════════════════════════════════════════════════════════
+
+-- Q-06  audit_folder_hierarchy_depth()
+-- Folder Hierarchy Depth
+WITH RECURSIVE folder_tree AS (
+    SELECT id, folder_name, parent_id, 1 AS depth
+    FROM public.{prefix}_folders
+    WHERE parent_id IS NULL
+
+    UNION ALL
+
+    SELECT f.id, f.folder_name, f.parent_id, ft.depth + 1
+    FROM public.{prefix}_folders f
+    JOIN folder_tree ft ON f.parent_id = ft.id
+)
+SELECT depth, COUNT(*) AS folder_count
+FROM folder_tree
+GROUP BY depth
+ORDER BY depth;
+
+
+-- Q-07  audit_folders_multilevel()
+-- Folders at Depth > 1 (will lose parent relationship)
+WITH RECURSIVE folder_tree AS (
+    SELECT id, folder_name, parent_id, 1 AS depth
+    FROM public.{prefix}_folders
+    WHERE parent_id IS NULL
+
+    UNION ALL
+
+    SELECT f.id, f.folder_name, f.parent_id, ft.depth + 1
+    FROM public.{prefix}_folders f
+    JOIN folder_tree ft ON f.parent_id = ft.id
+)
+SELECT id, folder_name, parent_id, depth
+FROM folder_tree
+WHERE depth > 1
+ORDER BY depth DESC, folder_name
+LIMIT 50;
+
+
+-- Q-08  audit_folder_type_distribution()
+-- Folder Type Distribution
+SELECT
+    COALESCE(folder_type, '(null)')  AS folder_type,
+    COUNT(*)                          AS folder_count
+FROM public.{prefix}_folders
+GROUP BY folder_type
+ORDER BY folder_count DESC;
+
+
+-- Q-09  audit_orphaned_folders()
+-- Orphaned Folders (parent_id references non-existent folder)
+SELECT
+    f.id,
+    f.folder_name,
+    f.parent_id  AS missing_parent_id
+FROM public.{prefix}_folders f
+WHERE f.parent_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM public.{prefix}_folders p WHERE p.id = f.parent_id
+  );
+
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 4 — DOCUMENT ANALYTICS  (6 queries)
+════════════════════════════════════════════════════════════════════════════════
+
+-- Q-10  audit_doc_type_distribution()
+-- Document Type Distribution
+SELECT
+    COALESCE(TRIM(doc_type), '(null)')  AS doc_type,
+    COUNT(*)                             AS doc_count
+FROM public.{prefix}_custom_documents
+GROUP BY TRIM(doc_type)
+ORDER BY doc_count DESC;
+
+
+-- Q-11  audit_problematic_doc_types()
+-- Problematic Doc Types (will become application/octet-stream)
+SELECT
+    dt.doc_type,
+    dt.doc_count,
+    samples.sample_doc_ids
+FROM (
+    SELECT COALESCE(TRIM(doc_type), '(null)') AS doc_type, COUNT(*) AS doc_count
+    FROM public.{prefix}_custom_documents
+    WHERE TRIM(LOWER(COALESCE(doc_type, ''))) NOT IN (
+        'pdf','docx','pptx','xlsx','doc','ppt','xls','txt','csv','html','json',
+        'png','jpg','jpeg','gif','svg','webp','md','mp3','mp4',
+        'application/pdf','image/png','image/jpeg'
+    )
+    GROUP BY COALESCE(TRIM(doc_type), '(null)')
+) dt
+CROSS JOIN LATERAL (
+    SELECT ARRAY_AGG(doc_id) AS sample_doc_ids
+    FROM (
+        SELECT doc_id FROM public.{prefix}_custom_documents d2
+        WHERE COALESCE(TRIM(d2.doc_type), '(null)') = dt.doc_type
+        ORDER BY doc_id LIMIT 3
+    ) sub
+) samples
+ORDER BY dt.doc_count DESC;
+
+
+-- Q-12  audit_blob_source_distribution()
+-- Blob Source Distribution
+SELECT
+    COALESCE(blob_source, '(null)')  AS blob_source,
+    COUNT(*)                          AS doc_count
+FROM public.{prefix}_custom_documents
+GROUP BY blob_source
+ORDER BY doc_count DESC;
+
+
+-- Q-13  audit_orphaned_documents()
+-- Count of Documents Without a Valid Owner (returns single integer)
+SELECT COUNT(*) AS orphaned_docs
+FROM public.{prefix}_custom_documents d
+WHERE NOT EXISTS (
+    SELECT 1 FROM public.{prefix}_users u WHERE u.id = d.owner_id
+);
+
+
+-- Q-14  audit_docs_missing_folders()
+-- Count of Documents Referencing Non-Existent Folders (returns single integer)
+SELECT COUNT(*) AS docs_with_missing_folder
+FROM public.{prefix}_custom_documents d
+WHERE d.folder_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM public.{prefix}_folders f WHERE f.id = d.folder_id
+  );
+
+
+-- Q-15  audit_duplicate_doc_ids()
+-- Duplicate doc_id Values
+SELECT doc_id, COUNT(*) AS occurrences
+FROM public.{prefix}_custom_documents
+GROUP BY doc_id
+HAVING COUNT(*) > 1
+ORDER BY occurrences DESC;
+
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 5 — CHUNKS & EMBEDDINGS ANALYTICS  (6 queries)
+════════════════════════════════════════════════════════════════════════════════
+
+-- Q-16  audit_chunks_per_document()
+-- Top 20 Documents by Chunk Count
+SELECT
+    metadata->>'doc_id'  AS doc_id,
+    COUNT(*)             AS chunk_count
+FROM public.{prefix}
+WHERE metadata->>'type' = 'chunk-data'
+GROUP BY metadata->>'doc_id'
+ORDER BY chunk_count DESC
+LIMIT 20;
+
+
+-- Q-17  audit_orphaned_chunks()
+-- Chunks Referencing Documents That Don't Exist (returns 2 counts)
+SELECT
+    COUNT(*)                              AS orphaned_chunks,
+    COUNT(DISTINCT metadata->>'doc_id')   AS orphaned_doc_ids
+FROM public.{prefix} c
+WHERE c.metadata->>'type' = 'chunk-data'
+  AND NOT EXISTS (
+    SELECT 1 FROM public.{prefix}_custom_documents d
+    WHERE d.doc_id = c.metadata->>'doc_id'
+  );
+
+
+-- Q-18  audit_chunks_without_embeddings()
+-- Count of Chunks With NULL Embeddings (returns single integer)
+SELECT COUNT(*) AS chunks_without_embeddings
+FROM public.{prefix}
+WHERE metadata->>'type' = 'chunk-data'
+  AND embeddings IS NULL;
+
+
+-- Q-19  audit_embedding_dimensions()
+-- Embedding Vector Dimensions (top 5)
+SELECT
+    array_length(
+        string_to_array(trim(both '[]' from embeddings::text), ','),
+        1
+    )                AS vector_dimension,
+    COUNT(*)         AS chunk_count
+FROM public.{prefix}
+WHERE metadata->>'type' = 'chunk-data'
+  AND embeddings IS NOT NULL
+GROUP BY 1
+ORDER BY chunk_count DESC
+LIMIT 5;
+
+
+-- Q-20  audit_chunk_type_distribution()
+-- Chunk Type Distribution in Embeddings Table
+SELECT
+    COALESCE(metadata->>'type', '(null)')  AS chunk_type,
+    COUNT(*)                                AS row_count
+FROM public.{prefix}
+GROUP BY metadata->>'type'
+ORDER BY row_count DESC;
+
+
+-- Q-21  audit_embeddings_by_model()
+-- Chunk Count Grouped by Embedding Model
+SELECT
+    COALESCE(TRIM(d.embedding_model), '(unknown)')  AS embedding_model,
+    COUNT(e.id)                                      AS chunk_count
+FROM public.{prefix} e
+LEFT JOIN public.{prefix}_custom_documents d ON d.doc_id = e.metadata->>'doc_id'
+WHERE e.metadata->>'type' = 'chunk-data'
+GROUP BY COALESCE(TRIM(d.embedding_model), '(unknown)')
+ORDER BY chunk_count DESC;
+
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 6 — CONVERSATION / LOGS ANALYTICS  (10 queries)
+════════════════════════════════════════════════════════════════════════════════
+
+-- Q-22  audit_top_users_by_conversations()
+-- Top 10 Users by Conversation Count
+SELECT
+    l.user_id            AS legacy_user_id,
+    u.name               AS user_name,
+    COUNT(DISTINCT l.chat_id)  AS conversation_count,
+    COUNT(*)             AS total_messages
+FROM public.{prefix}_logs l
+LEFT JOIN public.{prefix}_users u ON u.id = l.user_id
+WHERE l.user_id IS NOT NULL
+GROUP BY l.user_id, u.name
+ORDER BY total_messages DESC
+LIMIT 10;
+
+
+-- Q-23  audit_conversation_size_distribution()
+-- Conversation Size Distribution (messages per conversation)
+SELECT
+    CASE
+        WHEN cnt = 1      THEN '1 turn'
+        WHEN cnt <= 5     THEN '2-5 turns'
+        WHEN cnt <= 20    THEN '6-20 turns'
+        WHEN cnt <= 50    THEN '21-50 turns'
+        WHEN cnt <= 100   THEN '51-100 turns'
+        ELSE '100+ turns'
+    END                  AS turn_range,
+    COUNT(*)             AS conversation_count
+FROM (
+    SELECT chat_id, COUNT(*) AS cnt
+    FROM public.{prefix}_logs
+    WHERE user_id IS NOT NULL AND chat_id IS NOT NULL
+    GROUP BY chat_id
+) sub
+GROUP BY
+    CASE
+        WHEN cnt = 1      THEN '1 turn'
+        WHEN cnt <= 5     THEN '2-5 turns'
+        WHEN cnt <= 20    THEN '6-20 turns'
+        WHEN cnt <= 50    THEN '21-50 turns'
+        WHEN cnt <= 100   THEN '51-100 turns'
+        ELSE '100+ turns'
+    END
+ORDER BY MIN(cnt);
+
+
+-- Q-24  audit_logs_without_user()
+-- Logs With NULL user_id (will be SKIPPED)
+SELECT
+    COUNT(*)                   AS logs_without_user,
+    COUNT(DISTINCT chat_id)    AS conversations_affected
+FROM public.{prefix}_logs
+WHERE user_id IS NULL;
+
+
+-- Q-25  audit_logs_without_chat_id()
+-- Logs With NULL or Empty chat_id (will be SKIPPED - returns single integer)
+SELECT COUNT(*) AS logs_without_chat_id
+FROM public.{prefix}_logs
+WHERE chat_id IS NULL OR TRIM(chat_id::text) = '';
+
+
+-- Q-26  audit_invalid_chat_id_format()
+-- chat_id Format Validation (should be valid UUID, top 20 violations)
+SELECT
+    chat_id::text,
+    'INVALID UUID FORMAT'  AS issue
+FROM public.{prefix}_logs
+WHERE user_id IS NOT NULL
+  AND chat_id IS NOT NULL
+  AND chat_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+GROUP BY chat_id
+LIMIT 20;
+
+
+-- Q-27  audit_question_json_extraction()
+-- Question JSON Extraction Validation (top 20 rows where extraction fails)
+SELECT
+    id                              AS legacy_log_id,
+    question::jsonb->1->>'value'    AS extracted_user_question,
+    LEFT(answer, 80)                AS answer_preview,
+    jsonb_array_length(question::jsonb)  AS history_length
+FROM public.{prefix}_logs
+WHERE user_id IS NOT NULL
+  AND chat_id IS NOT NULL
+  AND (
+    question::jsonb->1->>'value' IS NULL
+    OR TRIM(question::jsonb->1->>'value') = ''
+  )
+LIMIT 20;
+
+
+-- Q-28  audit_orphaned_logs()
+-- Logs Referencing Users That Don't Exist (returns 2 counts)
+SELECT
+    COUNT(*)                   AS orphaned_logs,
+    COUNT(DISTINCT user_id)    AS orphaned_user_ids
+FROM public.{prefix}_logs l
+WHERE l.user_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM public.{prefix}_users u WHERE u.id = l.user_id
+  );
+
+
+-- Q-29  audit_model_usage_distribution()
+-- Model Usage Distribution
+SELECT
+    COALESCE(
+        (toolkit_settings::jsonb->>'model'),
+        '(unknown)'
+    )            AS model_name,
+    COUNT(*)     AS usage_count
+FROM public.{prefix}_logs
+WHERE user_id IS NOT NULL
+GROUP BY (toolkit_settings::jsonb->>'model')
+ORDER BY usage_count DESC;
+
+
+-- Q-30  audit_bot_usage_distribution()
+-- Bot / Agent Usage Distribution (top 20)
+SELECT
+    COALESCE(bot_id::text, '(none)')  AS bot_id,
+    COALESCE(type, '(none)')          AS conversation_type,
+    COUNT(*)                           AS log_count,
+    COUNT(DISTINCT chat_id)            AS conversation_count
+FROM public.{prefix}_logs
+WHERE user_id IS NOT NULL
+GROUP BY bot_id, type
+ORDER BY log_count DESC
+LIMIT 20;
+
+
+-- Q-31  audit_token_statistics()
+-- Token Usage Statistics
+SELECT
+    COUNT(*)                                                              AS total_turns,
+    SUM(token_amount)::bigint                                             AS total_tokens,
+    ROUND(AVG(token_amount), 0)                                           AS avg_tokens_per_turn,
+    MIN(token_amount)                                                     AS min_tokens,
+    MAX(token_amount)                                                     AS max_tokens,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY token_amount)            AS median_tokens,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY token_amount)            AS p95_tokens
+FROM public.{prefix}_logs
+WHERE user_id IS NOT NULL
+  AND token_amount IS NOT NULL;
+
+
+════════════════════════════════════════════════════════════════════════════════
+SECTION 7 — CROSS-TABLE INTEGRITY  (2 queries)
+════════════════════════════════════════════════════════════════════════════════
+
+-- Q-32  audit_missing_user_references()
+-- Users Referenced in Other Tables But Missing From users Table
+SELECT DISTINCT d.owner_id AS missing_user_id, 'documents' AS referenced_from
+FROM public.{prefix}_custom_documents d
+WHERE NOT EXISTS (SELECT 1 FROM public.{prefix}_users u WHERE u.id = d.owner_id)
+
+UNION ALL
+
+SELECT DISTINCT f.owner_id, 'folders'
+FROM public.{prefix}_folders f
+WHERE NOT EXISTS (SELECT 1 FROM public.{prefix}_users u WHERE u.id = f.owner_id)
+
+UNION ALL
+
+SELECT DISTINCT l.user_id, 'logs'
+FROM public.{prefix}_logs l
+WHERE l.user_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM public.{prefix}_users u WHERE u.id = l.user_id)
+
+UNION ALL
+
+SELECT DISTINCT c.metadata->>'user_id', 'chunks'
+FROM public.{prefix} c
+WHERE c.metadata->>'type' = 'chunk-data'
+  AND NOT EXISTS (SELECT 1 FROM public.{prefix}_users u WHERE u.id = c.metadata->>'user_id')
+
+ORDER BY referenced_from, missing_user_id;
+
+
+-- Q-33  audit_data_loss_risk_summary()
+-- Data Loss Risk Summary (rows that will be SKIPPED per table)
+SELECT
+    'documents without valid user'   AS risk,
+    COUNT(*)                          AS rows_at_risk
+FROM public.{prefix}_custom_documents d
+WHERE NOT EXISTS (SELECT 1 FROM public.{prefix}_users u WHERE u.id = d.owner_id)
+
+UNION ALL
+
+SELECT
+    'folders without valid user',
+    COUNT(*)
+FROM public.{prefix}_folders f
+WHERE NOT EXISTS (SELECT 1 FROM public.{prefix}_users u WHERE u.id = f.owner_id)
+
+UNION ALL
+
+SELECT
+    'chunks without valid document',
+    COUNT(*)
+FROM public.{prefix} c
+WHERE c.metadata->>'type' = 'chunk-data'
+  AND NOT EXISTS (
+    SELECT 1 FROM public.{prefix}_custom_documents d
+    WHERE d.doc_id = c.metadata->>'doc_id'
+  )
+
+UNION ALL
+
+SELECT
+    'logs without valid user',
+    COUNT(*)
+FROM public.{prefix}_logs l
+WHERE l.user_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM public.{prefix}_users u WHERE u.id = l.user_id)
+
+UNION ALL
+
+SELECT
+    'users without email (skipped)',
+    COUNT(*)
+FROM public.{prefix}_users
+WHERE TRIM(COALESCE(email, '')) = ''
+
+ORDER BY rows_at_risk DESC;
+
+
+================================================================================
+QUERY COUNT SUMMARY
+================================================================================
+
+  Section  | # Queries | Function(s)
+  ---------|-----------|----------------------------------------------------
+  §2 Users |     5     | Q-01 to Q-05
+  §3 Fldrs |     4     | Q-06 to Q-09
+  §4 Docs  |     6     | Q-10 to Q-15
+  §5 Chunks|     6     | Q-16 to Q-21
+  §6 Logs  |    10     | Q-22 to Q-31
+  §7 XRef  |     2     | Q-32 to Q-33
+  ---------|-----------|----------------------------------------------------
+  TOTAL    |    33     |
+
+NOTE: All tables use the schema "public" and the configured table prefix.
+      With default prefix "jeen_dev":
+        {prefix}                       → jeen_dev          (embeddings)
+        {prefix}_users                 → jeen_dev_users
+        {prefix}_logs                  → jeen_dev_logs
+        {prefix}_custom_documents      → jeen_dev_custom_documents
+        {prefix}_folders               → jeen_dev_folders
+
+================================================================================
+END OF FILE
+================================================================================

@@ -90,17 +90,21 @@ def cleanup_old_migration_files(output_file: str, file_prefix: str):
 
 
 def clean_string(val):
-    """Clean and trim string values."""
-    if val is None or pd.isna(val):
+    """Clean and trim string values. Returns None for None/NaN/list/dict."""
+    if _is_scalar_na(val):
         return None
+    if isinstance(val, (list, dict, tuple)):
+        return None  # JSONB compound types are not scalar strings
     cleaned = str(val).strip()
     return cleaned if cleaned else None
 
 
 def escape_sql_string(val):
     """Escape single quotes for SQL string literals."""
-    if val is None or pd.isna(val):
+    if _is_scalar_na(val):
         return 'NULL'
+    if isinstance(val, (list, dict, tuple)):
+        return 'NULL'  # JSONB compound types are not scalar strings
     return f"'{str(val).replace(chr(39), chr(39)+chr(39))}'"
 
 
@@ -112,8 +116,10 @@ def escape_sql_string_with_dollar_quotes(val, tag='CONTENT'):
     
     PostgreSQL dollar-quoting syntax:  $tag$content$tag$
     """
-    if val is None or pd.isna(val):
+    if _is_scalar_na(val):
         return 'NULL'
+    if isinstance(val, (list, dict, tuple)):
+        return 'NULL'  # JSONB compound types are not scalar strings
     
     # Convert to string
     content = str(val)
@@ -543,9 +549,7 @@ BEGIN
             updated_at,
             deleted_at,
             zitadel_user_id,
-            organization_id,
-            is_owner,
-            preferred_language
+            organization_id
         ) VALUES (
             v_new_id,
             {escape_sql_string(email)},
@@ -558,9 +562,7 @@ BEGIN
             now(),
             NULL,
             NULL,
-            '{org_id}'::uuid,
-            false,
-            NULL
+            '{org_id}'::uuid
         )
         ON CONFLICT (email) DO UPDATE SET
             first_name = EXCLUDED.first_name,
@@ -580,7 +582,7 @@ BEGIN
             INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
                 metadata, created_at, updated_at, deleted_at, zitadel_user_id,
-                organization_id, is_owner, preferred_language
+                organization_id
             ) VALUES (
                 v_new_id,
                 {escape_sql_string(email)},
@@ -588,7 +590,7 @@ BEGIN
                 {escape_sql_string(last_name)},
                 {escape_sql_string(email)},
                 NULL, {metadata_sql}, {created_at_sql}, now(), NULL, NULL,
-                '{org_id}'::uuid, false, NULL
+                '{org_id}'::uuid
             )
             ON CONFLICT (email) DO UPDATE SET
                 first_name = EXCLUDED.first_name,
@@ -1778,7 +1780,9 @@ def extract_question_from_jsonb(question_data) -> str:
     Extract user question from the question jsonb column.
     Format: question->[1]->>'value' (index 1 is current turn's user question)
     """
-    if not question_data or pd.isna(question_data):
+    if _is_scalar_na(question_data):
+        return '[no question text]'
+    if not question_data:  # handles empty string, empty list, etc.
         return '[no question text]'
     
     try:
@@ -1935,7 +1939,7 @@ END $$;
             for chat_id, chat_logs in user_logs.groupby('chat_id'):
                 # Sort by question_number/message_index for proper ordering
                 chat_logs_sorted = chat_logs.sort_values(
-                    by=['message_index', 'question_number', 'created_at'],
+                    by=['created_at'],
                     na_position='last'
                 )
                 
@@ -2007,7 +2011,7 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         assistant_msg_id = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-assistant')"
                         
                         # User message
-                        user_parent = f"'{prev_assistant_msg_id}'" if prev_assistant_msg_id else 'NULL::uuid'
+                        user_parent = prev_assistant_msg_id if prev_assistant_msg_id else 'NULL::uuid'
                         user_created_at = f"'{created_at_str}'::timestamptz - interval '1 second'" if pd.notna(created_at) else 'now()'
                         
                         msg_values.append(
@@ -2029,7 +2033,7 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         
                         is_like = log_row.get('is_like')
                         is_like_json = None
-                        if pd.notna(is_like) and str(is_like).strip():
+                        if not _is_scalar_na(is_like) and str(is_like).strip():
                             try:
                                 is_like_json = json.loads(str(is_like).replace("'", '"'))
                             except:
