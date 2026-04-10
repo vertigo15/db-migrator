@@ -15,8 +15,9 @@ import glob
 # Deterministic Namespace UUIDs for cross-database UUID generation
 # ============================================================
 # Each entity type uses a SEPARATE namespace to prevent UUID collisions.
-# uuid_generate_v5(namespace, old_id) always produces the same UUID
+# deterministic_uuid_v4(namespace, old_id) always produces the same UUID
 # for the same inputs, allowing independent computation across databases.
+# The output has the v4 version nibble set so it passes UUID v4 validation.
 # ============================================================
 USER_NAMESPACE_UUID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'   # Users (step 01)
 DOC_NAMESPACE_UUID  = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step 03)
@@ -31,7 +32,7 @@ def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None)
     a known UUID), the real V5 UUID is embedded directly into the SQL at
     generation time — no runtime lookup required.
 
-    Otherwise falls back to the deterministic uuid_generate_v5 formula, which
+    Otherwise falls back to the deterministic_uuid_v4 formula, which
     is the standard path for users being migrated fresh.
 
     This approach avoids cross-database issues: each SQL file runs against a
@@ -47,11 +48,11 @@ def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None)
     Returns:
         SQL expression string, e.g.:
           "'7a1b2c3d-...'::uuid"                          (override path)
-          "uuid_generate_v5('...'::uuid, 'de0ff054...')" (default path)
+          "migration.deterministic_uuid_v4('...'::uuid, 'de0ff054...')" (default path)
     """
     if overrides and old_id and old_id in overrides:
         return f"'{overrides[old_id]}'::uuid"
-    return f"uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(old_id)})"
+    return f"migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(old_id)})"
 
 
 def cleanup_old_migration_files(output_file: str, file_prefix: str):
@@ -264,6 +265,17 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
+
+-- Helper function: Deterministic UUID that passes v4 validation
+-- Uses uuid_generate_v5 internally for determinism, then overwrites the
+-- version nibble (position 15) from '5' to '4' so the result passes
+-- any UUID-v4 format check the target application performs.
+CREATE OR REPLACE FUNCTION migration.deterministic_uuid_v4(
+    ns uuid,
+    input text
+) RETURNS uuid AS $$
+  SELECT overlay(uuid_generate_v5(ns, input)::text placing '4' from 15 for 1)::uuid;
+$$ LANGUAGE sql IMMUTABLE;
 
 -- Progress summary view
 CREATE OR REPLACE VIEW migration.progress_summary AS
@@ -533,7 +545,7 @@ BEGIN
     END IF;
     
     -- Generate deterministic UUID (same namespace+input = same UUID across all databases)
-    v_new_id := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
+    v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
     
     -- Insert user (handle all unique constraint conflicts)
     BEGIN
@@ -577,7 +589,7 @@ BEGIN
             RAISE NOTICE 'User % already exists (matched by email), reusing id %', v_email, v_new_id;
         ELSE
             -- User doesn't exist yet, username is taken — retry with email as username
-            v_new_id := uuid_generate_v5('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
+            v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
             RAISE NOTICE 'User %: username conflict, using email as username instead', v_email;
             INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
@@ -761,7 +773,7 @@ def generate_folder_insert(
     
     # Generate parent_id SQL (deterministic UUID or NULL)
     if parent_id:
-        parent_id_sql = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{parent_id}')"
+        parent_id_sql = f"migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{parent_id}')"
     else:
         parent_id_sql = 'NULL'
     
@@ -772,7 +784,7 @@ DO $$
 DECLARE
     v_old_folder_id VARCHAR := {escape_sql_string(old_id)};
     v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
-    v_folder_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, v_old_folder_id);
+    v_folder_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, v_old_folder_id);
     v_user_id uuid := {resolve_user_id_sql(owner_id, user_id_overrides)};
 BEGIN
     -- Check if folder already migrated using mapping table (FAST)
@@ -903,7 +915,7 @@ WHERE batch_id = '{batch_id}';
 
 -- Total folders processed: {record_count}
 -- Skipped (no ID): {skipped_count}
--- Note: Folders inserted in parent-first order using deterministic UUIDs (uuid_generate_v5)
+-- Note: Folders inserted in parent-first order using deterministic UUIDs (deterministic_uuid_v4)
 -- Namespace UUID: {namespace_uuid}
 """
         sql_file.write(footer)
@@ -950,7 +962,8 @@ def get_content_type(doc_type: Optional[str]) -> str:
 def generate_document_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    source_label: Optional[str] = None
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single document.
@@ -958,6 +971,9 @@ def generate_document_insert(
     Args:
         row: Pandas Series with document data
         namespace_uuid: Fixed namespace UUID for folder_id conversion
+        user_id_overrides: Optional v4_id -> v5_uuid override mapping
+        source_label: If set, annotates the SQL comment to indicate why this
+                      document was included (e.g. 'agent:bot_abc123').
         
     Returns:
         SQL INSERT statement or None to skip
@@ -1078,15 +1094,18 @@ def generate_document_insert(
     
     metadata_sql = escape_json_for_sql(metadata)
     
+    # Build optional agent-topup annotation
+    topup_comment = f'\n-- [agent-topup] Auto-added: required by {source_label}' if source_label else ''
+
     # Generate SQL with mapping table integration
     sql = f"""
--- Document: {file_name} (owner: {owner_id})
+-- Document: {file_name} (owner: {owner_id}){topup_comment}
 DO $$
 DECLARE
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
     v_old_folder_id VARCHAR := {escape_sql_string(folder_id) if folder_id else 'NULL'};
-    v_new_doc_id UUID := uuid_generate_v5('{DOC_NAMESPACE_UUID}'::uuid, v_old_doc_id);
+    v_new_doc_id UUID := migration.deterministic_uuid_v4('{DOC_NAMESPACE_UUID}'::uuid, v_old_doc_id);
     v_user_id UUID := {resolve_user_id_sql(owner_id, user_id_overrides)};
     v_folder_id UUID;
 BEGIN
@@ -1166,7 +1185,8 @@ def generate_documents_migration_sql(
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    doc_source_labels: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for documents table.
@@ -1176,6 +1196,9 @@ def generate_documents_migration_sql(
         output_file: Path to output SQL file
         source_info: Source database info string
         namespace_uuid: Fixed namespace UUID for folder_id conversion
+        user_id_overrides: Optional v4_id -> v5_uuid override mapping
+        doc_source_labels: Optional dict mapping doc_id -> label string for
+                           agent-topup annotation (e.g. {'doc123': 'agent:bot_abc'}).
         
     Returns:
         Dictionary with generation stats
@@ -1223,7 +1246,9 @@ ON CONFLICT (batch_id) DO NOTHING;
         # Write individual INSERT statements with batch_id substitution
         for _, row in documents_df.iterrows():
             try:
-                sql = generate_document_insert(row, namespace_uuid, user_id_overrides)
+                _doc_id = clean_string(row.get('doc_id'))
+                _source_label = doc_source_labels.get(_doc_id) if doc_source_labels and _doc_id else None
+                sql = generate_document_insert(row, namespace_uuid, user_id_overrides, source_label=_source_label)
                 if sql:
                     # Replace batch placeholder with actual batch_id
                     sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
@@ -1482,7 +1507,7 @@ def generate_chunk_and_embedding_inserts(
 -- Chunk from legacy ID: {legacy_id} (doc_id: {doc_id})
 DO ${outer_tag}$
 DECLARE
-    v_chunk_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}');
+    v_chunk_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}');
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
 BEGIN
@@ -1559,7 +1584,7 @@ END ${outer_tag}$;
 -- Embedding for chunk {legacy_id}
 DO ${emb_tag}$
 DECLARE
-    v_chunk_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}');
+    v_chunk_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}');
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
 BEGIN
@@ -1669,7 +1694,7 @@ def generate_chunks_embeddings_migration_sql(
 --   1. chunks table - stores text content
 --   2. embeddings table - stores vector (if available)
 --
--- Uses deterministic UUID generation (uuid_generate_v5) for chunk_id.
+-- Uses deterministic UUID generation (deterministic_uuid_v4) for chunk_id.
 -- Namespace UUID: {namespace_uuid}
 -- Default embedding model: {default_embedding_model}
 -- Skip rows without embeddings: {skip_empty_embeddings}
@@ -1877,7 +1902,7 @@ def generate_conversations_logs_migration_sql(
 --   2. messages (user + assistant per row)
 --   3. message_content_blocks (one per message)
 --
--- Uses deterministic UUID generation (uuid_generate_v5).
+-- Uses deterministic UUID generation (deterministic_uuid_v4).
 -- Namespace UUID: {namespace_uuid}
 -- Multi-INSERT format: grouped by user, max {max_records_per_insert} conversations per INSERT
 -- ============================================================
@@ -2007,8 +2032,8 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         created_at_str = created_at.isoformat() if pd.notna(created_at) else 'now()'
                         
                         # Generate deterministic message IDs
-                        user_msg_id = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-user')"
-                        assistant_msg_id = f"uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-assistant')"
+                        user_msg_id = f"migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}-user')"
+                        assistant_msg_id = f"migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}-assistant')"
                         
                         # User message
                         user_parent = prev_assistant_msg_id if prev_assistant_msg_id else 'NULL::uuid'
@@ -2091,7 +2116,7 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         user_content_escaped = escape_json_for_sql(user_content)
                         
                         block_values.append(
-                            f"    (uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-user-block-0'), "
+                            f"    (migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}-user-block-0'), "
                             f"{user_msg_id}, 0, 'message'::message_content_blocks_type_enum, "
                             f"{user_content_escaped}, NULL::integer, {user_created_at})"
                         )
@@ -2109,7 +2134,7 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         exec_time_sql = str(calc_time) if calc_time is not None else 'NULL::integer'
                         
                         block_values.append(
-                            f"    (uuid_generate_v5('{namespace_uuid}'::uuid, '{legacy_id}-assistant-block-0'), "
+                            f"    (migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}-assistant-block-0'), "
                             f"{assistant_msg_id}, 0, 'message'::message_content_blocks_type_enum, "
                             f"{assistant_content_escaped}, {exec_time_sql}, '{created_at_str}'::timestamptz)"
                         )
@@ -2405,14 +2430,14 @@ def generate_agent_insert(
     IF migration.get_new_id('documents', {escape_sql_string(doc_id)}) IS NOT NULL THEN
         INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
         SELECT
-            uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}'),
+            migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}'),
             v_agent_id,
             migration.get_new_id('documents', {escape_sql_string(doc_id)}),
             true,
             'document'::agent_documents_type_enum
         WHERE NOT EXISTS (
             SELECT 1 FROM agent_documents
-            WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}')
+            WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}')
         );
         v_docs_linked := v_docs_linked + 1;
     ELSE
@@ -2426,14 +2451,14 @@ def generate_agent_insert(
     IF migration.get_new_id('folders', {escape_sql_string(fid)}) IS NOT NULL THEN
         INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
         SELECT
-            uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}'),
+            migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}'),
             v_agent_id,
             migration.get_new_id('folders', {escape_sql_string(fid)}),
             true,
             'folder'::agent_documents_type_enum
         WHERE NOT EXISTS (
             SELECT 1 FROM agent_documents
-            WHERE id = uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}')
+            WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}')
         );
         v_docs_linked := v_docs_linked + 1;
     ELSE
@@ -2446,8 +2471,8 @@ def generate_agent_insert(
 -- Agent: {bot_name[:60]} (bot_id: {bot_id})
 DO $agent_fn$
 DECLARE
-    v_agent_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-agent');
-    v_settings_id uuid := uuid_generate_v5('{namespace_uuid}'::uuid, '{bot_id}-settings');
+    v_agent_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-agent');
+    v_settings_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-settings');
     v_user_id uuid := {resolve_user_id_sql(str(user_id), user_id_overrides)};
     v_docs_linked integer := 0;
 BEGIN
@@ -2583,7 +2608,7 @@ def generate_agents_migration_sql(
 --   3. agent_documents (links to documents and folders)
 --   4. legacy_bot_to_agent_mapping (tracking table)
 --
--- Uses deterministic UUID generation (uuid_generate_v5).
+-- Uses deterministic UUID generation (deterministic_uuid_v4).
 -- Namespace UUID: {namespace_uuid}
 -- ============================================================
 

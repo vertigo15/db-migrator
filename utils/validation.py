@@ -441,6 +441,101 @@ class DataValidator:
         self.results.append(result)
         return result
     
+    def validate_agent_document_links(self) -> ValidationResult:
+        """Validate that every document referenced by an agent was migrated.
+
+        Reads the extracted agents CSV (docs_chosen column) and the extracted
+        documents CSV (doc_id column) and reports any agent-document references
+        that will be silently dropped at runtime because the document was not
+        included in the migration.
+        """
+        agents_file = self._find_latest_file(self.extract_dir, "agents_")
+        docs_file   = self._find_latest_file(self.extract_dir, "documents_")
+
+        if not agents_file:
+            result = ValidationResult(
+                name="Agent-Document Link Coverage",
+                status="skipped",
+                message="No agents file found"
+            )
+            self.results.append(result)
+            return result
+
+        if not docs_file:
+            result = ValidationResult(
+                name="Agent-Document Link Coverage",
+                status="skipped",
+                message="No documents file found"
+            )
+            self.results.append(result)
+            return result
+
+        agents_df = self._read_csv_safe(agents_file)
+        docs_df   = self._read_csv_safe(docs_file)
+
+        if agents_df is None or docs_df is None:
+            result = ValidationResult(
+                name="Agent-Document Link Coverage",
+                status="skipped",
+                message="Could not read agents or documents file"
+            )
+            self.results.append(result)
+            return result
+
+        # Collect all doc_ids referenced by agents
+        migrated_doc_ids = set(docs_df["doc_id"].dropna().astype(str).tolist())
+        missing_links: List[Dict] = []  # {bot_id, doc_id}
+
+        for _, row in agents_df.iterrows():
+            bot_id = str(row.get("bot_id") or "").strip()
+            if not bot_id:
+                continue
+            raw = row.get("docs_chosen")
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                continue
+            # Parse array representations
+            doc_ids = []
+            if isinstance(raw, list):
+                doc_ids = [str(d).strip() for d in raw if d and str(d).strip()]
+            elif isinstance(raw, str):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(raw)
+                    doc_ids = [str(d).strip() for d in parsed if d and str(d).strip()]
+                except Exception:
+                    cleaned = raw.strip("{}[]")
+                    if cleaned:
+                        doc_ids = [d.strip().strip('"\' ') for d in cleaned.split(',') if d.strip()]
+
+            for doc_id in doc_ids:
+                if doc_id and doc_id not in migrated_doc_ids:
+                    missing_links.append({"bot_id": bot_id, "doc_id": doc_id})
+
+        if missing_links:
+            result = ValidationResult(
+                name="Agent-Document Link Coverage",
+                status="warning",
+                message=(
+                    f"{len(missing_links)} agent-document link(s) reference documents not in the "
+                    f"migration plan. These links will be silently dropped at runtime."
+                ),
+                details={
+                    "missing_links": missing_links[:50],  # cap at 50 for readability
+                    "total_missing": len(missing_links),
+                    "hint": "Re-run extraction with agents selected — the topup mechanism "
+                            "will automatically fetch missing documents."
+                }
+            )
+        else:
+            result = ValidationResult(
+                name="Agent-Document Link Coverage",
+                status="pass",
+                message="All agent-referenced documents are present in the migration plan"
+            )
+
+        self.results.append(result)
+        return result
+
     def run_all_validations(self) -> Dict:
         """
         Run all validation checks.
@@ -458,6 +553,7 @@ class DataValidator:
         self.validate_referential_integrity_embeddings_docs()
         self.validate_uuid_format()
         self.validate_timestamp_format()
+        self.validate_agent_document_links()
         
         # Build summary
         summary = {

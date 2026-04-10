@@ -397,7 +397,10 @@ class ExtractionEngine:
     def extract_agents(
         self,
         user_ids: List[str],
-        selected_agent_ids: Optional[List[str]] = None
+        selected_agent_ids: Optional[List[str]] = None,
+        docs_df: Optional[pd.DataFrame] = None,
+        folders_df: Optional[pd.DataFrame] = None,
+        embeddings_df: Optional[pd.DataFrame] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract agents belonging to specified users.
@@ -443,6 +446,63 @@ class ExtractionEngine:
         if self.export_csv:
             df.to_csv(output_path, index=False)
         
+        # If dependent DataFrames are supplied, run topup before generating SQL
+        # so that all agent-referenced documents/folders are guaranteed to be
+        # present in migration SQL files when 06_agents_*.sql is executed.
+        topup_report: Optional[Dict] = None
+        if docs_df is not None and folders_df is not None and embeddings_df is not None and len(df) > 0:
+            source_info_base = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
+            docs_df, embeddings_df, folders_df, topup_report = self._topup_agent_documents(
+                agents_df=df,
+                docs_df=docs_df,
+                embeddings_df=embeddings_df,
+                folders_df=folders_df,
+            )
+            # Regenerate dependent SQL files if anything was topped up
+            if self.generate_sql:
+                if topup_report.get('added_folder_ids'):
+                    folders_sql = os.path.join(self.sql_output_dir, f"02_folders_{self.timestamp}.sql")
+                    try:
+                        generate_folders_migration_sql(
+                            folders_df=folders_df,
+                            output_file=folders_sql,
+                            source_info=source_info_base,
+                            user_id_overrides=self.user_id_overrides
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to regenerate folders SQL after topup: {e}")
+
+                if topup_report.get('added_doc_ids'):
+                    from utils.sql_generator import generate_documents_migration_sql, generate_chunks_embeddings_migration_sql
+                    docs_sql = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
+                    try:
+                        generate_documents_migration_sql(
+                            documents_df=docs_df,
+                            output_file=docs_sql,
+                            source_info=source_info_base,
+                            user_id_overrides=self.user_id_overrides,
+                            doc_source_labels=topup_report.get('doc_source_labels', {})
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to regenerate documents SQL after topup: {e}")
+
+                    if len(embeddings_df) > 0:
+                        emb_sql = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
+                        try:
+                            generate_chunks_embeddings_migration_sql(
+                                jeen_dev_df=embeddings_df,
+                                output_file=emb_sql,
+                                source_info=f"{self.config.host}:{self.config.port}/{self.config.database} (table: {get_table_name('embeddings', self.prefix)})",
+                                default_embedding_model=self.embedding_model,
+                                skip_empty_embeddings=self.skip_empty_embeddings,
+                                target_embedding_dim=self.target_embedding_dim
+                            )
+                        except Exception as e:
+                            print(f"Warning: Failed to regenerate embeddings SQL after topup: {e}")
+
+        # Expose topup_report for run_full_extraction to collect
+        self._last_topup_report = topup_report
+
         # Generate SQL migration file if enabled
         if self.generate_sql and len(df) > 0:
             sql_output_path = os.path.join(self.sql_output_dir, f"06_agents_{self.timestamp}.sql")
@@ -458,7 +518,7 @@ class ExtractionEngine:
             except Exception as e:
                 # Log error but don't fail extraction
                 print(f"Warning: Failed to generate SQL for agents: {str(e)}")
-        
+
         return df, output_path
     
     @staticmethod
@@ -476,13 +536,161 @@ class ExtractionEngine:
             v = str(val).strip()
             return v if v else None
 
+    # ---------------------------------------------------------------------- #
+    # Helper: collect doc/folder IDs referenced by every agent in a DataFrame #
+    # ---------------------------------------------------------------------- #
+    @staticmethod
+    def _collect_agent_refs(
+        agents_df: pd.DataFrame,
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """
+        Return two dicts:
+            agent_doc_map:    {bot_id: [doc_id, ...]}
+            agent_folder_map: {bot_id: [folder_id, ...]}
+        """
+        agent_doc_map: Dict[str, List[str]] = {}
+        agent_folder_map: Dict[str, List[str]] = {}
+
+        for _, row in agents_df.iterrows():
+            bot_id = str(row.get('bot_id') or '').strip()
+            if not bot_id:
+                continue
+
+            doc_ids: List[str] = []
+            raw = row.get('docs_chosen')
+            if raw is not None and not (isinstance(raw, float) and pd.isna(raw)):
+                if isinstance(raw, list):
+                    doc_ids = [str(d).strip() for d in raw if d and str(d).strip()]
+                elif isinstance(raw, str):
+                    cleaned = raw.strip('{}')
+                    if cleaned:
+                        doc_ids = [d.strip().strip('"') for d in cleaned.split(',') if d.strip()]
+
+            folder_ids: List[str] = []
+            fraw = row.get('chosen_docs_folders')
+            if fraw is not None and not (isinstance(fraw, float) and pd.isna(fraw)):
+                if isinstance(fraw, list):
+                    folder_ids = [ExtractionEngine._normalise_folder_id(f) for f in fraw if f is not None]
+                    folder_ids = [f for f in folder_ids if f]
+                elif isinstance(fraw, str):
+                    cleaned = fraw.strip('{}')
+                    if cleaned:
+                        folder_ids = [
+                            ExtractionEngine._normalise_folder_id(f.strip().strip('"'))
+                            for f in cleaned.split(',') if f.strip()
+                        ]
+                        folder_ids = [f for f in folder_ids if f]
+
+            agent_doc_map[bot_id] = doc_ids
+            agent_folder_map[bot_id] = folder_ids
+
+        return agent_doc_map, agent_folder_map
+
+    def analyze_agent_dependencies(
+        self,
+        agents_df: pd.DataFrame,
+        docs_df: pd.DataFrame,
+        folders_df: pd.DataFrame,
+        selected_user_ids: Optional[List[str]] = None,
+    ) -> Dict:
+        """
+        Dry-run: classify every agent-referenced document and folder without
+        mutating any DataFrame.  Useful for showing the user what will happen
+        before extraction commits to regenerating SQL files.
+
+        Returns a dict with keys:
+            already_selected_doc_ids:  set — already in docs_df
+            can_topup_doc_ids:         set — missing but found in V4
+            stale_doc_ids:             set — missing and NOT in V4
+            already_selected_folder_ids: set
+            can_topup_folder_ids:      set
+            stale_folder_ids:          set
+            out_of_scope_owner_folder_ids: set — topped-up folders whose owner
+                                           is not in selected_user_ids
+            agent_doc_map:             {bot_id: [doc_ids]}
+            agent_folder_map:          {bot_id: [folder_ids]}
+        """
+        agent_doc_map, agent_folder_map = self._collect_agent_refs(agents_df)
+
+        all_agent_doc_ids: set = {d for docs in agent_doc_map.values() for d in docs}
+        all_agent_folder_ids: set = {f for fids in agent_folder_map.values() for f in fids}
+
+        existing_doc_ids = set(docs_df['doc_id'].astype(str).tolist()) if len(docs_df) > 0 else set()
+        existing_folder_ids = (
+            set(folders_df['id'].apply(self._normalise_folder_id).dropna().tolist())
+            if len(folders_df) > 0 else set()
+        )
+
+        missing_doc_ids = all_agent_doc_ids - existing_doc_ids
+        missing_folder_ids = all_agent_folder_ids - existing_folder_ids
+
+        # Query V4 for missing docs
+        can_topup_doc_ids: set = set()
+        stale_doc_ids: set = set()
+        if missing_doc_ids:
+            try:
+                docs_table = get_table_name('custom_documents', self.prefix)
+                ph = ', '.join(['%s'] * len(missing_doc_ids))
+                found_df = execute_query(
+                    self.config,
+                    f"SELECT doc_id FROM public.{docs_table} WHERE doc_id IN ({ph})",
+                    tuple(missing_doc_ids)
+                )
+                found_ids = set(found_df['doc_id'].astype(str).tolist()) if len(found_df) > 0 else set()
+                can_topup_doc_ids = found_ids
+                stale_doc_ids = missing_doc_ids - found_ids
+            except Exception:
+                stale_doc_ids = missing_doc_ids
+
+        # Query V4 for missing folders
+        can_topup_folder_ids: set = set()
+        stale_folder_ids: set = set()
+        out_of_scope_owner_folder_ids: set = set()
+        if missing_folder_ids:
+            try:
+                folders_table = get_table_name('folders', self.prefix)
+                ph = ', '.join(['%s'] * len(missing_folder_ids))
+                found_df = execute_query(
+                    self.config,
+                    f"SELECT id, owner_id FROM public.{folders_table} WHERE id IN ({ph})",
+                    tuple(missing_folder_ids)
+                )
+                if len(found_df) > 0:
+                    found_ids = set(found_df['id'].apply(self._normalise_folder_id).dropna().tolist())
+                    can_topup_folder_ids = found_ids
+                    stale_folder_ids = missing_folder_ids - found_ids
+                    if selected_user_ids:
+                        selected_set = set(str(u) for u in selected_user_ids)
+                        for _, frow in found_df.iterrows():
+                            if str(frow.get('owner_id', '')) not in selected_set:
+                                fid = self._normalise_folder_id(frow['id'])
+                                if fid:
+                                    out_of_scope_owner_folder_ids.add(fid)
+                else:
+                    stale_folder_ids = missing_folder_ids
+            except Exception:
+                stale_folder_ids = missing_folder_ids
+
+        return {
+            'already_selected_doc_ids': existing_doc_ids & all_agent_doc_ids,
+            'can_topup_doc_ids': can_topup_doc_ids,
+            'stale_doc_ids': stale_doc_ids,
+            'already_selected_folder_ids': existing_folder_ids & all_agent_folder_ids,
+            'can_topup_folder_ids': can_topup_folder_ids,
+            'stale_folder_ids': stale_folder_ids,
+            'out_of_scope_owner_folder_ids': out_of_scope_owner_folder_ids,
+            'agent_doc_map': agent_doc_map,
+            'agent_folder_map': agent_folder_map,
+        }
+
     def _topup_agent_documents(
         self,
         agents_df: pd.DataFrame,
         docs_df: pd.DataFrame,
         embeddings_df: pd.DataFrame,
         folders_df: pd.DataFrame,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int, int]:
+        selected_user_ids: Optional[List[str]] = None,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict]:
         """
         Auto-include documents AND folders referenced by agents that were not
         explicitly selected.
@@ -494,54 +702,40 @@ class ExtractionEngine:
           non-existent parents.
 
         Returns:
-            (updated_docs_df, updated_embeddings_df, updated_folders_df,
-             topup_docs_count, topup_folders_count)
+            (updated_docs_df, updated_embeddings_df, updated_folders_df, report)
+
+        report keys:
+            added_doc_ids           – list of doc_ids fetched and added
+            stale_doc_ids           – list of doc_ids not found in V4
+            added_folder_ids        – list of folder ids fetched and added
+            stale_folder_ids        – list of folder ids not found in V4
+            out_of_scope_owner_folder_ids – folder ids whose owner_id is
+                                           not in selected_user_ids
+            doc_source_labels       – {doc_id: 'agent:<bot_id>'} for SQL annotation
         """
         # ------------------------------------------------------------------ #
         # 1. Collect every doc ID and folder ID referenced by any agent       #
         # ------------------------------------------------------------------ #
-        agent_doc_ids: set = set()
-        agent_folder_ids: set = set()
+        agent_doc_map, agent_folder_map = self._collect_agent_refs(agents_df)
+        agent_doc_ids: set = {d for docs in agent_doc_map.values() for d in docs}
+        agent_folder_ids: set = {f for fids in agent_folder_map.values() for f in fids}
 
-        for _, row in agents_df.iterrows():
-            # --- docs_chosen ---
-            docs_chosen_raw = row.get('docs_chosen')
-            if docs_chosen_raw is not None and not (isinstance(docs_chosen_raw, float) and pd.isna(docs_chosen_raw)):
-                if isinstance(docs_chosen_raw, list):
-                    for d in docs_chosen_raw:
-                        v = str(d).strip() if d is not None else ''
-                        if v:
-                            agent_doc_ids.add(v)
-                elif isinstance(docs_chosen_raw, str):
-                    cleaned = docs_chosen_raw.strip('{}')
-                    if cleaned:
-                        for d in cleaned.split(','):
-                            v = d.strip().strip('"')
-                            if v:
-                                agent_doc_ids.add(v)
-
-            # --- chosen_docs_folders ---
-            folders_raw = row.get('chosen_docs_folders')
-            if folders_raw is not None and not (isinstance(folders_raw, float) and pd.isna(folders_raw)):
-                if isinstance(folders_raw, list):
-                    for f in folders_raw:
-                        v = self._normalise_folder_id(f)
-                        if v:
-                            agent_folder_ids.add(v)
-                elif isinstance(folders_raw, str):
-                    cleaned = folders_raw.strip('{}')
-                    if cleaned:
-                        for f in cleaned.split(','):
-                            v = self._normalise_folder_id(f.strip().strip('"'))
-                            if v:
-                                agent_folder_ids.add(v)
+        # Build reverse map: doc_id -> first bot_id that references it (for SQL label)
+        doc_to_agent: Dict[str, str] = {}
+        for bot_id, doc_ids in agent_doc_map.items():
+            for d in doc_ids:
+                if d not in doc_to_agent:
+                    doc_to_agent[d] = bot_id
 
         # ------------------------------------------------------------------ #
         # 2. Topup: missing documents                                          #
         # ------------------------------------------------------------------ #
         existing_doc_ids = set(docs_df["doc_id"].astype(str).tolist()) if len(docs_df) > 0 else set()
         missing_doc_ids = agent_doc_ids - existing_doc_ids
-        topup_docs_count = 0
+
+        added_doc_ids: List[str] = []
+        stale_doc_ids: List[str] = []
+        doc_source_labels: Dict[str, str] = {}
 
         if missing_doc_ids:
             print(f"[topup] Fetching {len(missing_doc_ids)} agent-referenced document(s) not in selection...")
@@ -557,11 +751,24 @@ class ExtractionEngine:
             """
             new_docs_df = execute_query(self.config, docs_query, tuple(missing_doc_ids))
 
+            found_ids = set(new_docs_df["doc_id"].astype(str).tolist()) if len(new_docs_df) > 0 else set()
+            stale_doc_ids = list(missing_doc_ids - found_ids)
+
+            if found_ids:
+                stale_doc_ids = list(missing_doc_ids - found_ids)
+            else:
+                stale_doc_ids = list(missing_doc_ids)
+
             if len(new_docs_df) == 0:
                 print(f"[topup] Warning: none of the {len(missing_doc_ids)} referenced doc ID(s) found "
                       "(may have been deleted from source).")
             else:
-                topup_docs_count = len(new_docs_df)
+                added_doc_ids = new_docs_df["doc_id"].tolist()
+                # Build SQL annotation labels
+                for doc_id in added_doc_ids:
+                    agent_ref = doc_to_agent.get(str(doc_id), 'unknown')
+                    doc_source_labels[str(doc_id)] = f'agent:{agent_ref[:16]}'
+
                 docs_df = pd.concat([docs_df, new_docs_df], ignore_index=True)
 
                 # Fetch embeddings for the newly added documents
@@ -576,7 +783,10 @@ class ExtractionEngine:
                 new_emb_df = execute_query(self.config, emb_query, tuple(new_doc_ids))
                 if len(new_emb_df) > 0:
                     embeddings_df = pd.concat([embeddings_df, new_emb_df], ignore_index=True)
-                print(f"[topup] Added {topup_docs_count} document(s) and {len(new_emb_df)} embedding chunk(s).")
+                print(f"[topup] Added {len(added_doc_ids)} document(s) and {len(new_emb_df)} embedding chunk(s).")
+                if stale_doc_ids:
+                    print(f"[topup] Warning: {len(stale_doc_ids)} agent-referenced doc ID(s) not found in V4 "
+                          f"(stale references — agent-document links will be dropped): {stale_doc_ids[:5]}")
 
         # ------------------------------------------------------------------ #
         # 3. Topup: missing folders (with recursive ancestor resolution)       #
@@ -586,7 +796,9 @@ class ExtractionEngine:
             if len(folders_df) > 0 else set()
         )
         missing_folder_ids = agent_folder_ids - existing_folder_ids
-        topup_folders_count = 0
+        added_folder_ids: List[str] = []
+        stale_folder_ids: List[str] = []
+        out_of_scope_owner_folder_ids: List[str] = []
         all_new_folder_rows: List[pd.DataFrame] = []
 
         if missing_folder_ids:
@@ -606,11 +818,24 @@ class ExtractionEngine:
                 """
                 batch_df = execute_query(self.config, folder_query, tuple(to_fetch))
                 if len(batch_df) == 0:
+                    # IDs left in to_fetch were not found — they are stale
+                    stale_folder_ids.extend(list(to_fetch - known_ids))
                     break
 
                 all_new_folder_rows.append(batch_df)
                 fetched_ids = set(batch_df["id"].apply(self._normalise_folder_id).dropna().tolist())
+                # Any of to_fetch not returned are stale
+                stale_folder_ids.extend(list(to_fetch - fetched_ids - known_ids))
                 known_ids.update(fetched_ids)
+
+                # Check out-of-scope owners
+                if selected_user_ids:
+                    sel_set = set(str(u) for u in selected_user_ids)
+                    for _, frow in batch_df.iterrows():
+                        if str(frow.get('owner_id', '')) not in sel_set:
+                            fid = self._normalise_folder_id(frow['id'])
+                            if fid and fid not in out_of_scope_owner_folder_ids:
+                                out_of_scope_owner_folder_ids.append(fid)
 
                 # Collect parent IDs that we don't have yet
                 next_batch: set = set()
@@ -624,11 +849,24 @@ class ExtractionEngine:
                 new_folders_df = pd.concat(all_new_folder_rows, ignore_index=True)
                 # Drop duplicates in case ancestors appeared in multiple batches
                 new_folders_df = new_folders_df.drop_duplicates(subset=["id"])
-                topup_folders_count = len(new_folders_df)
+                added_folder_ids = new_folders_df["id"].apply(self._normalise_folder_id).dropna().tolist()
                 folders_df = pd.concat([folders_df, new_folders_df], ignore_index=True)
-                print(f"[topup] Added {topup_folders_count} folder(s) (including ancestors).")
+                print(f"[topup] Added {len(added_folder_ids)} folder(s) (including ancestors).")
+                if out_of_scope_owner_folder_ids:
+                    print(f"[topup] Warning: {len(out_of_scope_owner_folder_ids)} added folder(s) are owned by "
+                          f"users not in the selected migration set.")
+            elif missing_folder_ids:
+                stale_folder_ids = list(missing_folder_ids)
 
-        return docs_df, embeddings_df, folders_df, topup_docs_count, topup_folders_count
+        report: Dict = {
+            'added_doc_ids': added_doc_ids,
+            'stale_doc_ids': stale_doc_ids,
+            'added_folder_ids': added_folder_ids,
+            'stale_folder_ids': stale_folder_ids,
+            'out_of_scope_owner_folder_ids': out_of_scope_owner_folder_ids,
+            'doc_source_labels': doc_source_labels,
+        }
+        return docs_df, embeddings_df, folders_df, report
 
     def extract_logs(
         self,
@@ -793,91 +1031,44 @@ class ExtractionEngine:
                 results["summary"]["embeddings"] = 0
                 embeddings_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
             
-            # 6. Extract agents
+            # 6. Extract agents — pass current docs/folders/embeddings so topup
+            #    runs inside extract_agents() and SQL files are regenerated atomically.
             current_step += 1
             self._report_progress("agents", current_step, total_steps)
-            agents_df, agents_path = self.extract_agents(user_ids, selected_agent_ids)
+            agents_df, agents_path = self.extract_agents(
+                user_ids, selected_agent_ids,
+                docs_df=docs_df,
+                folders_df=folders_df,
+                embeddings_df=embeddings_df,
+            )
             results["files"]["agents"] = agents_path
             results["summary"]["agents"] = len(agents_df)
-            
+
             # Track SQL generation for agents
             if self.generate_sql and len(agents_df) > 0:
                 sql_path = os.path.join(self.sql_output_dir, f"06_agents_{self.timestamp}.sql")
                 if os.path.exists(sql_path):
                     results["sql_files"]["agents"] = sql_path
 
-            # 6.5 Auto-topup: pull in any agent-referenced documents/folders not in selection
-            if len(agents_df) > 0:
-                source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
-                docs_df, embeddings_df, folders_df, topup_docs, topup_folders = self._topup_agent_documents(
-                    agents_df, docs_df, embeddings_df, folders_df
-                )
+            # Collect topup report produced inside extract_agents() and update
+            # summary counts + CSV exports to reflect any added records.
+            # (extract_agents stores the report on self for retrieval here)
+            topup_report = getattr(self, '_last_topup_report', None)
+            if topup_report:
+                results['topup_report'] = topup_report
+                source_info_base = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
 
-                # --- Folders topup ---
-                if topup_folders > 0:
-                    results["summary"]["folders"] = len(folders_df)
-
-                    if self.export_csv:
-                        folders_csv_path = os.path.join(self.output_dir, f"folders_{self.timestamp}.csv")
-                        folders_df.to_csv(folders_csv_path, index=False)
-
+                if topup_report.get('added_folder_ids'):
+                    # Re-fetch updated folders_df from the file that was regenerated
+                    results["summary"]["folders"] = results["summary"].get("folders", 0) + len(topup_report['added_folder_ids'])
                     if self.generate_sql:
-                        folders_sql_path = os.path.join(self.sql_output_dir, f"02_folders_{self.timestamp}.sql")
-                        try:
-                            generate_folders_migration_sql(
-                                folders_df=folders_df,
-                                output_file=folders_sql_path,
-                                source_info=source_info,
-                                user_id_overrides=self.user_id_overrides
-                            )
-                            results["sql_files"]["folders"] = folders_sql_path
-                        except Exception as e:
-                            results["errors"].append(f"[topup] Failed to regenerate folders SQL: {e}")
+                        results["sql_files"]["folders"] = os.path.join(self.sql_output_dir, f"02_folders_{self.timestamp}.sql")
 
-                # --- Documents topup ---
-                if topup_docs > 0:
-                    results["summary"]["documents"] = len(docs_df)
-
-                    if self.export_csv:
-                        docs_csv_path = os.path.join(self.output_dir, f"documents_{self.timestamp}.csv")
-                        docs_df.to_csv(docs_csv_path, index=False)
-
+                if topup_report.get('added_doc_ids'):
+                    results["summary"]["documents"] = results["summary"].get("documents", 0) + len(topup_report['added_doc_ids'])
                     if self.generate_sql:
-                        docs_sql_path = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
-                        try:
-                            generate_documents_migration_sql(
-                                documents_df=docs_df,
-                                output_file=docs_sql_path,
-                                source_info=source_info,
-                                user_id_overrides=self.user_id_overrides
-                            )
-                            results["sql_files"]["documents"] = docs_sql_path
-                        except Exception as e:
-                            results["errors"].append(f"[topup] Failed to regenerate documents SQL: {e}")
-
-                    if self.generate_sql and len(embeddings_df) > 0:
-                        emb_sql_path = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
-                        emb_source_info = (
-                            f"{self.config.host}:{self.config.port}/{self.config.database}"
-                            f" (table: {get_table_name('embeddings', self.prefix)})"
-                        )
-                        try:
-                            generate_chunks_embeddings_migration_sql(
-                                jeen_dev_df=embeddings_df,
-                                output_file=emb_sql_path,
-                                source_info=emb_source_info,
-                                default_embedding_model=self.embedding_model,
-                                skip_empty_embeddings=self.skip_empty_embeddings,
-                                target_embedding_dim=self.target_embedding_dim
-                            )
-                            results["sql_files"]["chunks_embeddings"] = emb_sql_path
-                            results["summary"]["embeddings"] = len(embeddings_df)
-                        except Exception as e:
-                            results["errors"].append(f"[topup] Failed to regenerate embeddings SQL: {e}")
-
-                    if self.export_csv and len(embeddings_df) > 0:
-                        emb_csv_path = os.path.join(self.output_dir, f"embeddings_{self.timestamp}.csv")
-                        embeddings_df.to_csv(emb_csv_path, index=False)
+                        results["sql_files"]["documents"] = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
+                        results["sql_files"]["chunks_embeddings"] = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
 
             # 7. Extract logs (conversations/messages)
             current_step += 1

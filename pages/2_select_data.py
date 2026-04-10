@@ -19,7 +19,8 @@ from utils.storage import (
     save_selected_users, load_selected_users,
     save_document_filters, load_document_filters
 )
-from utils.config import SessionKeys, get_table_name, get_env_org_id, get_env_embedding_model, EMBEDDING_MODEL_OPTIONS
+from utils.config import SessionKeys, get_table_name, get_env_org_id, get_env_embedding_model, get_env_target_defaults, EMBEDDING_MODEL_OPTIONS
+from utils.db import test_connection
 from utils.extraction import (
     ExtractionEngine,
     get_document_count_preview,
@@ -34,6 +35,68 @@ st.title("📋 Select Data to Migrate")
 # Output directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(BASE_DIR, "output", "extract")
+
+
+# ─── Destination DB lookup helpers ──────────────────────────────────────────
+
+def _make_target_config(database: str):
+    """Return a ConnectionConfig for a specific target database, or None if
+    no target connection is available in session state."""
+    target: ConnectionConfig = st.session_state.get("target_config")
+    if target is None:
+        td = st.session_state.get(SessionKeys.TARGET_CONNECTION, {})
+        if not td.get("host") or not td.get("password"):
+            return None
+        try:
+            target = ConnectionConfig.from_dict(td)
+        except Exception:
+            return None
+    return ConnectionConfig(
+        host=target.host,
+        port=target.port,
+        database=database,
+        username=target.username,
+        password=target.password,
+    )
+
+
+def fetch_dest_org_ids() -> list:
+    """Query target user_db for distinct organization_ids."""
+    cfg = _make_target_config("user_db")
+    if cfg is None:
+        return []
+    try:
+        df = execute_query(
+            cfg,
+            "SELECT DISTINCT organization_id::text AS org_id "
+            "FROM public.users "
+            "WHERE organization_id IS NOT NULL "
+            "ORDER BY org_id"
+        )
+        return df["org_id"].tolist() if not df.empty else []
+    except Exception:
+        return []
+
+
+def fetch_dest_embedding_models() -> list:
+    """Query target document_db for distinct embedding model_names."""
+    cfg = _make_target_config("document_db")
+    if cfg is None:
+        return []
+    try:
+        df = execute_query(
+            cfg,
+            "SELECT DISTINCT model_name "
+            "FROM public.embeddings "
+            "WHERE model_name IS NOT NULL "
+            "ORDER BY model_name"
+        )
+        return df["model_name"].tolist() if not df.empty else []
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def convert_timestamp_to_datetime(ts):
@@ -756,28 +819,147 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         )
     
     # SQL-specific options (shown only if SQL generation is enabled)
+    _has_target = "target_config" in st.session_state
     if generate_sql:
+
+        # ── Inline destination connection (to load Org IDs & Embedding Models) ──
+        _target_label = (
+            "✅ Destination DB connected — use buttons below to load Org IDs & Models"
+            if _has_target
+            else "🔌 Connect to destination DB — load Org IDs & Embedding Models"
+        )
+        with st.expander(_target_label, expanded=not _has_target):
+            if _has_target:
+                _tc = st.session_state["target_config"]
+                st.caption(f"Connected: `{_tc.host}:{_tc.port}` (set via Target page or quick-connect below)")
+                if st.button("❌ Disconnect", key="_dest_disconnect"):
+                    for _k in ("target_config", "_dest_org_ids", "_dest_embedding_models"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+            else:
+                st.caption(
+                    "Enter destination credentials to fetch Org IDs from `user_db` and "
+                    "Embedding Models from `document_db`. Credentials are used only for "
+                    "these lookups and are stored in session state only."
+                )
+                _env_t = get_env_target_defaults()
+                _dc1, _dc2, _dc3 = st.columns([3, 1, 2])
+                with _dc1:
+                    _t_host = st.text_input(
+                        "Host", value=_env_t.get("host", ""),
+                        key="_dest_host", placeholder="db.example.com"
+                    )
+                with _dc2:
+                    _t_port = st.number_input(
+                        "Port", value=int(_env_t.get("port", 5432)),
+                        min_value=1, max_value=65535, key="_dest_port"
+                    )
+                with _dc3:
+                    _t_user = st.text_input(
+                        "Username", value=_env_t.get("username", ""),
+                        key="_dest_user", placeholder="postgres"
+                    )
+                _t_pass = st.text_input(
+                    "Password", type="password",
+                    value=_env_t.get("password", ""),
+                    key="_dest_pass", placeholder="••••••••"
+                )
+                if st.button(
+                    "📡 Connect & load Org IDs and Embedding Models",
+                    key="_dest_connect", type="primary", use_container_width=True
+                ):
+                    if not all([_t_host, _t_user, _t_pass]):
+                        st.error("Please fill in host, username, and password.")
+                    else:
+                        _probe = ConnectionConfig(
+                            host=_t_host, port=int(_t_port),
+                            database="user_db",
+                            username=_t_user, password=_t_pass
+                        )
+                        with st.spinner("Connecting…"):
+                            _ok, _msg = test_connection(_probe)
+                        if not _ok:
+                            st.error(f"❌ {_msg}")
+                        else:
+                            st.session_state["target_config"] = _probe
+                            _has_target = True
+                            # Fetch both values immediately
+                            with st.spinner("Loading Org IDs from user_db…"):
+                                _org_ids = fetch_dest_org_ids()
+                            with st.spinner("Loading Embedding Models from document_db…"):
+                                _emb_models = fetch_dest_embedding_models()
+                            if _org_ids:
+                                st.session_state["_dest_org_ids"] = _org_ids
+                            if _emb_models:
+                                st.session_state["_dest_embedding_models"] = _emb_models
+                            st.success(
+                                f"✅ Connected! Loaded {len(_org_ids)} Org ID(s) and "
+                                f"{len(_emb_models)} Embedding Model(s)."
+                            )
+                            st.rerun()
+
         col3, col4, col5, col6 = st.columns([2, 2, 1, 1])
+
+        # ── Org ID ──────────────────────────────────────────────────────────
         with col3:
-            org_id = st.text_input(
-                "Org ID",
-                value=get_env_org_id(),
-                help="Organization UUID for SQL generation (set DEFAULT_ORG_ID in .env to change default)"
-            )
+            _dest_org_ids = st.session_state.get("_dest_org_ids", [])
+
+            if _dest_org_ids:
+                # Destination values loaded — show selectbox
+                org_id = st.selectbox(
+                    "Org ID",
+                    options=_dest_org_ids,
+                    index=(
+                        _dest_org_ids.index(get_env_org_id())
+                        if get_env_org_id() in _dest_org_ids
+                        else 0
+                    ),
+                    help="Organization IDs found in destination `user_db.users`. "
+                         "Clear with the button below to enter manually."
+                )
+                if st.button("✕ Clear / enter manually", key="_clear_org_ids",
+                             use_container_width=True):
+                    del st.session_state["_dest_org_ids"]
+                    st.rerun()
+            else:
+                # Manual entry (default)
+                org_id = st.text_input(
+                    "Org ID",
+                    value=get_env_org_id(),
+                    help="Organization UUID for SQL generation "
+                         "(set DEFAULT_ORG_ID in .env to change default)"
+                )
+                if _has_target:
+                    if st.button("📡 Load from destination", key="_load_org_ids",
+                                 use_container_width=True):
+                        with st.spinner("Querying user_db.users…"):
+                            _fetched = fetch_dest_org_ids()
+                        if _fetched:
+                            st.session_state["_dest_org_ids"] = _fetched
+                            st.rerun()
+                        else:
+                            st.warning("No organization_ids found in destination user_db.")
+
+        # ── Embedding Model ─────────────────────────────────────────────────
         with col4:
-            _env_model = get_env_embedding_model()
+            _env_model    = get_env_embedding_model()
             _custom_label = "Custom..."
-            _preset_options = EMBEDDING_MODEL_OPTIONS + [_custom_label]
+            _dest_models  = st.session_state.get("_dest_embedding_models", [])
+
+            # Merge presets + destination models (deduplicated, presets first)
+            _combined = list(dict.fromkeys(EMBEDDING_MODEL_OPTIONS + _dest_models + [_custom_label]))
+
             _default_index = (
-                _preset_options.index(_env_model)
-                if _env_model in EMBEDDING_MODEL_OPTIONS
-                else _preset_options.index(_custom_label)
+                _combined.index(_env_model)
+                if _env_model in _combined
+                else _combined.index(_custom_label)
             )
             _selected_model = st.selectbox(
                 "Embedding Model",
-                options=_preset_options,
+                options=_combined,
                 index=_default_index,
-                help="Embedding model name written into the embeddings table. Existing V5 embeddings are never overwritten."
+                help="Model name written into the embeddings table. "
+                     "Destination models (if loaded) are merged with the preset list."
             )
             if _selected_model == _custom_label:
                 embedding_model = st.text_input(
@@ -788,6 +970,21 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 )
             else:
                 embedding_model = _selected_model
+
+            if _has_target:
+                _btn_label = (
+                    f"📡 Reload from destination ({len(_dest_models)} loaded)"
+                    if _dest_models else "📡 Load from destination"
+                )
+                if st.button(_btn_label, key="_load_embedding_models",
+                             use_container_width=True):
+                    with st.spinner("Querying document_db.embeddings…"):
+                        _fetched = fetch_dest_embedding_models()
+                    if _fetched:
+                        st.session_state["_dest_embedding_models"] = _fetched
+                        st.rerun()
+                    else:
+                        st.warning("No model_names found in destination document_db.")
         with col5:
             skip_empty_embeddings = st.checkbox(
                 "Skip empty",
@@ -887,7 +1084,69 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 st.error(error)
         else:
             st.success(f"✅ Extraction complete! Timestamp: {results['timestamp']}")
-        
+
+        # ── Agent-document topup report ──────────────────────────────────────
+        topup = results.get("topup_report")
+        if topup:
+            added_docs    = topup.get("added_doc_ids", [])
+            stale_docs    = topup.get("stale_doc_ids", [])
+            added_folders = topup.get("added_folder_ids", [])
+            stale_folders = topup.get("stale_folder_ids", [])
+            oos_folders   = topup.get("out_of_scope_owner_folder_ids", [])
+
+            st.subheader("🤖 Agent Document Coverage")
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("📄 Docs auto-added",    len(added_docs),
+                      help="Documents not in original selection but required by agents — fetched automatically.")
+            c2.metric("⚠️ Stale doc refs",     len(stale_docs),
+                      help="Agent-referenced documents no longer found in V4. These links will be dropped.")
+            c3.metric("📁 Folders auto-added", len(added_folders),
+                      help="Folders (including ancestors) fetched because agents reference them.")
+            c4.metric("⚠️ Stale folder refs",  len(stale_folders),
+                      help="Agent-referenced folders no longer found in V4. These links will be dropped.")
+
+            if added_docs:
+                st.success(
+                    f"✅ **{len(added_docs)} document(s)** were automatically added to the migration because "
+                    f"selected agents depend on them. They appear in `03_documents_*.sql` annotated with "
+                    f"`[agent-topup]`."
+                )
+
+            if stale_docs:
+                with st.expander(f"⚠️ {len(stale_docs)} stale document reference(s) — links will be dropped"):
+                    st.warning(
+                        "These documents are referenced by agents in V4 but no longer exist in the source "
+                        "database. The agent-document links cannot be migrated."
+                    )
+                    st.dataframe(
+                        pd.DataFrame({"Stale doc_id": stale_docs}),
+                        hide_index=True, use_container_width=True
+                    )
+
+            if stale_folders:
+                with st.expander(f"⚠️ {len(stale_folders)} stale folder reference(s) — links will be dropped"):
+                    st.warning("These folders are referenced by agents but no longer exist in V4.")
+                    st.dataframe(
+                        pd.DataFrame({"Stale folder_id": stale_folders}),
+                        hide_index=True, use_container_width=True
+                    )
+
+            if oos_folders:
+                with st.expander(
+                    f"⚠️ {len(oos_folders)} auto-added folder(s) owned by users outside the migration scope"
+                ):
+                    st.warning(
+                        "These folders were fetched because agents reference them, but their owner is not "
+                        "among the selected users. They will be inserted into `document_db` without a "
+                        "matching user record — verify this is acceptable before executing the SQL."
+                    )
+                    st.dataframe(
+                        pd.DataFrame({"Folder id (out-of-scope owner)": oos_folders}),
+                        hide_index=True, use_container_width=True
+                    )
+
+        # ── Extraction summary table ─────────────────────────────────────────
         # Show summary
         st.subheader("📊 Extraction Summary")
         summary_data = [

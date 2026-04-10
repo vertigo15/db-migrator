@@ -248,6 +248,8 @@ def main():
         v4b -- "Step 6" --> ag
         v4b -- "Step 6" --> as2
         v4b -- "Step 6" --> ad
+        v4b -. "topup: fetch missing docs" .-> v4d
+        v4d -. "Step 3 &#40;+topup&#41;" .-> d
 
         mid -.-> u
         mid -.-> f
@@ -297,7 +299,7 @@ def main():
                 "Username derived from email. Each mapping is stored in `migration.id_mappings`."
             ),
             "columns": [
-                ("id", "id", "uuid_generate_v5(USER_NAMESPACE, id)"),
+                ("id", "id", "deterministic_uuid_v4(USER_NAMESPACE, id)"),
                 ("email", "email", "Direct"),
                 ("first_name", "name", "Direct"),
                 ("last_name", "last_name", "Direct"),
@@ -308,9 +310,9 @@ def main():
                 ("updated_at", "—", "now()"),
                 ("deleted_at", "—", "NULL"),
                 ("zitadel_user_id", "—", "NULL"),
-                ("organization_id", "—", "Fixed config org UUID"),
-                ("is_owner", "—", "false"),
-                ("preferred_language", "—", "NULL"),
+                ("organization_id", "—", "Configurable UUID: from `DEFAULT_ORG_ID` env var or Org ID input field in UI (default: `356b50f7-bcbd-42aa-9392-e1605f42f7a1`)"),
+                ("is_owner", "—", "false (DB default — not explicitly inserted)"),
+                ("preferred_language", "—", "NULL (DB default — not explicitly inserted)"),
             ],
         },
         {
@@ -319,16 +321,16 @@ def main():
             "source": "`{prefix}_folders`",
             "target": "`document_db.folders`",
             "logic": (
-                "Deterministic UUIDs generated via `uuid_generate_v5` to preserve parent → child hierarchy. "
+                "Deterministic UUIDs generated via `deterministic_uuid_v4` to preserve parent → child hierarchy. "
                 "`owner_id` resolved to V5 `user_id` through `migration.id_mappings`. "
                 "Parents inserted before children (topological sort)."
             ),
             "columns": [
-                ("id", "id", "uuid_generate_v5(NAMESPACE, id)"),
+                ("id", "id", "deterministic_uuid_v4(NAMESPACE, id)"),
                 ("folder_name", "folder_name", "Direct"),
-                ("parent_id", "parent_id", "uuid_generate_v5(NAMESPACE, parent_id) or NULL"),
-                ("folder_type", "folder_type", "Default 'default', cast to folders_folder_type_enum"),
-                ("user_id", "owner_id", "uuid_generate_v5(USER_NAMESPACE, owner_id)"),
+                ("parent_id", "parent_id", "deterministic_uuid_v4(NAMESPACE, parent_id) or NULL"),
+                ("folder_type", "folder_type", "V4→V5 type map: 'bot'→'agent', 'document'→'document', 'agent'→'agent', else 'default'"),
+                ("user_id", "owner_id", "deterministic_uuid_v4(USER_NAMESPACE, owner_id)"),
                 ("created_at", "created_at", "Direct"),
                 ("updated_at", "—", "now()"),
                 ("deleted_at", "—", "NULL"),
@@ -342,11 +344,15 @@ def main():
             "logic": (
                 "New UUID per document. `owner_id` → `user_id` and `folder_id` resolved via mapping table. "
                 "File type mapped to MIME `content_type`. Legacy metadata (`tags`, `doc_summery`, "
-                "`embedding_model`, `vector_methods`, etc.) stored in `metadata` JSONB."
+                "`embedding_model`, `vector_methods`, etc.) stored in `metadata` JSONB. "
+                "**Agent-topup:** documents referenced by selected agents but not in the original "
+                "user selection are automatically fetched from V4 and appended to this file, "
+                "annotated with `-- [agent-topup] Auto-added: required by agent:<bot_id>`. "
+                "Their chunks and embeddings are also added to step 04."
             ),
             "columns": [
-                ("id", "doc_id", "uuid_generate_v5(DOC_NAMESPACE, doc_id)"),
-                ("status", "—", "Always 'PROCESSED'"),
+                ("id", "doc_id", "deterministic_uuid_v4(DOC_NAMESPACE, doc_id)"),
+                ("status", "—", "Always 'UPLOADED'"),
                 ("file_name", "doc_name_origin / doc_title", "doc_name_origin → doc_title → 'unnamed'"),
                 ("file_size", "doc_size", "Integer cast"),
                 ("storage_type", "blob_source", "'azure_blob' → 'azure'; else direct"),
@@ -356,8 +362,8 @@ def main():
                 ("created_at", "created_at", "Direct"),
                 ("updated_at", "—", "now()"),
                 ("deleted_at", "—", "NULL"),
-                ("folder_id", "folder_id", "uuid_generate_v5(NAMESPACE, folder_id) or NULL"),
-                ("user_id", "owner_id", "uuid_generate_v5(USER_NAMESPACE, owner_id)"),
+                ("folder_id", "folder_id", "migration.get_new_id('folders', folder_id) or NULL"),
+                ("user_id", "owner_id", "deterministic_uuid_v4(USER_NAMESPACE, owner_id)"),
                 ("content_type", "doc_type", "Mapped to MIME (pdf → application/pdf, etc.)"),
                 ("parsing_technique_id", "—", "NULL"),
                 ("source_type", "—", "Always 'upload'"),
@@ -377,7 +383,7 @@ def main():
                 "Only rows where `metadata.type = 'chunk-data'` are processed."
             ),
             "columns": [
-                ("chunks.id", "id", "uuid_generate_v5(NAMESPACE, id)"),
+                ("chunks.id", "id", "deterministic_uuid_v4(NAMESPACE, id)"),
                 ("chunks.document_id", "metadata.doc_id", "migration.get_new_id('documents', doc_id)"),
                 ("chunks.chunk_index", "—", "Computed: cumcount() per doc_id (0-based)"),
                 ("chunks.content", "document", "Text after 'original_content:' prefix; fallback full document"),
@@ -389,7 +395,7 @@ def main():
                 ("chunks.created_at", "metadata.create_date", "Parsed as timestamptz"),
                 ("chunks.translated_content", "document", "Text between 'translated_content:' and 'original_content:'; NULL if absent"),
                 ("embeddings.id", "—", "gen_random_uuid()"),
-                ("embeddings.chunk_id", "id", "uuid_generate_v5(NAMESPACE, id)"),
+                ("embeddings.chunk_id", "id", "deterministic_uuid_v4(NAMESPACE, id)"),
                 ("embeddings.embedding", "embeddings", "Cast to vector; optionally truncated to target_embedding_dim"),
                 ("embeddings.model_name", "—", "Config value (default: text-embedding-ada-002)"),
                 ("embeddings.created_at", "metadata.create_date", "Parsed as timestamptz"),
@@ -413,12 +419,12 @@ def main():
                 ("conversations.total_tokens", "token_amount", "sum(token_amount) per chat"),
                 ("conversations.created_at", "created_at", "min(created_at) in chat"),
                 ("conversations.updated_at / last_interacted_at", "created_at", "max(created_at) in chat"),
-                ("conversations.user_id", "user_id", "uuid_generate_v5(USER_NAMESPACE, user_id)"),
-                ("messages[user].id", "id", "uuid_generate_v5(NAMESPACE, '{id}-user')"),
+                ("conversations.user_id", "user_id", "deterministic_uuid_v4(USER_NAMESPACE, user_id)"),
+                ("messages[user].id", "id", "deterministic_uuid_v4(NAMESPACE, '{id}-user')"),
                 ("messages[user].role", "—", "'user'"),
                 ("messages[user].created_at", "created_at", "created_at - interval '1 second'"),
-                ("messages[user].metadata", "—", "Empty {}"),
-                ("messages[asst].id", "id", "uuid_generate_v5(NAMESPACE, '{id}-assistant')"),
+                ("messages[user].metadata", "—", "JSONB: {message_order: turn_idx×2, turn_index: turn_idx}"),
+                ("messages[asst].id", "id", "deterministic_uuid_v4(NAMESPACE, '{id}-assistant')"),
                 ("messages[asst].role", "—", "'assistant'"),
                 ("messages[asst].finish_reason", "—", "'stop'"),
                 ("messages[asst].metadata", "Multiple", "JSONB: model, type, bot_id, is_like, token_amount, words_amount, calculated_time, category, sentiment, legacyData: {legacy_log_id, title, toolkit_settings, sourcetext, sourcelink, webpagelink, documents_selected}"),
@@ -434,17 +440,27 @@ def main():
             "source": "`playground_bot_generator_config`",
             "target": "`agents` + `agent_settings` + `agent_documents`",
             "logic": (
-                "Agent type derived from config (`spark` / `cortex` / `workflow`). "
+                "Agent type derived from config (all legacy bots migrate as `cortex`). "
                 "JSONB fields (`bot_data`, `toolkit_settings`, prompts) decomposed into "
                 "normalized columns. `docs_chosen` and `chosen_docs_folders` expanded "
-                "into `agent_documents` link table. RAG settings extracted and mapped."
+                "into `agent_documents` link table via `migration.get_new_id`. "
+                "RAG settings extracted and mapped. "
+                "**Dependency resolution (auto-topup):** before this SQL is generated, "
+                "every document and folder referenced by selected agents is verified against "
+                "the migration plan. Missing documents are automatically fetched from V4 "
+                "and added to steps 03 & 04 (with `[agent-topup]` annotation). Missing "
+                "folders are fetched with their full ancestor chain. "
+                "References to documents or folders that no longer exist in V4 are flagged "
+                "as stale — those specific `agent_documents` links will be dropped. "
+                "After topup, every `migration.get_new_id(...)` call in this file is "
+                "guaranteed to resolve correctly."
             ),
             "columns": [
-                ("agents.id", "bot_id", "uuid_generate_v5(NAMESPACE, '{bot_id}-agent')"),
+                ("agents.id", "bot_id", "deterministic_uuid_v4(NAMESPACE, '{bot_id}-agent')"),
                 ("agents.name", "bot_data.bot_name", "Max 128 chars; fallback 'Unnamed Agent'"),
                 ("agents.description", "bot_data.bot_description", "Max 2048 chars"),
-                ("agents.type", "toolkit_settings / prompts", "'workflow' / 'cortex' / 'spark' derived"),
-                ("agents.user_id", "user_id", "uuid_generate_v5(USER_NAMESPACE, user_id)"),
+                ("agents.type", "—", "Always 'cortex' (legacy bots)"),
+                ("agents.user_id", "user_id", "deterministic_uuid_v4(USER_NAMESPACE, user_id)"),
                 ("agents.avatar_url", "toolkit_settings", "assistantIcon.url or logo_url"),
                 ("agents.folder_id", "folder_id", "migration.get_new_id('folders', folder_id)"),
                 ("agents.last_interacted_at", "last_activity", "Direct"),
@@ -460,8 +476,8 @@ def main():
                 ("agent_settings.show_source_text", "toolkit_settings.questions_selected", "Contains 'Display the source text'"),
                 ("agent_settings.follow_up_questions", "toolkit_settings.questions_selected", "Contains 'Follow-up questions'"),
                 ("agent_settings.additional_links", "additional_links_title.is_selected", "== 'true'"),
-                ("agent_documents.document_id", "docs_chosen", "uuid_generate_v5(DOC_NAMESPACE, doc_id)"),
-                ("agent_documents.document_id", "chosen_docs_folders", "migration.get_new_id('folders', fid)"),
+                ("agent_documents.document_id", "docs_chosen", "migration.get_new_id('documents', doc_id) — guaranteed by topup"),
+                ("agent_documents.document_id", "chosen_docs_folders", "migration.get_new_id('folders', fid) — guaranteed by topup"),
                 ("agent_documents.type", "—", "'document' or 'folder'"),
             ],
         },
@@ -480,12 +496,30 @@ def main():
             )
             st.markdown(col_header + col_rows)
 
-    # ID Mapping infrastructure note
+    # Key infrastructure notes
     st.info(
         "**🔗 migration.id_mappings** — Central lookup table that stores every "
         "`old_id → new_id (UUID)` mapping. Used by steps 2-6 to resolve foreign keys "
         "across tables. Enables idempotent re-runs (records are skipped if already migrated) "
         "and provides a real-time progress summary via `migration.progress_summary`."
+    )
+
+    st.info(
+        "**🔑 UUID Strategy — `migration.deterministic_uuid_v4(namespace, input)`** — "
+        "All entity IDs are generated deterministically: the same legacy ID always produces "
+        "the same new UUID regardless of which database or script run generates it. "
+        "The output has its version nibble set to `4` so it passes any UUID v4 validation "
+        "in the target application. Each entity type uses a separate namespace to prevent "
+        "collisions across tables (users / documents / everything else)."
+    )
+
+    st.info(
+        "**🤖 Agent-Document Topup** — When agent migration SQL is generated, the extraction "
+        "engine automatically scans every agent's `docs_chosen` and `chosen_docs_folders`. "
+        "Any documents or folders not already in the migration plan are fetched from V4 and "
+        "appended to steps 03 & 04 (annotated `[agent-topup]`). References to records that "
+        "no longer exist in V4 are flagged as stale and surfaced as warnings in the UI — "
+        "those specific agent-document links will be dropped at runtime."
     )
 
     st.markdown(

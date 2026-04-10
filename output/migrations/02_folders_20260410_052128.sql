@@ -1,7 +1,7 @@
 -- ============================================================
 -- FOLDERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-24T08:14:46.775520
+-- Generated: 2026-04-10T05:21:31.331011
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: document_db.public.folders
 -- Records to migrate: 1
@@ -114,7 +114,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: document_db.public.folders';
     
-    RAISE NOTICE 'Generated: 2026-03-24T08:14:46.775520';
+    RAISE NOTICE 'Generated: 2026-04-10T05:21:31.331011';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -141,17 +141,17 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('folders_20260324_081446', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('folders_20260410_052131', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
--- Folder: Ariel TEsttt (owner: e994b100cd7b6327b45618f254d1b708)
+-- Folder: adi test (owner: de0ff05457533c93fdf3e0d1cdd0f808)
 DO $$
 DECLARE
-    v_old_folder_id VARCHAR := '1398';
-    v_old_owner_id VARCHAR := 'e994b100cd7b6327b45618f254d1b708';
+    v_old_folder_id VARCHAR := '1168';
+    v_old_owner_id VARCHAR := 'de0ff05457533c93fdf3e0d1cdd0f808';
     v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'e994b100cd7b6327b45618f254d1b708');
+    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808');
 BEGIN
     -- Check if folder already migrated using mapping table (FAST)
     IF migration.is_migrated('folders', v_old_folder_id) THEN
@@ -171,11 +171,11 @@ BEGIN
         deleted_at
     ) VALUES (
         v_folder_id,
-        'Ariel TEsttt',
+        'adi test',
         NULL,
         'document'::public.folders_folder_type_enum,
         v_user_id,
-        '2026-03-17T14:27:15.221381',
+        '2025-08-26T11:25:49.823742',
         now(),
         NULL
     )
@@ -191,7 +191,7 @@ BEGIN
         'folders',
         v_old_folder_id,
         v_folder_id,
-        'folders_20260324_081446'
+        'folders_20260410_052131'
     );
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
@@ -200,7 +200,7 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'folders_20260324_081446';
+WHERE batch_id = 'folders_20260410_052131';
 
 -- Total folders processed: 1
 -- Skipped (no ID): 0

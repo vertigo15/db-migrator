@@ -73,43 +73,44 @@ def test_agents_sql_generation():
         print(f"❌ FAIL: Namespace UUID '{namespace_uuid}' not found in SQL")
         return False
     
-    # Check 3: Temp table created
-    if 'CREATE TEMP TABLE _migration_bots' in sql_content:
-        print(f"✓ PASS: Temp table _migration_bots created")
+    # Check 3: Agent DO block present
+    if 'DO $agent_fn$' in sql_content:
+        print(f"✓ PASS: Agent DO block found")
     else:
-        print(f"❌ FAIL: Temp table _migration_bots not found")
+        print(f"❌ FAIL: Agent DO block not found")
         return False
-    
-    # Check 4: All expected steps present
-    expected_steps = [
-        'STEP 0: CREATE MAPPING TABLE',
-        'STEP 1: BUILD WORKING TABLE',
-        'STEP 2: INSERT AGENTS',
-        'STEP 3: INSERT AGENT SETTINGS',
-        'STEP 4: INSERT AGENT_DOCUMENTS (from docs_chosen array)',
-        'STEP 5: INSERT AGENT_DOCUMENTS (from chosen_docs_folders array)',
-        'STEP 6: INSERT INTO MIGRATION.ID_MAPPINGS',
-        'STEP 7: POPULATE LEGACY MAPPING TABLE'
+
+    # Check 4: All expected structural elements present
+    expected_elements = [
+        'CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping',
+        'INSERT INTO agents',
+        'INSERT INTO agent_settings',
+        'INSERT INTO agent_documents',
+        'INSERT INTO migration.id_mappings',
+        'INSERT INTO legacy_bot_to_agent_mapping',
+        'migration.deterministic_uuid_v4',
+        'migration.get_new_id',
     ]
-    
-    for step in expected_steps:
-        if step in sql_content:
-            print(f"✓ PASS: {step} found")
+
+    for element in expected_elements:
+        if element in sql_content:
+            print(f"✓ PASS: '{element}' found")
         else:
-            print(f"❌ FAIL: {step} not found")
+            print(f"❌ FAIL: '{element}' not found")
             return False
-    
-    # Check 5: Explicit defaults present
-    if 'false  -- explicit default' in sql_content or 'false) AS base_answers_on_files_only' in sql_content:
-        print(f"✓ PASS: Explicit defaults found")
+
+    # Check 5: deterministic_uuid_v4 helper function is included
+    if 'CREATE OR REPLACE FUNCTION migration.deterministic_uuid_v4' in sql_content:
+        print(f"✓ PASS: deterministic_uuid_v4 helper function present")
     else:
-        print(f"⚠ WARNING: Explicit default comments may not be present")
-    
-    # Check 6: Empty string check present
-    if "TRIM(doc_id_elem) != ''" in sql_content:
-        print(f"✓ PASS: Empty string check found for docs_chosen")
+        print(f"❌ FAIL: deterministic_uuid_v4 helper function missing")
+        return False
+
+    # Check 6: docs_chosen links are generated for the test agent
+    if "'doc1'" in sql_content or "'doc2'" in sql_content:
+        print(f"✓ PASS: docs_chosen document links found")
     else:
-        print(f"❌ FAIL: Empty string check not found")
+        print(f"❌ FAIL: docs_chosen document links not found")
         return False
     
     # Show sample of generated SQL

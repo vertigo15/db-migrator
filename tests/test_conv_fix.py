@@ -99,9 +99,9 @@ def test_generation():
     # Turn 1: parent must be NULL::uuid
     assert 'NULL::uuid' in user_msg_lines[0], f"Turn 1 parent should be NULL, got: {user_msg_lines[0][:120]}"
 
-    # Turn 2+: parent must be a uuid_generate_v5(...) call, NOT a quoted string
+    # Turn 2+: parent must be a deterministic_uuid_v4(...) call, NOT a quoted string
     for i, line in enumerate(user_msg_lines[1:], start=2):
-        assert 'uuid_generate_v5' in line, f"Turn {i} parent must be a uuid_generate_v5 expression"
+        assert 'deterministic_uuid_v4' in line, f"Turn {i} parent must be a deterministic_uuid_v4 expression"
         # The broken version would have: '...'-assistant')'  (double single quotes nesting)
         assert "'-assistant')'" not in line, f"Turn {i} parent is still a quoted string literal (broken)"
 

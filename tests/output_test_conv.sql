@@ -1,7 +1,7 @@
 -- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-03-24T09:59:25.729784
+-- Generated: 2026-04-10T08:03:34.480089
 -- Source: test-source
 -- Destination: conversations + messages + message_content_blocks
 -- Source rows: 3
@@ -14,7 +14,7 @@
 --   2. messages (user + assistant per row)
 --   3. message_content_blocks (one per message)
 --
--- Uses deterministic UUID generation (uuid_generate_v5).
+-- Uses deterministic UUID generation (deterministic_uuid_v4).
 -- Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b
 -- Multi-INSERT format: grouped by user, max 50 conversations per INSERT
 -- ============================================================
@@ -37,7 +37,7 @@ BEGIN
     RAISE NOTICE 'This script will migrate conversations and messages';
     RAISE NOTICE 'Source rows: 3';
     RAISE NOTICE 'Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b';
-    RAISE NOTICE 'Generated: 2026-03-24T09:59:25.729800';
+    RAISE NOTICE 'Generated: 2026-04-10T08:03:34.480135';
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'PREREQUISITE: Users must be migrated first!';
     RAISE NOTICE '============================================================';
@@ -131,6 +131,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Helper function: Deterministic UUID that passes v4 validation
+-- Uses uuid_generate_v5 internally for determinism, then overwrites the
+-- version nibble (position 15) from '5' to '4' so the result passes
+-- any UUID-v4 format check the target application performs.
+CREATE OR REPLACE FUNCTION migration.deterministic_uuid_v4(
+    ns uuid,
+    input text
+) RETURNS uuid AS $$
+  SELECT overlay(uuid_generate_v5(ns, input)::text placing '4' from 15 for 1)::uuid;
+$$ LANGUAGE sql IMMUTABLE;
+
 -- Progress summary view
 CREATE OR REPLACE VIEW migration.progress_summary AS
 SELECT 
@@ -155,7 +166,7 @@ ORDER BY table_name;
 INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 SELECT * FROM (
   VALUES
-    ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, 'Test conversation', 6, 150, true, NULL::timestamp, '2026-01-01T10:00:00'::timestamptz, '2026-01-01T10:02:00'::timestamptz, '2026-01-01T10:02:00'::timestamptz, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'))
+    ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, 'Test conversation', 6, 150, true, NULL::timestamp, '2026-01-01T10:00:00'::timestamptz, '2026-01-01T10:02:00'::timestamptz, '2026-01-01T10:02:00'::timestamptz, migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'))
 ) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 
@@ -163,12 +174,12 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 INSERT INTO messages (id, conversation_id, parent_message_id, role, has_tool_calls, iteration_count, content_block_count, finish_reason, created_at, updated_at, deleted_at, user_id, metadata)
 SELECT * FROM (
   VALUES
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, NULL::uuid, 'user'::messages_role_enum, false, 1, 1, NULL::text, '2026-01-01T10:00:00'::timestamptz - interval '1 second', '2026-01-01T10:00:00'::timestamptz - interval '1 second', NULL::timestamp, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{}'::jsonb),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user'), 'assistant'::messages_role_enum, false, 1, 1, 'stop', '2026-01-01T10:00:00'::timestamptz, '2026-01-01T10:00:00'::timestamptz, NULL::timestamp, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"model": "gpt-4", "type": "chat", "bot_id": "bot-001", "is_like": ["positive"], "token_amount": 50, "words_amount": 10, "calculated_time": 120, "category": "general", "sentiment": "neutral", "legacyData": {"legacy_log_id": "log-id-0000", "title": "Test conversation", "toolkit_settings": {"model": "gpt-4"}, "sourcetext": null, "sourcelink": null, "webpagelink": null, "documents_selected": null}}'::jsonb),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant'), 'user'::messages_role_enum, false, 1, 1, NULL::text, '2026-01-01T10:01:00'::timestamptz - interval '1 second', '2026-01-01T10:01:00'::timestamptz - interval '1 second', NULL::timestamp, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{}'::jsonb),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user'), 'assistant'::messages_role_enum, false, 1, 1, 'stop', '2026-01-01T10:01:00'::timestamptz, '2026-01-01T10:01:00'::timestamptz, NULL::timestamp, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"model": "gpt-4", "type": "chat", "bot_id": "bot-001", "is_like": ["positive"], "token_amount": 50, "words_amount": 10, "calculated_time": 120, "category": "general", "sentiment": "neutral", "legacyData": {"legacy_log_id": "log-id-0001", "title": "Test conversation", "toolkit_settings": {"model": "gpt-4"}, "sourcetext": null, "sourcelink": null, "webpagelink": null, "documents_selected": null}}'::jsonb),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant'), 'user'::messages_role_enum, false, 1, 1, NULL::text, '2026-01-01T10:02:00'::timestamptz - interval '1 second', '2026-01-01T10:02:00'::timestamptz - interval '1 second', NULL::timestamp, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{}'::jsonb),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-assistant'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user'), 'assistant'::messages_role_enum, false, 1, 1, 'stop', '2026-01-01T10:02:00'::timestamptz, '2026-01-01T10:02:00'::timestamptz, NULL::timestamp, uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"model": "gpt-4", "type": "chat", "bot_id": "bot-001", "is_like": ["positive"], "token_amount": 50, "words_amount": 10, "calculated_time": 120, "category": "general", "sentiment": "neutral", "legacyData": {"legacy_log_id": "log-id-0002", "title": "Test conversation", "toolkit_settings": {"model": "gpt-4"}, "sourcetext": null, "sourcelink": null, "webpagelink": null, "documents_selected": null}}'::jsonb)
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, NULL::uuid, 'user'::messages_role_enum, false, 1, 1, NULL::text, '2026-01-01T10:00:00'::timestamptz - interval '1 second', '2026-01-01T10:00:00'::timestamptz - interval '1 second', NULL::timestamp, migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"message_order": 0, "turn_index": 0}'::jsonb),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user'), 'assistant'::messages_role_enum, false, 1, 1, 'stop', '2026-01-01T10:00:00'::timestamptz, '2026-01-01T10:00:00'::timestamptz, NULL::timestamp, migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"model": "gpt-4", "type": "chat", "bot_id": "bot-001", "is_like": ["positive"], "token_amount": 50, "words_amount": 10, "calculated_time": 120, "category": "general", "sentiment": "neutral", "message_order": 1, "turn_index": 0, "legacyData": {"legacy_log_id": "log-id-0000", "title": "Test conversation", "toolkit_settings": {"model": "gpt-4"}, "sourcetext": null, "sourcelink": null, "webpagelink": null, "documents_selected": null}}'::jsonb),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant'), 'user'::messages_role_enum, false, 1, 1, NULL::text, '2026-01-01T10:01:00'::timestamptz - interval '1 second', '2026-01-01T10:01:00'::timestamptz - interval '1 second', NULL::timestamp, migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"message_order": 2, "turn_index": 1}'::jsonb),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user'), 'assistant'::messages_role_enum, false, 1, 1, 'stop', '2026-01-01T10:01:00'::timestamptz, '2026-01-01T10:01:00'::timestamptz, NULL::timestamp, migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"model": "gpt-4", "type": "chat", "bot_id": "bot-001", "is_like": ["positive"], "token_amount": 50, "words_amount": 10, "calculated_time": 120, "category": "general", "sentiment": "neutral", "message_order": 3, "turn_index": 1, "legacyData": {"legacy_log_id": "log-id-0001", "title": "Test conversation", "toolkit_settings": {"model": "gpt-4"}, "sourcetext": null, "sourcelink": null, "webpagelink": null, "documents_selected": null}}'::jsonb),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant'), 'user'::messages_role_enum, false, 1, 1, NULL::text, '2026-01-01T10:02:00'::timestamptz - interval '1 second', '2026-01-01T10:02:00'::timestamptz - interval '1 second', NULL::timestamp, migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"message_order": 4, "turn_index": 2}'::jsonb),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-assistant'), 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid, migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user'), 'assistant'::messages_role_enum, false, 1, 1, 'stop', '2026-01-01T10:02:00'::timestamptz, '2026-01-01T10:02:00'::timestamptz, NULL::timestamp, migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'user-hash-abc123'), '{"model": "gpt-4", "type": "chat", "bot_id": "bot-001", "is_like": ["positive"], "token_amount": 50, "words_amount": 10, "calculated_time": 120, "category": "general", "sentiment": "neutral", "message_order": 5, "turn_index": 2, "legacyData": {"legacy_log_id": "log-id-0002", "title": "Test conversation", "toolkit_settings": {"model": "gpt-4"}, "sourcetext": null, "sourcelink": null, "webpagelink": null, "documents_selected": null}}'::jsonb)
 ) AS v(id, conversation_id, parent_message_id, role, has_tool_calls, iteration_count, content_block_count, finish_reason, created_at, updated_at, deleted_at, user_id, metadata)
 WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id);
 
@@ -176,12 +187,12 @@ WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id);
 INSERT INTO message_content_blocks (id, message_id, sequence, type, content, execution_time_ms, created_at)
 SELECT * FROM (
   VALUES
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user-block-0'), uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user'), 0, 'message'::message_content_blocks_type_enum, '{"role": "user", "type": "message", "content": [{"text": "Question 0", "type": "text"}]}'::jsonb, NULL::integer, '2026-01-01T10:00:00'::timestamptz - interval '1 second'),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant-block-0'), uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant'), 0, 'message'::message_content_blocks_type_enum, '{"role": "assistant", "type": "message", "content": [{"text": "Answer number 0", "type": "text"}]}'::jsonb, 120, '2026-01-01T10:00:00'::timestamptz),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user-block-0'), uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user'), 0, 'message'::message_content_blocks_type_enum, '{"role": "user", "type": "message", "content": [{"text": "Question 1", "type": "text"}]}'::jsonb, NULL::integer, '2026-01-01T10:01:00'::timestamptz - interval '1 second'),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant-block-0'), uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant'), 0, 'message'::message_content_blocks_type_enum, '{"role": "assistant", "type": "message", "content": [{"text": "Answer number 1", "type": "text"}]}'::jsonb, 120, '2026-01-01T10:01:00'::timestamptz),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user-block-0'), uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user'), 0, 'message'::message_content_blocks_type_enum, '{"role": "user", "type": "message", "content": [{"text": "Question 2", "type": "text"}]}'::jsonb, NULL::integer, '2026-01-01T10:02:00'::timestamptz - interval '1 second'),
-    (uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-assistant-block-0'), uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-assistant'), 0, 'message'::message_content_blocks_type_enum, '{"role": "assistant", "type": "message", "content": [{"text": "Answer number 2", "type": "text"}]}'::jsonb, 120, '2026-01-01T10:02:00'::timestamptz)
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user-block-0'), migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-user'), 0, 'message'::message_content_blocks_type_enum, '{"role": "user", "type": "message", "content": [{"text": "Question 0", "type": "text"}]}'::jsonb, NULL::integer, '2026-01-01T10:00:00'::timestamptz - interval '1 second'),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant-block-0'), migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0000-assistant'), 0, 'message'::message_content_blocks_type_enum, '{"role": "assistant", "type": "message", "content": [{"text": "Answer number 0", "type": "text"}]}'::jsonb, 120, '2026-01-01T10:00:00'::timestamptz),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user-block-0'), migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-user'), 0, 'message'::message_content_blocks_type_enum, '{"role": "user", "type": "message", "content": [{"text": "Question 1", "type": "text"}]}'::jsonb, NULL::integer, '2026-01-01T10:01:00'::timestamptz - interval '1 second'),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant-block-0'), migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0001-assistant'), 0, 'message'::message_content_blocks_type_enum, '{"role": "assistant", "type": "message", "content": [{"text": "Answer number 1", "type": "text"}]}'::jsonb, 120, '2026-01-01T10:01:00'::timestamptz),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user-block-0'), migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-user'), 0, 'message'::message_content_blocks_type_enum, '{"role": "user", "type": "message", "content": [{"text": "Question 2", "type": "text"}]}'::jsonb, NULL::integer, '2026-01-01T10:02:00'::timestamptz - interval '1 second'),
+    (migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-assistant-block-0'), migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'log-id-0002-assistant'), 0, 'message'::message_content_blocks_type_enum, '{"role": "assistant", "type": "message", "content": [{"text": "Answer number 2", "type": "text"}]}'::jsonb, 120, '2026-01-01T10:02:00'::timestamptz)
 ) AS v(id, message_id, sequence, type, content, execution_time_ms, created_at)
 WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
 
