@@ -1,7 +1,7 @@
 -- ============================================================
 -- FOLDERS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-04-10T05:21:31.331011
+-- Generated: 2026-04-13T12:05:43.598054
 -- Source: jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)
 -- Destination: document_db.public.folders
 -- Records to migrate: 1
@@ -87,6 +87,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Helper function: Deterministic UUID that passes v4 validation
+-- Uses uuid_generate_v5 internally for determinism, then overwrites the
+-- version nibble (position 15) from '5' to '4' so the result passes
+-- any UUID-v4 format check the target application performs.
+CREATE OR REPLACE FUNCTION migration.deterministic_uuid_v4(
+    ns uuid,
+    input text
+) RETURNS uuid AS $$
+  SELECT overlay(uuid_generate_v5(ns, input)::text placing '4' from 15 for 1)::uuid;
+$$ LANGUAGE sql IMMUTABLE;
+
 -- Progress summary view
 CREATE OR REPLACE VIEW migration.progress_summary AS
 SELECT 
@@ -114,7 +125,7 @@ BEGIN
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'This script will migrate 1 records to: document_db.public.folders';
     
-    RAISE NOTICE 'Generated: 2026-04-10T05:21:31.331011';
+    RAISE NOTICE 'Generated: 2026-04-13T12:05:43.598054';
     RAISE NOTICE '============================================================';
     RAISE NOTICE '';
     
@@ -141,7 +152,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
 INSERT INTO migration.batch_log (batch_id, table_name, record_count, source_info)
-VALUES ('folders_20260410_052131', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
+VALUES ('folders_20260413_120543', 'folders', 1, '{"source": "jeen-pg-dev-weu.postgres.database.azure.com:5432/postgres (prefix: jeen_dev)"}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 
@@ -150,8 +161,8 @@ DO $$
 DECLARE
     v_old_folder_id VARCHAR := '1168';
     v_old_owner_id VARCHAR := 'de0ff05457533c93fdf3e0d1cdd0f808';
-    v_folder_id uuid := uuid_generate_v5('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
-    v_user_id uuid := uuid_generate_v5('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808');
+    v_folder_id uuid := migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, v_old_folder_id);
+    v_user_id uuid := migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'de0ff05457533c93fdf3e0d1cdd0f808');
 BEGIN
     -- Check if folder already migrated using mapping table (FAST)
     IF migration.is_migrated('folders', v_old_folder_id) THEN
@@ -191,7 +202,7 @@ BEGIN
         'folders',
         v_old_folder_id,
         v_folder_id,
-        'folders_20260410_052131'
+        'folders_20260413_120543'
     );
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
@@ -200,9 +211,9 @@ END $$;
 -- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
-WHERE batch_id = 'folders_20260410_052131';
+WHERE batch_id = 'folders_20260413_120543';
 
 -- Total folders processed: 1
 -- Skipped (no ID): 0
--- Note: Folders inserted in parent-first order using deterministic UUIDs (uuid_generate_v5)
+-- Note: Folders inserted in parent-first order using deterministic UUIDs (deterministic_uuid_v4)
 -- Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b

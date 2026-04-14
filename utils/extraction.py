@@ -481,7 +481,8 @@ class ExtractionEngine:
                             output_file=docs_sql,
                             source_info=source_info_base,
                             user_id_overrides=self.user_id_overrides,
-                            doc_source_labels=topup_report.get('doc_source_labels', {})
+                            doc_source_labels=topup_report.get('doc_source_labels', {}),
+                            embeddings_df=embeddings_df,
                         )
                     except Exception as e:
                         print(f"Warning: Failed to regenerate documents SQL after topup: {e}")
@@ -1021,12 +1022,28 @@ class ExtractionEngine:
                 embeddings_df, embeddings_path = self.extract_embeddings(doc_ids, selected_embedding_ids)
                 results["files"]["embeddings"] = embeddings_path
                 results["summary"]["embeddings"] = len(embeddings_df)
-                
+
                 # Track SQL generation (chunks + embeddings combined)
                 if self.generate_sql and len(embeddings_df) > 0:
                     sql_path = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
                     if os.path.exists(sql_path):
                         results["sql_files"]["chunks_embeddings"] = sql_path
+
+                # Regenerate 03_documents_*.sql now that embeddings are known so that
+                # translate_to_english is correctly set on each document_processing record.
+                if self.generate_sql and len(docs_df) > 0:
+                    _docs_sql = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
+                    _src = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
+                    try:
+                        generate_documents_migration_sql(
+                            documents_df=docs_df,
+                            output_file=_docs_sql,
+                            source_info=_src,
+                            user_id_overrides=self.user_id_overrides,
+                            embeddings_df=embeddings_df,
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to regenerate documents SQL with translation info: {e}")
             else:
                 results["summary"]["embeddings"] = 0
                 embeddings_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])

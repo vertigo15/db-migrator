@@ -340,34 +340,49 @@ def main():
             "step": "03",
             "name": "Documents",
             "source": "`{prefix}_custom_documents`",
-            "target": "`document_db.documents`",
+            "target": "`document_db.documents` + `document_processing`",
             "logic": (
                 "New UUID per document. `owner_id` → `user_id` and `folder_id` resolved via mapping table. "
                 "File type mapped to MIME `content_type`. Legacy metadata (`tags`, `doc_summery`, "
                 "`embedding_model`, `vector_methods`, etc.) stored in `metadata` JSONB. "
+                "**document_processing:** one record is inserted per document in the same DO block "
+                "(status `COMPLETED`, `is_ready = true`). `translate_to_english` is derived at "
+                "generation time by scanning source chunks — `true` when any chunk for the document "
+                "contains a `translated_content:` section. `parsing_technique_id` is resolved via "
+                "subquery (first available technique). "
                 "**Agent-topup:** documents referenced by selected agents but not in the original "
                 "user selection are automatically fetched from V4 and appended to this file, "
                 "annotated with `-- [agent-topup] Auto-added: required by agent:<bot_id>`. "
                 "Their chunks and embeddings are also added to step 04."
             ),
             "columns": [
-                ("id", "doc_id", "deterministic_uuid_v4(DOC_NAMESPACE, doc_id)"),
-                ("status", "—", "Always 'UPLOADED'"),
-                ("file_name", "doc_name_origin / doc_title", "doc_name_origin → doc_title → 'unnamed'"),
-                ("file_size", "doc_size", "Integer cast"),
-                ("storage_type", "blob_source", "'azure_blob' → 'azure'; else direct"),
-                ("storage_path", "doc_id", "Old doc_id as path reference"),
-                ("storage_id", "—", "NULL"),
-                ("metadata", "Multiple", "JSONB: name, source='legacy-migration', legacyData: {doc_id, doc_title, doc_description, doc_summery, tags, embedding_model, vector_methods, version, doc_checksum, data_integration_doc_metadata}"),
-                ("created_at", "created_at", "Direct"),
-                ("updated_at", "—", "now()"),
-                ("deleted_at", "—", "NULL"),
-                ("folder_id", "folder_id", "migration.get_new_id('folders', folder_id) or NULL"),
-                ("user_id", "owner_id", "deterministic_uuid_v4(USER_NAMESPACE, owner_id)"),
-                ("content_type", "doc_type", "Mapped to MIME (pdf → application/pdf, etc.)"),
-                ("parsing_technique_id", "—", "NULL"),
-                ("source_type", "—", "Always 'upload'"),
-                ("organization_id", "—", "NULL"),
+                ("documents.id", "doc_id", "deterministic_uuid_v4(DOC_NAMESPACE, doc_id)"),
+                ("documents.status", "—", "Always 'UPLOADED'"),
+                ("documents.file_name", "doc_name_origin / doc_title", "doc_name_origin → doc_title → 'unnamed'"),
+                ("documents.file_size", "doc_size", "Integer cast"),
+                ("documents.storage_type", "blob_source", "'azure_blob' → 'azure'; else direct"),
+                ("documents.storage_path", "doc_id", "Old doc_id as path reference"),
+                ("documents.storage_id", "—", "NULL"),
+                ("documents.metadata", "Multiple", "JSONB: name, source='legacy-migration', legacyData: {doc_id, doc_title, doc_description, doc_summery, tags, embedding_model, vector_methods, version, doc_checksum, data_integration_doc_metadata}"),
+                ("documents.created_at", "created_at", "Direct"),
+                ("documents.updated_at", "—", "now()"),
+                ("documents.deleted_at", "—", "NULL"),
+                ("documents.folder_id", "folder_id", "migration.get_new_id('folders', folder_id) or NULL"),
+                ("documents.user_id", "owner_id", "deterministic_uuid_v4(USER_NAMESPACE, owner_id)"),
+                ("documents.content_type", "doc_type", "Mapped to MIME (pdf → application/pdf, etc.)"),
+                ("documents.parsing_technique_id", "—", "NULL"),
+                ("documents.source_type", "—", "Always 'upload'"),
+                ("documents.organization_id", "—", "NULL"),
+                ("document_processing.id", "doc_id", "deterministic_uuid_v4(DOC_NAMESPACE, doc_id || '-processing')"),
+                ("document_processing.document_id", "doc_id", "References documents.id (v_new_doc_id)"),
+                ("document_processing.parsing_technique_id", "—", "SELECT id FROM parsing_techniques ORDER BY created_at LIMIT 1"),
+                ("document_processing.chunk_size", "—", "512 (hardcoded default)"),
+                ("document_processing.chunk_overlap", "—", "50 (hardcoded default)"),
+                ("document_processing.status", "—", "Always 'COMPLETED'"),
+                ("document_processing.is_active", "—", "true"),
+                ("document_processing.translate_to_english", "{prefix}_embeddings.document", "true if any chunk for this doc has 'translated_content:' section; else false"),
+                ("document_processing.embedding_model_id", "—", "'00000000-0000-0000-0000-000000000001' (schema default)"),
+                ("document_processing.is_ready", "—", "true"),
             ],
         },
         {

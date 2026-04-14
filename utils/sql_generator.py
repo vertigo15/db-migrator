@@ -963,18 +963,21 @@ def generate_document_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     user_id_overrides: Optional[Dict[str, str]] = None,
-    source_label: Optional[str] = None
+    source_label: Optional[str] = None,
+    translate_to_english: bool = False,
 ) -> Optional[str]:
     """
-    Generate INSERT statement for a single document.
-    
+    Generate INSERT statement for a single document plus its document_processing record.
+
     Args:
         row: Pandas Series with document data
         namespace_uuid: Fixed namespace UUID for folder_id conversion
         user_id_overrides: Optional v4_id -> v5_uuid override mapping
         source_label: If set, annotates the SQL comment to indicate why this
                       document was included (e.g. 'agent:bot_abc123').
-        
+        translate_to_english: True when any chunk for this document contains
+                              translated content (derived from source embeddings).
+
     Returns:
         SQL INSERT statement or None to skip
     """
@@ -1159,7 +1162,35 @@ BEGIN
         NULL
     )
     ON CONFLICT (id) DO NOTHING;
-    
+
+    -- Insert document_processing record (status COMPLETED, is_ready true)
+    -- parsing_technique_id: subquery picks first available technique
+    -- translate_to_english: derived from whether source chunks contained translated content
+    INSERT INTO public.document_processing (
+        id,
+        document_id,
+        parsing_technique_id,
+        chunk_size,
+        chunk_overlap,
+        status,
+        is_active,
+        translate_to_english,
+        embedding_model_id,
+        is_ready
+    ) VALUES (
+        migration.deterministic_uuid_v4('{DOC_NAMESPACE_UUID}'::uuid, v_old_doc_id || '-processing'),
+        v_new_doc_id,
+        (SELECT id FROM public.parsing_techniques ORDER BY created_at LIMIT 1),
+        512,
+        50,
+        'COMPLETED'::public.document_processing_status_enum,
+        true,
+        {str(translate_to_english).lower()},
+        '00000000-0000-0000-0000-000000000001'::uuid,
+        true
+    )
+    ON CONFLICT (id) DO NOTHING;
+
     -- Store document ID mapping
     INSERT INTO migration.id_mappings (
         table_name,
@@ -1186,11 +1217,12 @@ def generate_documents_migration_sql(
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     user_id_overrides: Optional[Dict[str, str]] = None,
-    doc_source_labels: Optional[Dict[str, str]] = None
+    doc_source_labels: Optional[Dict[str, str]] = None,
+    embeddings_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for documents table.
-    
+
     Args:
         documents_df: DataFrame with document data
         output_file: Path to output SQL file
@@ -1199,7 +1231,10 @@ def generate_documents_migration_sql(
         user_id_overrides: Optional v4_id -> v5_uuid override mapping
         doc_source_labels: Optional dict mapping doc_id -> label string for
                            agent-topup annotation (e.g. {'doc123': 'agent:bot_abc'}).
-        
+        embeddings_df: Optional source embeddings DataFrame used to detect which
+                       documents have translated content (sets translate_to_english
+                       on the document_processing record).
+
     Returns:
         Dictionary with generation stats
     """
@@ -1210,7 +1245,28 @@ def generate_documents_migration_sql(
     
     record_count = 0
     skipped_count = 0
-    
+
+    # Pre-compute which doc_ids have translated content in the source embeddings.
+    # A document is considered translated when at least one of its chunks has a
+    # non-empty translated_content section in the legacy `document` text field.
+    translated_doc_ids: set = set()
+    if embeddings_df is not None and not embeddings_df.empty:
+        for _, emb_row in embeddings_df.iterrows():
+            meta = emb_row.get('metadata')
+            if isinstance(meta, dict):
+                emb_doc_id = meta.get('doc_id')
+            elif isinstance(meta, str):
+                try:
+                    emb_doc_id = json.loads(meta).get('doc_id')
+                except Exception:
+                    emb_doc_id = None
+            else:
+                emb_doc_id = None
+            if emb_doc_id and emb_doc_id not in translated_doc_ids:
+                _, translated = extract_content_from_document(str(emb_row.get('document') or ''))
+                if translated:
+                    translated_doc_ids.add(emb_doc_id)
+
     # Generate batch ID for tracking
     batch_id = f"documents_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
@@ -1248,7 +1304,12 @@ ON CONFLICT (batch_id) DO NOTHING;
             try:
                 _doc_id = clean_string(row.get('doc_id'))
                 _source_label = doc_source_labels.get(_doc_id) if doc_source_labels and _doc_id else None
-                sql = generate_document_insert(row, namespace_uuid, user_id_overrides, source_label=_source_label)
+                _translate = _doc_id in translated_doc_ids if _doc_id else False
+                sql = generate_document_insert(
+                    row, namespace_uuid, user_id_overrides,
+                    source_label=_source_label,
+                    translate_to_english=_translate,
+                )
                 if sql:
                     # Replace batch placeholder with actual batch_id
                     sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)

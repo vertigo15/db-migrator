@@ -115,6 +115,31 @@ not in the original user selection.
 
 ---
 
+## 3b. custom_documents → document_db.public.document_processing
+
+**Same source table and SQL file as documents** (`{prefix}_custom_documents`, `03_documents_*.sql`)  
+One `document_processing` row is inserted per document, inside the same DO block, immediately after the `documents` INSERT.
+
+**Translation detection:** `translate_to_english` is computed at SQL generation time by scanning the source `{prefix}_embeddings` rows for the document. If any chunk's `document` field contains a `translated_content:` section, the flag is set to `true`. This scan runs in Python before the SQL loop, so detection is accurate regardless of the order documents and chunks are executed on the target.
+
+| Target Column | Source / Derivation | Value |
+|---|---|---|
+| `id` | `doc_id` | `migration.deterministic_uuid_v4(DOC_NAMESPACE, doc_id \|\| '-processing')` |
+| `document_id` | `doc_id` | References the newly inserted `documents.id` (`v_new_doc_id`) |
+| `parsing_technique_id` | — | `(SELECT id FROM public.parsing_techniques ORDER BY created_at LIMIT 1)` |
+| `chunk_size` | — | `512` (hardcoded default) |
+| `chunk_overlap` | — | `50` (hardcoded default) |
+| `status` | — | Always `'COMPLETED'` |
+| `is_active` | — | `true` |
+| `translate_to_english` | `{prefix}_embeddings.document` | `true` if any chunk for this doc has `translated_content:` prefix; else `false` |
+| `embedding_model_id` | — | `'00000000-0000-0000-0000-000000000001'` (schema default) |
+| `is_ready` | — | `true` |
+| `created_at` | — | `now()` (DB default) |
+
+**Idempotency:** `ON CONFLICT (id) DO NOTHING` — safe to re-run.
+
+---
+
 ## 4. embeddings → document_db.public.chunks
 
 **Source table:** `{prefix}_embeddings`  
@@ -316,7 +341,7 @@ the extraction UI.
 |---|---|---|---|
 | 1 | `01_users_*.sql` | `{prefix}_users` | — |
 | 2 | `02_folders_*.sql` | `{prefix}_folders` | Users |
-| 3 | `03_documents_*.sql` | `{prefix}_custom_documents` | Users + Folders |
+| 3 | `03_documents_*.sql` | `{prefix}_custom_documents` | Users + Folders | Also inserts `document_processing` (one row per document) |
 | 4 | `04_chunks_embeddings_*.sql` | `{prefix}_embeddings` | Documents |
 | 5 | `05_conversations_*.sql` | `{prefix}_logs` | Users |
 | 6 | `06_agents_*.sql` | `{prefix}_playground_bot_generator_config` | Users + Folders + Documents |
