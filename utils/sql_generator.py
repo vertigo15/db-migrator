@@ -1176,7 +1176,9 @@ BEGIN
         is_active,
         translate_to_english,
         embedding_model_id,
-        is_ready
+        is_ready,
+        prepend_doc_title,
+        deleted_at
     ) VALUES (
         migration.deterministic_uuid_v4('{DOC_NAMESPACE_UUID}'::uuid, v_old_doc_id || '-processing'),
         v_new_doc_id,
@@ -1187,7 +1189,9 @@ BEGIN
         true,
         {str(translate_to_english).lower()},
         '00000000-0000-0000-0000-000000000001'::uuid,
-        true
+        true,
+        false,
+        NULL
     )
     ON CONFLICT (id) DO NOTHING;
 
@@ -1671,6 +1675,7 @@ BEGIN
             chunk_id,
             document_id,
             embedding,
+            dimension,
             model_name,
             created_at
         ) VALUES (
@@ -1678,6 +1683,7 @@ BEGIN
             v_chunk_id,
             v_document_id,
             '{embeddings_value}'::vector,
+            vector_dims('{embeddings_value}'::vector),
             '{default_embedding_model}',
             {created_at_sql}
         );
@@ -1804,20 +1810,16 @@ END $$;
 --   \\\\quit
 -- \\\\endif
 
--- Ensure embeddings column matches target dimension ({target_embedding_dim or 'original'})
+-- V5 uses untyped vector column + separate dimension column (per-row).
+-- Ensure the dimension column exists (it should from the V5 migration).
 DO $$
-DECLARE
-    v_current_dim INTEGER;
 BEGIN
-    -- Check current vector dimension on the embeddings table
-    SELECT atttypmod INTO v_current_dim
-    FROM pg_attribute
-    WHERE attrelid = 'public.embeddings'::regclass
-      AND attname = 'embedding';
-
-    IF v_current_dim IS NOT NULL AND v_current_dim != {target_embedding_dim or 0} THEN
-        RAISE NOTICE '⚠️  DIMENSION TRIM: embeddings.embedding column resized from % to {target_embedding_dim or 'original'} dimensions. Source vectors will be truncated to fit.', v_current_dim;
-        ALTER TABLE public.embeddings ALTER COLUMN embedding TYPE vector({target_embedding_dim or 1024});
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'embeddings' AND column_name = 'dimension'
+    ) THEN
+        RAISE NOTICE 'Adding missing dimension column to embeddings table';
+        ALTER TABLE public.embeddings ADD COLUMN dimension smallint;
     END IF;
 END $$;
 

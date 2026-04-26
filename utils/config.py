@@ -76,14 +76,6 @@ TABLE_DEFINITIONS: Dict[str, TableDefinition] = {
             FROM public.{table_name}
         """
     ),
-    "users_groups": TableDefinition(
-        logical_name="users_groups",
-        name_template="{prefix}_users_groups",
-        query_template="""
-            SELECT id, group_name, default_model, default_max_tokens_per_user, enabled_features
-            FROM public.{table_name}
-        """
-    ),
     "agents": TableDefinition(
         logical_name="agents",
         name_template="playground_bot_generator_config",
@@ -112,7 +104,6 @@ TABLE_DEFINITIONS: Dict[str, TableDefinition] = {
 
 # Extraction order (respecting foreign keys)
 EXTRACTION_ORDER = [
-    "users_groups",
     "users",
     "folders",
     "custom_documents",
@@ -225,19 +216,6 @@ DEFAULT_MAPPINGS = {
             {"source": "folder_id", "target": "folder_id", "type": "uuid", "flag": "needs mapping"},
         ],
     },
-    "users_groups": {
-        "source_table": "{prefix}_users_groups",
-        "target_table": "users_groups",
-        "target_schema": "user_db",
-        "flag": "needs target schema definition",
-        "columns": [
-            {"source": "id", "target": "id", "type": "uuid"},
-            {"source": "group_name", "target": "group_name", "type": "varchar(255)"},
-            {"source": "default_model", "target": "default_model", "type": "varchar(255)"},
-            {"source": "default_max_tokens_per_user", "target": "default_max_tokens_per_user", "type": "integer"},
-            {"source": "enabled_features", "target": "enabled_features", "type": "jsonb"},
-        ],
-    },
 }
 
 
@@ -291,7 +269,7 @@ def get_env_target_defaults() -> Dict[str, str]:
 
 def get_env_org_id() -> str:
     """Load default organisation ID from .env file (DEFAULT_ORG_ID)."""
-    return os.getenv("DEFAULT_ORG_ID", "356b50f7-bcbd-42aa-9392-e1605f42f7a1")
+    return os.getenv("DEFAULT_ORG_ID", "d8578dff-3465-4b81-8b0f-ce1a83efc21b")
 
 
 EMBEDDING_MODEL_OPTIONS = [

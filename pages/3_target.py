@@ -48,49 +48,27 @@ def init_session_state():
 def render_target_connection():
     """Render target database connection form."""
     st.subheader("🔌 Target Database Connection")
-    
-    # Show test results if available (from previous run)
-    test_result = st.session_state.get("target_test_result")
-    if test_result and st.session_state.get("target_config"):
-        # Display test results from previous test
-        if test_result["server_connected"]:
-            st.info(f"💻 **PostgreSQL Version:** {test_result['version'][:80]}")
-        
-        if test_result["message"]:
-            st.text_area(
-                "Database & Table Verification:",
-                test_result["message"],
-                height=200,
-                disabled=True
-            )
-        
-        if test_result["success"]:
-            st.success("🎉 All databases and tables verified!")
-        else:
-            st.warning("⚠️ Some databases or tables are missing. See details above.")
-        
-        st.markdown("---")
-    
+
     # Show target database structure
     st.info("""
     🎯 **Target V5 Database Structure:**
     
-    • **user_db**: users, users_groups, folders
+    • **user_db**: users, folders
     • **document_db**: documents, chunks, embeddings
-    • **completion_db**: agents, agent_settings, agent_documents, conversations, messages, message_content_blocks
+    • **completion_db**: agents, agent_settings, knowledge_bases, knowledge_base_assignments, knowledge_base_items
     """)
-    
+
     # Show which values are loaded from .env
     env_defaults = get_env_target_defaults()
     if any(v for v in env_defaults.values()):
         st.info("💡 **Loaded from .env file:** " + ", ".join([k for k, v in env_defaults.items() if v and k != "password"]))
-    
+
     # Get saved values
     saved_conn = st.session_state.get(SessionKeys.TARGET_CONNECTION, {})
-    
+
     with st.form("target_connection_form"):
         col1, col2 = st.columns(2)
-        
+
         with col1:
             host = st.text_input(
                 "Host",
@@ -107,7 +85,7 @@ def render_target_connection():
                 value=saved_conn.get("username", ""),
                 placeholder="postgres"
             )
-        
+
         with col2:
             port = st.number_input(
                 "Port",
@@ -127,14 +105,14 @@ def render_target_connection():
                 index=0 if saved_conn.get("schema_mode", "schemas") == "schemas" else 1,
                 help="'schemas' = user_db, document_db, completion_db as schemas in one database. 'databases' = separate databases."
             )
-        
+
         submitted = st.form_submit_button("🔗 Test Connection", type="primary", use_container_width=True)
-        
+
         if submitted:
             if not all([host, database, username, password]):
                 st.error("Please fill in all required fields.")
                 return
-            
+
             config = ConnectionConfig(
                 host=host,
                 port=port,
@@ -142,50 +120,72 @@ def render_target_connection():
                 username=username,
                 password=password
             )
-            
+
             # Test basic connection
             success, message = test_connection(config)
-            
+
             if not success:
                 st.error(f"❌ {message}")
                 return
-            
+
             # Test databases and tables
             test_result = test_target_databases_and_tables(config, schema_mode)
-            
-            # Save to session state
+
+            # Also fetch table status now so we don't need a separate spinner later
+            table_status = get_target_table_info(config, schema_mode)
+
+            # Save everything to session state in one go
             conn_dict = config.to_dict()
             conn_dict["schema_mode"] = schema_mode
             st.session_state[SessionKeys.TARGET_CONNECTION] = conn_dict
             st.session_state["target_config"] = config
             st.session_state["target_schema_mode"] = schema_mode
             st.session_state["target_test_result"] = test_result
-            
+            st.session_state["target_table_status"] = table_status
+
             # Save to localStorage (without password)
             save_connection("target", conn_dict)
-            
-            # Rerun to show results
+
             st.rerun()
+
+    # Show test results AFTER the form (below it) — avoids layout shift
+    test_result = st.session_state.get("target_test_result")
+    if test_result and st.session_state.get("target_config"):
+        if test_result["server_connected"]:
+            st.info(f"💻 **PostgreSQL Version:** {test_result['version'][:80]}")
+
+        if test_result["message"]:
+            st.text_area(
+                "Database & Table Verification:",
+                test_result["message"],
+                height=200,
+                disabled=True
+            )
+
+        if test_result["success"]:
+            st.success("🎉 All databases and tables verified!")
+        else:
+            st.warning("⚠️ Some databases or tables are missing. See details above.")
 
 
 def render_target_tables_status():
-    """Render target tables status."""
-    if "target_config" not in st.session_state:
+    """Render target tables status using cached data from test connection."""
+    table_info = st.session_state.get("target_table_status")
+    if not table_info:
         return
-    
+
     st.markdown("---")
     st.subheader("📋 Target Tables Status")
-    
-    config = st.session_state["target_config"]
-    schema_mode = st.session_state.get("target_schema_mode", "schemas")
-    
-    with st.spinner("Checking target tables..."):
-        table_info = get_target_table_info(config, schema_mode)
-    
-    if not table_info:
-        st.warning("Could not retrieve target table information.")
-        return
-    
+
+    col_status, col_refresh = st.columns([4, 1])
+    with col_refresh:
+        if st.button("🔄 Refresh", key="_refresh_table_status"):
+            config = st.session_state.get("target_config")
+            schema_mode = st.session_state.get("target_schema_mode", "schemas")
+            if config:
+                st.session_state["target_table_status"] = get_target_table_info(config, schema_mode)
+                st.rerun()
+
     # Display table status
     status_data = []
     for name in LOAD_ORDER:
@@ -197,9 +197,9 @@ def render_target_tables_status():
             "Rows": info.get("row_count", 0) if info.get("exists") else "-",
             "Columns": len(info.get("columns", [])) if info.get("exists") else "-",
         })
-    
+
     st.dataframe(pd.DataFrame(status_data), hide_index=True, use_container_width=True)
-    
+
     # Schema inspector
     with st.expander("🔍 Schema Inspector"):
         for name in LOAD_ORDER:

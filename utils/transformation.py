@@ -128,22 +128,6 @@ class TransformationEngine:
         
         return transformed_df, output_path
     
-    def transform_users_groups(self) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-        """Transform users_groups table."""
-        input_file = self._find_latest_file("users_groups_")
-        if not input_file:
-            return None, None
-        
-        df = pd.read_csv(input_file)
-        mapping = self.mapping_config.get("users_groups", {})
-        
-        transformed_df = self._apply_column_mapping(df, "users_groups", mapping)
-        
-        output_path = os.path.join(self.output_dir, f"users_groups_{self.timestamp}.csv")
-        transformed_df.to_csv(output_path, index=False)
-        
-        return transformed_df, output_path
-    
     def transform_folders(self) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
         """Transform folders table."""
         input_file = self._find_latest_file("folders_")
@@ -223,7 +207,6 @@ class TransformationEngine:
         }
         
         transforms = [
-            ("users_groups", self.transform_users_groups),
             ("users", self.transform_users),
             ("folders", self.transform_folders),
             ("documents", self.transform_documents),

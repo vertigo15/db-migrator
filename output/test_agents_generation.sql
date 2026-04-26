@@ -1,19 +1,21 @@
 -- ============================================================
 -- AGENTS MIGRATION SQL (from playground_bot_generator_config)
 -- ============================================================
--- Generated: 2026-04-10T08:03:36.439305
+-- Generated: 2026-04-26T14:40:46.948019
 -- Source: test_source
--- Destination: agents + agent_settings + agent_documents
+-- Destination: agents + agent_settings + knowledge_bases
 -- Source rows: 1
 -- 
--- IMPORTANT: This script will INSERT data into 3 tables!
+-- IMPORTANT: This script will INSERT data into 5 tables!
 -- IMPORTANT: Run users, folders, and documents migrations first!
 --
 -- Creates:
 --   1. agents (main agent record with deterministic UUID)
 --   2. agent_settings (1:1 settings for each agent)
---   3. agent_documents (links to documents and folders)
---   4. legacy_bot_to_agent_mapping (tracking table)
+--   3. knowledge_bases (one per agent with documents)
+--   4. knowledge_base_assignments (links KB to agent)
+--   5. knowledge_base_items (links KB to documents/folders)
+--   6. legacy_bot_to_agent_mapping (tracking table)
 --
 -- Uses deterministic UUID generation (deterministic_uuid_v4).
 -- Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b
@@ -142,7 +144,8 @@ DECLARE
     v_agent_id uuid := migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-agent');
     v_settings_id uuid := migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-settings');
     v_user_id uuid := migration.deterministic_uuid_v4('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'::uuid, 'test_user_456');
-    v_docs_linked integer := 0;
+    v_kb_id uuid := migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb');
+    v_kb_assignment_id uuid := migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-assignment');
 BEGIN
     -- Insert agent if not exists
     IF NOT EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id) THEN
@@ -161,7 +164,7 @@ BEGIN
             false,
             false,
             false,
-            migration.get_new_id('folders', '1'),
+            migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, '1'),
             '2024-01-01T00:00:00'::timestamptz,
             '2024-01-02T00:00:00'::timestamptz,
             '2024-01-03T00:00:00'::timestamptz,
@@ -198,82 +201,105 @@ BEGIN
         );
     END IF;
 
-    -- Link document: doc1 (skip if document wasn't migrated)
-    IF migration.get_new_id('documents', 'doc1') IS NOT NULL THEN
-        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-        SELECT
-            migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-doc-doc1'),
-            v_agent_id,
-            migration.get_new_id('documents', 'doc1'),
-            true,
-            'document'::agent_documents_type_enum
-        WHERE NOT EXISTS (
-            SELECT 1 FROM agent_documents
-            WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-doc-doc1')
-        );
-        v_docs_linked := v_docs_linked + 1;
-    ELSE
-        RAISE NOTICE 'Agent test_bot_123: skipping document link doc1 — document not migrated';
-    END IF;
+    -- Create knowledge base for this agent
+    INSERT INTO knowledge_bases (
+        id, name, description, similarity_top_k, re_rank_score,
+        combines_multiple_answers, query_instructions,
+        document_count_threshold, total_document_count, is_active, created_at, updated_at
+    )
+    SELECT
+        v_kb_id,
+        LEFT('Test Agent' || ' Knowledge Base', 128),
+        NULL,
+        NULL,
+        NULL,
+        true,
+        NULL,
+        20,
+        4,
+        true,
+        now(),
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_bases WHERE id = v_kb_id
+    );
 
-    -- Link document: doc2 (skip if document wasn't migrated)
-    IF migration.get_new_id('documents', 'doc2') IS NOT NULL THEN
-        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-        SELECT
-            migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-doc-doc2'),
-            v_agent_id,
-            migration.get_new_id('documents', 'doc2'),
-            true,
-            'document'::agent_documents_type_enum
-        WHERE NOT EXISTS (
-            SELECT 1 FROM agent_documents
-            WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-doc-doc2')
-        );
-        v_docs_linked := v_docs_linked + 1;
-    ELSE
-        RAISE NOTICE 'Agent test_bot_123: skipping document link doc2 — document not migrated';
-    END IF;
+    -- Assign knowledge base to agent
+    INSERT INTO knowledge_base_assignments (
+        id, knowledge_base_id, assigned_to_id, assigned_to_type, is_active, created_at
+    )
+    SELECT
+        v_kb_assignment_id,
+        v_kb_id,
+        v_agent_id,
+        'agent'::knowledge_base_assignments_assigned_to_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_assignments
+        WHERE assigned_to_id = v_agent_id AND assigned_to_type = 'agent'
+    );
 
-    -- Link folder: 1 (skip if folder wasn't migrated)
-    IF migration.get_new_id('folders', '1') IS NOT NULL THEN
-        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-        SELECT
-            migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-folder-1'),
-            v_agent_id,
-            migration.get_new_id('folders', '1'),
-            true,
-            'folder'::agent_documents_type_enum
-        WHERE NOT EXISTS (
-            SELECT 1 FROM agent_documents
-            WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-folder-1')
-        );
-        v_docs_linked := v_docs_linked + 1;
-    ELSE
-        RAISE NOTICE 'Agent test_bot_123: skipping folder link 1 — folder not migrated';
-    END IF;
+    -- KB item (document): doc1
+    INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
+    SELECT
+        migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-doc1'),
+        v_kb_id,
+        migration.deterministic_uuid_v4('b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'::uuid, 'doc1'),
+        'document'::knowledge_base_items_item_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-doc1')
+    );
 
-    -- Link folder: 2 (skip if folder wasn't migrated)
-    IF migration.get_new_id('folders', '2') IS NOT NULL THEN
-        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-        SELECT
-            migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-folder-2'),
-            v_agent_id,
-            migration.get_new_id('folders', '2'),
-            true,
-            'folder'::agent_documents_type_enum
-        WHERE NOT EXISTS (
-            SELECT 1 FROM agent_documents
-            WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-folder-2')
-        );
-        v_docs_linked := v_docs_linked + 1;
-    ELSE
-        RAISE NOTICE 'Agent test_bot_123: skipping folder link 2 — folder not migrated';
-    END IF;
+    -- KB item (document): doc2
+    INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
+    SELECT
+        migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-doc2'),
+        v_kb_id,
+        migration.deterministic_uuid_v4('b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'::uuid, 'doc2'),
+        'document'::knowledge_base_items_item_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-doc2')
+    );
+
+    -- KB item (folder): 1
+    INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
+    SELECT
+        migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-folder-1'),
+        v_kb_id,
+        migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, '1'),
+        'folder'::knowledge_base_items_item_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-folder-1')
+    );
+
+    -- KB item (folder): 2
+    INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
+    SELECT
+        migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-folder-2'),
+        v_kb_id,
+        migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, '2'),
+        'folder'::knowledge_base_items_item_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4('0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'::uuid, 'test_bot_123-kb-item-folder-2')
+    );
 
     -- Track in migration.id_mappings
     INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
     VALUES ('agents', 'test_bot_123', v_agent_id, 'agents_migration',
-            'Type: cortex. Docs linked: ' || v_docs_linked)
+            'Type: cortex. KB items: 4')
     ON CONFLICT (table_name, old_id) DO NOTHING;
     
     -- Track in legacy mapping table

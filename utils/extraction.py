@@ -99,42 +99,6 @@ class ExtractionEngine:
                 return c
         return None
     
-    def extract_users_groups(
-        self,
-        group_ids: Optional[List[str]] = None
-    ) -> Tuple[pd.DataFrame, str]:
-        """
-        Extract user groups data.
-        
-        Args:
-            group_ids: Optional list of specific group IDs to extract
-            
-        Returns:
-            Tuple of (DataFrame, output_file_path)
-        """
-        table_name = get_table_name("users_groups", self.prefix)
-        
-        if group_ids:
-            placeholders = ", ".join(["%s"] * len(group_ids))
-            query = f"""
-                SELECT id, group_name, default_model, default_max_tokens_per_user, enabled_features
-                FROM public.{table_name}
-                WHERE id IN ({placeholders})
-            """
-            df = execute_query(self.config, query, tuple(group_ids))
-        else:
-            query = f"""
-                SELECT id, group_name, default_model, default_max_tokens_per_user, enabled_features
-                FROM public.{table_name}
-            """
-            df = execute_query(self.config, query)
-        
-        output_path = os.path.join(self.output_dir, f"users_groups_{self.timestamp}.csv")
-        if self.export_csv:
-            df.to_csv(output_path, index=False)
-        
-        return df, output_path
-    
     def extract_users(
         self,
         user_emails: Optional[List[str]] = None
@@ -441,7 +405,7 @@ class ExtractionEngine:
             query += f" AND user_id IN ({placeholders})"
             params.extend(user_ids)
         df = execute_query(self.config, query, tuple(params))
-        
+
         output_path = os.path.join(self.output_dir, f"agents_{self.timestamp}.csv")
         if self.export_csv:
             df.to_csv(output_path, index=False)
@@ -971,20 +935,7 @@ class ExtractionEngine:
                 results["errors"].append("No users found matching the selected emails.")
                 return results
             
-            # Get group IDs for users
-            group_ids = users_df["__group_id__"].dropna().unique().tolist()
-            
-            # 2. Extract user groups
-            current_step += 1
-            self._report_progress("users_groups", current_step, total_steps)
-            if group_ids:
-                groups_df, groups_path = self.extract_users_groups(group_ids)
-                results["files"]["users_groups"] = groups_path
-                results["summary"]["users_groups"] = len(groups_df)
-            else:
-                results["summary"]["users_groups"] = 0
-            
-            # 3. Extract folders
+            # 2. Extract folders
             current_step += 1
             self._report_progress("folders", current_step, total_steps)
             folders_df, folders_path = self.extract_folders(user_ids)

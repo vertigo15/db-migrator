@@ -72,7 +72,7 @@ class DataValidator:
     
     def validate_row_counts(self) -> ValidationResult:
         """Validate that extracted and transformed row counts match."""
-        tables = ["users", "folders", "documents", "embeddings", "agents", "users_groups"]
+        tables = ["users", "folders", "documents", "embeddings", "agents"]
         mismatches = []
         
         for table in tables:
@@ -229,10 +229,9 @@ class DataValidator:
             self.results.append(result)
             return result
         
-        # Need to exclude users_groups file
-        if "groups" in users_file:
+        if not users_file or not os.path.isfile(users_file):
             files = [f for f in os.listdir(self.extract_dir) 
-                     if f.startswith("users_") and "groups" not in f and f.endswith('.csv')]
+                     if f.startswith("users_") and f.endswith('.csv')]
             if files:
                 files.sort(reverse=True)
                 users_file = os.path.join(self.extract_dir, files[0])
