@@ -89,6 +89,69 @@ COMMENT ON CONSTRAINT fk_agent_settings_agent ON public.agent_settings IS 'FK to
 COMMENT ON CONSTRAINT fk_agent_documents_agent ON public.agent_documents IS 'FK to agents within same database - CASCADE delete';
 
 -- ============================================================
+-- KNOWLEDGE BASE TABLES (V5 agent-document architecture)
+-- ============================================================
+-- These tables replace agent_documents as the primary link between
+-- agents and their documents/folders in V5.
+
+-- Enum types for knowledge base tables
+CREATE TYPE IF NOT EXISTS public.knowledge_base_items_item_type_enum AS ENUM ('document', 'folder');
+CREATE TYPE IF NOT EXISTS public.knowledge_base_assignments_assigned_to_type_enum AS ENUM ('agent', 'conversation', 'project');
+
+-- knowledge_bases: one per agent, holds RAG retrieval settings
+CREATE TABLE IF NOT EXISTS public.knowledge_bases (
+    id UUID PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    description TEXT,
+    similarity_top_k INTEGER,
+    threshold REAL,
+    re_ranker_top_k INTEGER,
+    re_rank_score REAL,
+    combines_multiple_answers BOOLEAN NOT NULL DEFAULT true,
+    query_instructions TEXT,
+    document_count_threshold INTEGER NOT NULL DEFAULT 20,
+    total_document_count INTEGER NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- knowledge_base_assignments: links a KB to an agent (or conversation/project)
+CREATE TABLE IF NOT EXISTS public.knowledge_base_assignments (
+    id UUID PRIMARY KEY,
+    knowledge_base_id UUID NOT NULL REFERENCES public.knowledge_bases(id) ON DELETE CASCADE,
+    assigned_to_id UUID NOT NULL,
+    assigned_to_type public.knowledge_base_assignments_assigned_to_type_enum NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_knowledge_base_assignments_target_kb UNIQUE (assigned_to_id, assigned_to_type, knowledge_base_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_one_kb_per_agent
+    ON public.knowledge_base_assignments (assigned_to_id)
+    WHERE assigned_to_type = 'agent';
+
+-- knowledge_base_items: links a KB to documents/folders
+CREATE TABLE IF NOT EXISTS public.knowledge_base_items (
+    id UUID PRIMARY KEY,
+    knowledge_base_id UUID NOT NULL REFERENCES public.knowledge_bases(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL,
+    item_type public.knowledge_base_items_item_type_enum NOT NULL DEFAULT 'document',
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_knowledge_base_items_kb_doc_type UNIQUE (knowledge_base_id, item_id, item_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_base_items_item_id ON public.knowledge_base_items(item_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_base_items_kb_id ON public.knowledge_base_items(knowledge_base_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_base_assignments_target ON public.knowledge_base_assignments(assigned_to_id, assigned_to_type);
+CREATE INDEX IF NOT EXISTS idx_knowledge_base_assignments_kb_id ON public.knowledge_base_assignments(knowledge_base_id);
+
+COMMENT ON TABLE public.knowledge_bases IS 'Logical collection of documents used for RAG retrieval. Owned by agents, conversations, or projects.';
+COMMENT ON TABLE public.knowledge_base_assignments IS 'Polymorphic assignment table linking knowledge bases to agents, conversations, or projects.';
+COMMENT ON TABLE public.knowledge_base_items IS 'Junction table linking knowledge bases to documents or folders from the document service.';
+
+-- ============================================================
 -- COMPLETION_DB SCHEMA CREATION COMPLETE
 -- ============================================================
 -- Next steps:
@@ -100,4 +163,5 @@ COMMENT ON CONSTRAINT fk_agent_documents_agent ON public.agent_documents IS 'FK 
 -- - User IDs must exist in user_db BEFORE migrating!
 -- - Folder IDs must exist in document_db BEFORE migrating!
 -- - Document IDs must exist in document_db for agent_documents!
+-- - Knowledge base tables must exist for agent-document links!
 -- ============================================================

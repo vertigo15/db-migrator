@@ -613,7 +613,10 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     agents_table = get_table_name("agents", prefix)
     placeholders = ", ".join(["%s"] * len(user_ids))
     query = f"""
-        SELECT bot_id, user_id, folder_id, created_at
+        SELECT bot_id, user_id, folder_id, created_at,
+               COALESCE(array_length(docs_chosen, 1), 0) AS docs,
+               COALESCE(array_length(chosen_docs_folders, 1), 0) AS folders,
+               array_to_string(docs_chosen, ', ') AS doc_ids
         FROM public.{agents_table}
         WHERE user_id IN ({placeholders})
         ORDER BY created_at DESC
@@ -645,7 +648,7 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
             filtered_df["selected"] = filtered_df["bot_id"].isin(previous)
         else:
             filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "bot_id", "user_id", "folder_id", "created_at"]]
+    filtered_df = filtered_df[["selected", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,

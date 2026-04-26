@@ -41,7 +41,7 @@ TABLE_MAPPING = {
     "03_documents_": {"tables": ["documents"], "mapping_table": "documents"},
     "04_chunks_embeddings_": {"tables": ["chunks", "embeddings"], "mapping_table": "documents"},
     "05_conversations_": {"tables": ["conversations", "messages", "message_content_blocks"], "mapping_table": "conversations"},
-    "06_agents_": {"tables": ["agents", "agent_settings", "agent_documents"], "mapping_table": "agents"},
+    "06_agents_": {"tables": ["agents", "agent_settings", "knowledge_bases", "knowledge_base_assignments", "knowledge_base_items"], "mapping_table": "agents"},
 }
 
 
