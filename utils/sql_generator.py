@@ -1176,7 +1176,9 @@ BEGIN
         is_active,
         translate_to_english,
         embedding_model_id,
-        is_ready
+        is_ready,
+        prepend_doc_title,
+        deleted_at
     ) VALUES (
         migration.deterministic_uuid_v4('{DOC_NAMESPACE_UUID}'::uuid, v_old_doc_id || '-processing'),
         v_new_doc_id,
@@ -1187,7 +1189,9 @@ BEGIN
         true,
         {str(translate_to_english).lower()},
         '00000000-0000-0000-0000-000000000001'::uuid,
-        true
+        true,
+        false,
+        NULL
     )
     ON CONFLICT (id) DO NOTHING;
 
@@ -1671,6 +1675,7 @@ BEGIN
             chunk_id,
             document_id,
             embedding,
+            dimension,
             model_name,
             created_at
         ) VALUES (
@@ -1678,6 +1683,7 @@ BEGIN
             v_chunk_id,
             v_document_id,
             '{embeddings_value}'::vector,
+            vector_dims('{embeddings_value}'::vector),
             '{default_embedding_model}',
             {created_at_sql}
         );
@@ -1804,20 +1810,16 @@ END $$;
 --   \\\\quit
 -- \\\\endif
 
--- Ensure embeddings column matches target dimension ({target_embedding_dim or 'original'})
+-- V5 uses untyped vector column + separate dimension column (per-row).
+-- Ensure the dimension column exists (it should from the V5 migration).
 DO $$
-DECLARE
-    v_current_dim INTEGER;
 BEGIN
-    -- Check current vector dimension on the embeddings table
-    SELECT atttypmod INTO v_current_dim
-    FROM pg_attribute
-    WHERE attrelid = 'public.embeddings'::regclass
-      AND attname = 'embedding';
-
-    IF v_current_dim IS NOT NULL AND v_current_dim != {target_embedding_dim or 0} THEN
-        RAISE NOTICE '⚠️  DIMENSION TRIM: embeddings.embedding column resized from % to {target_embedding_dim or 'original'} dimensions. Source vectors will be truncated to fit.', v_current_dim;
-        ALTER TABLE public.embeddings ALTER COLUMN embedding TYPE vector({target_embedding_dim or 1024});
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'embeddings' AND column_name = 'dimension'
+    ) THEN
+        RAISE NOTICE 'Adding missing dimension column to embeddings table';
+        ALTER TABLE public.embeddings ADD COLUMN dimension smallint;
     END IF;
 END $$;
 
@@ -2278,7 +2280,7 @@ def generate_agent_insert(
     user_id_overrides: Optional[Dict[str, str]] = None
 ) -> Optional[str]:
     """
-    Generate INSERT statements for a single agent (agents + agent_settings + agent_documents).
+    Generate INSERT statements for a single agent (agents + agent_settings + knowledge_bases).
     
     Extracts all JSONB fields in Python and generates a self-contained DO block.
     
@@ -2441,9 +2443,10 @@ def generate_agent_insert(
     else:
         last_activity_sql = 'NULL::timestamp'
     
-    # Folder UUID SQL — use mapping lookup so agents land at root if folder wasn't migrated
+    # Folder UUID SQL — compute deterministically (cross-database: folder mappings
+    # live in document_db but agents SQL runs in completion_db)
     if folder_id:
-        folder_id_sql = f"migration.get_new_id('folders', {escape_sql_string(folder_id)})"
+        folder_id_sql = f"migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, {escape_sql_string(folder_id)})"
     else:
         folder_id_sql = 'NULL::uuid'
     
@@ -2458,7 +2461,7 @@ def generate_agent_insert(
             cleaned = docs_chosen_raw.strip('{}')
             if cleaned:
                 docs_chosen = [d.strip().strip('"') for d in cleaned.split(',') if d.strip()]
-    
+
     folders_chosen_raw = row.get('chosen_docs_folders')
     folders_chosen = []
     if folders_chosen_raw is not None and not (isinstance(folders_chosen_raw, float) and pd.isna(folders_chosen_raw)):
@@ -2483,59 +2486,106 @@ def generate_agent_insert(
                         except (ValueError, TypeError):
                             folders_chosen.append(f)
     
-    # Build agent_documents SQL fragments
-    doc_inserts = ''
-    for doc_id in docs_chosen:
-        doc_inserts += f"""
-    -- Link document: {doc_id} (skip if document wasn't migrated)
-    IF migration.get_new_id('documents', {escape_sql_string(doc_id)}) IS NOT NULL THEN
-        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-        SELECT
-            migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}'),
-            v_agent_id,
-            migration.get_new_id('documents', {escape_sql_string(doc_id)}),
-            true,
-            'document'::agent_documents_type_enum
-        WHERE NOT EXISTS (
-            SELECT 1 FROM agent_documents
-            WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-doc-{doc_id}')
-        );
-        v_docs_linked := v_docs_linked + 1;
-    ELSE
-        RAISE NOTICE 'Agent {bot_id}: skipping document link {doc_id} — document not migrated';
-    END IF;
+    # Build knowledge_bases + knowledge_base_assignments + knowledge_base_items SQL.
+    # V5 moved from agent_documents to a knowledge-base architecture:
+    #   knowledge_bases (one per agent, holds RAG settings)
+    #   knowledge_base_assignments (links KB to agent)
+    #   knowledge_base_items (links KB to documents/folders via item_id)
+    kb_inserts = ''
+    has_docs_or_folders = len(docs_chosen) > 0 or len(folders_chosen) > 0
+    if has_docs_or_folders:
+        retrieved_context_size_kb = str(retrieved_context_size) if retrieved_context_size is not None else 'NULL'
+        re_rank_score_kb = str(re_rank_score) if re_rank_score is not None else 'NULL'
+
+        kb_inserts += f"""
+    -- Create knowledge base for this agent
+    INSERT INTO knowledge_bases (
+        id, name, description, similarity_top_k, re_rank_score,
+        combines_multiple_answers, query_instructions,
+        document_count_threshold, total_document_count, is_active, created_at, updated_at
+    )
+    SELECT
+        v_kb_id,
+        LEFT({escape_sql_string(bot_name[:100])} || ' Knowledge Base', 128),
+        NULL,
+        {retrieved_context_size_kb},
+        {re_rank_score_kb},
+        true,
+        NULL,
+        20,
+        {len(docs_chosen) + len(folders_chosen)},
+        true,
+        now(),
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_bases WHERE id = v_kb_id
+    );
+
+    -- Assign knowledge base to agent
+    INSERT INTO knowledge_base_assignments (
+        id, knowledge_base_id, assigned_to_id, assigned_to_type, is_active, created_at
+    )
+    SELECT
+        v_kb_assignment_id,
+        v_kb_id,
+        v_agent_id,
+        'agent'::knowledge_base_assignments_assigned_to_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_assignments
+        WHERE assigned_to_id = v_agent_id AND assigned_to_type = 'agent'
+    );
+"""
+
+        for doc_id in docs_chosen:
+            kb_inserts += f"""
+    -- KB item (document): {doc_id}
+    INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
+    SELECT
+        migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}'),
+        v_kb_id,
+        migration.deterministic_uuid_v4('{DOC_NAMESPACE_UUID}'::uuid, {escape_sql_string(doc_id)}),
+        'document'::knowledge_base_items_item_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}')
+    );
+"""
+
+        for fid in folders_chosen:
+            kb_inserts += f"""
+    -- KB item (folder): {fid}
+    INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
+    SELECT
+        migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}'),
+        v_kb_id,
+        migration.deterministic_uuid_v4('{NAMESPACE_UUID}'::uuid, {escape_sql_string(fid)}),
+        'folder'::knowledge_base_items_item_type_enum,
+        true,
+        now()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}')
+    );
 """
     
-    for fid in folders_chosen:
-        doc_inserts += f"""
-    -- Link folder: {fid} (skip if folder wasn't migrated)
-    IF migration.get_new_id('folders', {escape_sql_string(fid)}) IS NOT NULL THEN
-        INSERT INTO agent_documents (id, agent_id, document_id, is_active, type)
-        SELECT
-            migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}'),
-            v_agent_id,
-            migration.get_new_id('folders', {escape_sql_string(fid)}),
-            true,
-            'folder'::agent_documents_type_enum
-        WHERE NOT EXISTS (
-            SELECT 1 FROM agent_documents
-            WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-folder-{fid}')
-        );
-        v_docs_linked := v_docs_linked + 1;
-    ELSE
-        RAISE NOTICE 'Agent {bot_id}: skipping folder link {fid} — folder not migrated';
-    END IF;
-"""
-    
-    # Build the DO block
+    # Build the DO block — include KB variables only when there are docs/folders
+    kb_declare = ''
+    if has_docs_or_folders:
+        kb_declare = f"""
+    v_kb_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb');
+    v_kb_assignment_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-assignment');"""
+
     sql = f"""
 -- Agent: {bot_name[:60]} (bot_id: {bot_id})
 DO $agent_fn$
 DECLARE
     v_agent_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-agent');
     v_settings_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-settings');
-    v_user_id uuid := {resolve_user_id_sql(str(user_id), user_id_overrides)};
-    v_docs_linked integer := 0;
+    v_user_id uuid := {resolve_user_id_sql(str(user_id), user_id_overrides)};{kb_declare}
 BEGIN
     -- Insert agent if not exists
     IF NOT EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id) THEN
@@ -2590,11 +2640,11 @@ BEGIN
             {str(additional_links).lower()}
         );
     END IF;
-{doc_inserts}
+{kb_inserts}
     -- Track in migration.id_mappings
     INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
     VALUES ('agents', '{bot_id}', v_agent_id, 'agents_migration',
-            'Type: {agent_type}. Docs linked: ' || v_docs_linked)
+            'Type: {agent_type}. KB items: {len(docs_chosen) + len(folders_chosen)}')
     ON CONFLICT (table_name, old_id) DO NOTHING;
     
     -- Track in legacy mapping table
@@ -2618,10 +2668,12 @@ def generate_agents_migration_sql(
     """
     Generate SQL migration file for agents from playground_bot_generator_config.
     
-    Creates entries in 3 target tables:
+    Creates entries in 5 target tables:
       - agents (main agent record)
       - agent_settings (1:1 with agent)
-      - agent_documents (many-to-many with documents/folders)
+      - knowledge_bases (one per agent that has documents)
+      - knowledge_base_assignments (links KB to agent)
+      - knowledge_base_items (links KB to documents/folders)
     
     Uses pre-extracted DataFrame data to generate self-contained INSERT statements.
     
@@ -2644,7 +2696,7 @@ def generate_agents_migration_sql(
             'file': output_file,
             'agents_processed': 0,
             'settings_processed': 0,
-            'documents_linked': 0
+            'kb_items_linked': 0
         }
     
     agents_processed = 0
@@ -2657,17 +2709,19 @@ def generate_agents_migration_sql(
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
 -- Source: {source_info}
--- Destination: agents + agent_settings + agent_documents
+-- Destination: agents + agent_settings + knowledge_bases
 -- Source rows: {len(agents_df)}
 -- 
--- IMPORTANT: This script will INSERT data into 3 tables!
+-- IMPORTANT: This script will INSERT data into 5 tables!
 -- IMPORTANT: Run users, folders, and documents migrations first!
 --
 -- Creates:
 --   1. agents (main agent record with deterministic UUID)
 --   2. agent_settings (1:1 settings for each agent)
---   3. agent_documents (links to documents and folders)
---   4. legacy_bot_to_agent_mapping (tracking table)
+--   3. knowledge_bases (one per agent with documents)
+--   4. knowledge_base_assignments (links KB to agent)
+--   5. knowledge_base_items (links KB to documents/folders)
+--   6. legacy_bot_to_agent_mapping (tracking table)
 --
 -- Uses deterministic UUID generation (deterministic_uuid_v4).
 -- Namespace UUID: {namespace_uuid}
@@ -2723,5 +2777,5 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
         'file': output_file,
         'agents_processed': agents_processed,
         'settings_processed': agents_processed,
-        'documents_linked': 0  # Tracked per-agent at runtime via RAISE NOTICE
+        'kb_items_linked': 0  # Tracked per-agent at runtime via RAISE NOTICE
     }

@@ -85,11 +85,12 @@ def test_agents_sql_generation():
         'CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping',
         'INSERT INTO agents',
         'INSERT INTO agent_settings',
-        'INSERT INTO agent_documents',
+        'INSERT INTO knowledge_bases',
+        'INSERT INTO knowledge_base_assignments',
+        'INSERT INTO knowledge_base_items',
         'INSERT INTO migration.id_mappings',
         'INSERT INTO legacy_bot_to_agent_mapping',
         'migration.deterministic_uuid_v4',
-        'migration.get_new_id',
     ]
 
     for element in expected_elements:

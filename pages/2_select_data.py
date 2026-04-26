@@ -37,6 +37,33 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(BASE_DIR, "output", "extract")
 
 
+def _source_scope_key(config: ConnectionConfig, prefix: str) -> str:
+    """Stable key for caching reads from the source DB (unchanged when only SQL/org UI changes)."""
+    d = config.to_dict()
+    return f"{d['host']}:{d['port']}:{d['database']}:{d['username']}:{prefix}"
+
+
+def _filters_fingerprint(filters: dict) -> str:
+    """Stable fingerprint for document filter dict (may contain datetimes)."""
+    if not filters:
+        return "none"
+
+    def _conv(v):
+        if isinstance(v, datetime):
+            return v.isoformat()
+        if isinstance(v, date):
+            return v.isoformat()
+        return v
+
+    try:
+        return json.dumps(
+            {str(k): _conv(v) for k, v in sorted(filters.items(), key=lambda kv: str(kv[0]))},
+            sort_keys=True,
+        )
+    except TypeError:
+        return repr(filters)
+
+
 # ─── Destination DB lookup helpers ──────────────────────────────────────────
 
 def _make_target_config(database: str):
@@ -61,7 +88,25 @@ def _make_target_config(database: str):
 
 
 def fetch_dest_org_ids() -> list:
-    """Query target user_db for distinct organization_ids."""
+    """Query target admin_db for organizations (id + name).
+    Falls back to user_db.users if admin_db is unavailable.
+    Returns list of dicts: [{"id": "uuid", "name": "Org Name"}, ...]
+    """
+    cfg = _make_target_config("admin_db")
+    if cfg is not None:
+        try:
+            df = execute_query(
+                cfg,
+                "SELECT id::text AS org_id, name AS org_name "
+                "FROM public.organizations "
+                "WHERE is_active = true "
+                "ORDER BY name"
+            )
+            if not df.empty:
+                return [{"id": r["org_id"], "name": r["org_name"]} for _, r in df.iterrows()]
+        except Exception:
+            pass
+
     cfg = _make_target_config("user_db")
     if cfg is None:
         return []
@@ -73,9 +118,18 @@ def fetch_dest_org_ids() -> list:
             "WHERE organization_id IS NOT NULL "
             "ORDER BY org_id"
         )
-        return df["org_id"].tolist() if not df.empty else []
+        return [{"id": r["org_id"], "name": None} for _, r in df.iterrows()] if not df.empty else []
     except Exception:
         return []
+
+
+def _org_name_label(org: dict) -> str:
+    """Label for org name selectbox (name from DB; fallback if missing)."""
+    name = (org.get("name") or "").strip()
+    if name:
+        return name
+    oid = str(org.get("id") or "")
+    return oid if len(oid) <= 48 else f"{oid[:8]}…{oid[-4:]}"
 
 
 def fetch_dest_embedding_models() -> list:
@@ -148,10 +202,15 @@ def load_users_data(config: ConnectionConfig, prefix: str) -> pd.DataFrame:
 def render_user_selection(config: ConnectionConfig, prefix: str):
     """Render the user selection section."""
     st.subheader("👥 Select Users")
-    
-    # Load users
-    with st.spinner("Loading users..."):
-        users_df = load_users_data(config, prefix)
+
+    _usk = _source_scope_key(config, prefix)
+    if st.session_state.get("_p2_users_scope") != _usk:
+        with st.spinner("Loading users..."):
+            users_df = load_users_data(config, prefix)
+        st.session_state["_p2_users_scope"] = _usk
+        st.session_state["_p2_users_df"] = users_df
+    else:
+        users_df = st.session_state["_p2_users_df"]
     
     if users_df.empty:
         st.warning("No users found in the database.")
@@ -236,89 +295,6 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     
     return selected_emails, selected_user_ids
 
-def render_user_groups_under_users(config: ConnectionConfig, prefix: str, user_ids: list):
-    """Show user groups for currently selected users with selection capability."""
-    st.subheader("👥 User Groups")
-    if not user_ids:
-        st.info("Select users to view their groups.")
-        st.session_state["selected_group_ids"] = []
-        return []
-    users_table = get_table_name("users", prefix)
-    groups_table = get_table_name("users_groups", prefix)
-    # Detect the group-id column in users table (schema may vary between environments)
-    cols_query = """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = %s
-    """
-    cols_df = execute_query(config, cols_query, (users_table,))
-    available_cols = set(cols_df["column_name"].tolist()) if not cols_df.empty else set()
-    candidate_cols = ["__group_id__", "group_id", "_group_id_", "groupid"]
-    group_col = next((c for c in candidate_cols if c in available_cols), None)
-    if group_col is None:
-        st.info("No group-id column found in users table for this environment.")
-        st.session_state["selected_group_ids"] = []
-        return []
-    placeholders = ", ".join(["%s"] * len(user_ids))
-    group_ids_query = f"""
-        SELECT DISTINCT "{group_col}" AS group_id
-        FROM public.{users_table}
-        WHERE id IN ({placeholders}) AND "{group_col}" IS NOT NULL
-    """
-    gids_df = execute_query(config, group_ids_query, tuple(user_ids))
-    if gids_df.empty:
-        st.info("No user groups found for selected users.")
-        st.session_state["selected_group_ids"] = []
-        return []
-    group_ids = gids_df["group_id"].astype(str).tolist()
-    gp = ", ".join(["%s"] * len(group_ids))
-    groups_query = f"""
-        SELECT id, group_name, default_model, default_max_tokens_per_user
-        FROM public.{groups_table}
-        WHERE id IN ({gp})
-        ORDER BY group_name
-    """
-    groups_df = execute_query(config, groups_query, tuple(group_ids))
-    if groups_df.empty:
-        st.info("No user groups found.")
-        st.session_state["selected_group_ids"] = []
-        return []
-    
-    st.caption(f"Groups found: {len(groups_df)}")
-    
-    # Select all checkbox for groups
-    select_all_groups = st.checkbox("Select all groups", value=True, key="select_all_groups")
-    
-    # Previous selection
-    previous = st.session_state.get("selected_group_ids")
-    if select_all_groups:
-        groups_df["selected"] = True
-    else:
-        if isinstance(previous, list):
-            groups_df["selected"] = groups_df["id"].astype(str).isin(previous)
-        else:
-            groups_df["selected"] = True
-    
-    # Reorder columns
-    groups_df = groups_df[["selected", "id", "group_name", "default_model", "default_max_tokens_per_user"]]
-    
-    edited_df = st.data_editor(
-        groups_df,
-        hide_index=True,
-        use_container_width=True,
-        height=250,
-        column_config={
-            "selected": st.column_config.CheckboxColumn("Select", default=True),
-        },
-        key="groups_editor",
-    )
-    
-    selected_group_ids = edited_df[edited_df["selected"] == True]["id"].astype(str).tolist()
-    st.session_state["selected_group_ids"] = selected_group_ids
-    st.metric("Selected Groups", len(selected_group_ids))
-    return selected_group_ids
-
-
 def render_document_filters(config: ConnectionConfig, prefix: str, user_ids: list):
     """Render document filter section."""
     if not user_ids:
@@ -359,13 +335,22 @@ def render_document_filters(config: ConnectionConfig, prefix: str, user_ids: lis
     date_from_dt = datetime.combine(date_from, datetime.min.time()) if date_from else None
     date_to_dt = datetime.combine(date_to, datetime.max.time()) if date_to else None
     max_size_val = max_size if max_size > 0 else None
-    
-    # Get preview count
-    with st.spinner("Counting matching documents..."):
-        doc_count = get_document_count_preview(
-            config, prefix, user_ids,
-            date_from_dt, date_to_dt, max_size_val
-        )
+
+    _filters_snap = {"date_from": date_from_dt, "date_to": date_to_dt, "max_size": max_size_val}
+    # Get preview count (cached — avoids re-query on unrelated widget changes e.g. org select)
+    _fp = _source_scope_key(config, prefix)
+    _uids = tuple(sorted(str(u) for u in user_ids))
+    _dcc_key = f"{_fp}|{_uids}|{_filters_fingerprint(_filters_snap)}"
+    if st.session_state.get("_p2_doccount_key") == _dcc_key:
+        doc_count = st.session_state["_p2_doccount_val"]
+    else:
+        with st.spinner("Counting matching documents..."):
+            doc_count = get_document_count_preview(
+                config, prefix, user_ids,
+                date_from_dt, date_to_dt, max_size_val
+            )
+        st.session_state["_p2_doccount_key"] = _dcc_key
+        st.session_state["_p2_doccount_val"] = doc_count
     
     st.metric("📝 Matching Documents", f"{doc_count:,}")
     
@@ -387,6 +372,8 @@ def render_document_filters(config: ConnectionConfig, prefix: str, user_ids: lis
     }
     
     return date_from_dt, date_to_dt, max_size_val
+
+
 def _load_documents_df(config: ConnectionConfig, prefix: str, user_ids: list, filters: dict) -> pd.DataFrame:
     """Load documents for selected users + current filters."""
     if not user_ids:
@@ -425,8 +412,14 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
     # Keep all filters above the table
     render_document_filters(config, prefix, user_ids)
     filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
-    with st.spinner("Loading documents..."):
-        docs_df = _load_documents_df(config, prefix, user_ids, filters)
+    _dk = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}|{_filters_fingerprint(filters)}"
+    if st.session_state.get("_p2_docs_df_key") == _dk:
+        docs_df = st.session_state["_p2_docs_df"]
+    else:
+        with st.spinner("Loading documents..."):
+            docs_df = _load_documents_df(config, prefix, user_ids, filters)
+        st.session_state["_p2_docs_df_key"] = _dk
+        st.session_state["_p2_docs_df"] = docs_df.copy()
     if docs_df.empty:
         st.info("No matching documents found.")
         st.session_state["selected_doc_ids"] = []
@@ -499,8 +492,14 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
         WHERE metadata->>'doc_id' IN ({placeholders})
         LIMIT 5000
     """
-    with st.spinner("Loading embeddings..."):
-        emb_df = execute_query(config, query, tuple(doc_ids))
+    _ek = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(d) for d in doc_ids))}"
+    if st.session_state.get("_p2_emb_df_key") == _ek:
+        emb_df = st.session_state["_p2_emb_df"]
+    else:
+        with st.spinner("Loading embeddings..."):
+            emb_df = execute_query(config, query, tuple(doc_ids))
+        st.session_state["_p2_emb_df_key"] = _ek
+        st.session_state["_p2_emb_df"] = emb_df.copy()
     if emb_df.empty:
         st.info("No embeddings found for selected documents.")
         st.session_state["selected_embedding_ids"] = []
@@ -549,8 +548,14 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
         ORDER BY created_at DESC
         LIMIT 5000
     """
-    with st.spinner("Loading conversations..."):
-        convs_df = execute_query(config, query, tuple(user_ids))
+    _ck = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}"
+    if st.session_state.get("_p2_conv_df_key") == _ck:
+        convs_df = st.session_state["_p2_conv_df"]
+    else:
+        with st.spinner("Loading conversations..."):
+            convs_df = execute_query(config, query, tuple(user_ids))
+        st.session_state["_p2_conv_df_key"] = _ck
+        st.session_state["_p2_conv_df"] = convs_df.copy()
     if not convs_df.empty and "created_at" in convs_df.columns:
         convs_df["created_at"] = pd.to_datetime(convs_df["created_at"], unit="s", errors="coerce")
     if convs_df.empty:
@@ -613,14 +618,23 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     agents_table = get_table_name("agents", prefix)
     placeholders = ", ".join(["%s"] * len(user_ids))
     query = f"""
-        SELECT bot_id, user_id, folder_id, created_at
+        SELECT bot_id, user_id, folder_id, created_at,
+               COALESCE(array_length(docs_chosen, 1), 0) AS docs,
+               COALESCE(array_length(chosen_docs_folders, 1), 0) AS folders,
+               array_to_string(docs_chosen, ', ') AS doc_ids
         FROM public.{agents_table}
         WHERE user_id IN ({placeholders})
         ORDER BY created_at DESC
         LIMIT 5000
     """
-    with st.spinner("Loading agents..."):
-        agents_df = execute_query(config, query, tuple(user_ids))
+    _ak = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}"
+    if st.session_state.get("_p2_agents_df_key") == _ak:
+        agents_df = st.session_state["_p2_agents_df"]
+    else:
+        with st.spinner("Loading agents..."):
+            agents_df = execute_query(config, query, tuple(user_ids))
+        st.session_state["_p2_agents_df_key"] = _ak
+        st.session_state["_p2_agents_df"] = agents_df.copy()
     if not agents_df.empty and "created_at" in agents_df.columns:
         agents_df["created_at"] = pd.to_datetime(agents_df["created_at"], unit="s", errors="coerce")
     if agents_df.empty:
@@ -645,7 +659,7 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
             filtered_df["selected"] = filtered_df["bot_id"].isin(previous)
         else:
             filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "bot_id", "user_id", "folder_id", "created_at"]]
+    filtered_df = filtered_df[["selected", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,
@@ -669,33 +683,42 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
         st.info("Select users to see related data counts.")
         return
     
-    # Get document IDs for embedding count (if we have the preview)
-    # For now, we'll show estimated counts
-    
-    with st.spinner("Calculating related data..."):
-        # First get document IDs for the current filters
-        filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
-        doc_table = get_table_name("custom_documents", prefix)
-        placeholders = ", ".join(["%s"] * len(user_ids))
-        
-        query = f"SELECT doc_id FROM public.{doc_table} WHERE owner_id IN ({placeholders})"
-        params = list(user_ids)
-        
-        if filters.get("date_from"):
-            query += " AND created_at >= %s"
-            params.append(filters["date_from"])
-        if filters.get("date_to"):
-            query += " AND created_at <= %s"
-            params.append(filters["date_to"])
-        if filters.get("max_size"):
-            query += " AND doc_size <= %s"
-            params.append(filters["max_size"])
-        
-        doc_ids_df = execute_query(config, query, tuple(params))
-        doc_ids = doc_ids_df["doc_id"].tolist() if not doc_ids_df.empty else []
-        
-        # Get counts
-        counts = get_related_counts(config, prefix, user_ids, doc_ids)
+    filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
+    _rk = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}|{_filters_fingerprint(filters)}"
+    if st.session_state.get("_p2_related_key") == _rk:
+        doc_ids = st.session_state["_p2_related_doc_ids"]
+        counts = st.session_state["_p2_related_counts"]
+        est_size = st.session_state.get("_p2_related_est_size", 0.0)
+    else:
+        with st.spinner("Calculating related data..."):
+            doc_table = get_table_name("custom_documents", prefix)
+            placeholders = ", ".join(["%s"] * len(user_ids))
+
+            query = f"SELECT doc_id FROM public.{doc_table} WHERE owner_id IN ({placeholders})"
+            params = list(user_ids)
+
+            if filters.get("date_from"):
+                query += " AND created_at >= %s"
+                params.append(filters["date_from"])
+            if filters.get("date_to"):
+                query += " AND created_at <= %s"
+                params.append(filters["date_to"])
+            if filters.get("max_size"):
+                query += " AND doc_size <= %s"
+                params.append(filters["max_size"])
+
+            doc_ids_df = execute_query(config, query, tuple(params))
+            doc_ids = doc_ids_df["doc_id"].tolist() if not doc_ids_df.empty else []
+
+            counts = get_related_counts(config, prefix, user_ids, doc_ids)
+            est_size = (
+                estimate_embeddings_size(config, prefix, doc_ids) if doc_ids else 0.0
+            )
+
+        st.session_state["_p2_related_key"] = _rk
+        st.session_state["_p2_related_doc_ids"] = doc_ids
+        st.session_state["_p2_related_counts"] = counts
+        st.session_state["_p2_related_est_size"] = est_size
     
     # Display as metric cards
     col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -714,10 +737,11 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
         st.metric("💬 Conversations", f"{counts.get('logs', 0):,}")
     
     # Embedding size warning
-    if doc_ids:
-        est_size = estimate_embeddings_size(config, prefix, doc_ids)
-        if est_size > 500:
-            st.warning(f"⚠️ Estimated embeddings size: {est_size:.1f} MB. Consider batched extraction for large datasets.")
+    if doc_ids and est_size > 500:
+        st.warning(
+            f"⚠️ Estimated embeddings size: {est_size:.1f} MB. "
+            "Consider batched extraction for large datasets."
+        )
     
     # Summary bar
     total_items = len(user_ids) + doc_count + counts.get("folders", 0) + counts.get("embeddings", 0) + counts.get("agents", 0) + counts.get("logs", 0)
@@ -884,7 +908,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                             st.session_state["target_config"] = _probe
                             _has_target = True
                             # Fetch both values immediately
-                            with st.spinner("Loading Org IDs from user_db…"):
+                            with st.spinner("Loading Organizations…"):
                                 _org_ids = fetch_dest_org_ids()
                             with st.spinner("Loading Embedding Models from document_db…"):
                                 _emb_models = fetch_dest_embedding_models()
@@ -900,31 +924,44 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
 
         col3, col4, col5, col6 = st.columns([2, 2, 1, 1])
 
-        # ── Org ID ──────────────────────────────────────────────────────────
+        # ── Organization (name + UUID for SQL) ─────────────────────────────
         with col3:
-            _dest_org_ids = st.session_state.get("_dest_org_ids", [])
+            _dest_orgs = st.session_state.get("_dest_org_ids", [])
 
-            if _dest_org_ids:
-                # Destination values loaded — show selectbox
-                org_id = st.selectbox(
-                    "Org ID",
-                    options=_dest_org_ids,
-                    index=(
-                        _dest_org_ids.index(get_env_org_id())
-                        if get_env_org_id() in _dest_org_ids
-                        else 0
-                    ),
-                    help="Organization IDs found in destination `user_db.users`. "
-                         "Clear with the button below to enter manually."
+            if _dest_orgs:
+                _env_org = get_env_org_id()
+                _default_idx = 0
+                for _i, _o in enumerate(_dest_orgs):
+                    if str(_o.get("id")) == str(_env_org):
+                        _default_idx = _i
+                        break
+                _org_row = st.selectbox(
+                    "Org Name",
+                    options=list(range(len(_dest_orgs))),
+                    index=_default_idx,
+                    format_func=lambda i: _org_name_label(_dest_orgs[i]),
+                    key="_extract_sql_org_row",
+                    help="From destination `admin_db.organizations` (or user_db fallback). "
+                         "Only the name is shown here; UUID is used in generated SQL.",
                 )
+                org_id = str(_dest_orgs[int(_org_row)]["id"])
+                # Key includes org_id so this field refreshes when selection changes
+                # (a fixed-key disabled text_input can show a stale UUID in Streamlit).
+                st.text_input(
+                    "Org UUID",
+                    value=org_id,
+                    disabled=True,
+                    key=f"_extract_org_uuid_{org_id}",
+                    help="Organization id written into migration SQL.",
+                )
+
                 if st.button("✕ Clear / enter manually", key="_clear_org_ids",
                              use_container_width=True):
                     del st.session_state["_dest_org_ids"]
                     st.rerun()
             else:
-                # Manual entry (default)
                 org_id = st.text_input(
-                    "Org ID",
+                    "Org UUID",
                     value=get_env_org_id(),
                     help="Organization UUID for SQL generation "
                          "(set DEFAULT_ORG_ID in .env to change default)"
@@ -932,13 +969,13 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 if _has_target:
                     if st.button("📡 Load from destination", key="_load_org_ids",
                                  use_container_width=True):
-                        with st.spinner("Querying user_db.users…"):
+                        with st.spinner("Querying admin_db.organizations…"):
                             _fetched = fetch_dest_org_ids()
                         if _fetched:
                             st.session_state["_dest_org_ids"] = _fetched
                             st.rerun()
                         else:
-                            st.warning("No organization_ids found in destination user_db.")
+                            st.warning("No organizations found in destination.")
 
         # ── Embedding Model ─────────────────────────────────────────────────
         with col4:
@@ -1030,13 +1067,16 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             if user_id_overrides:
                 st.info(f"🔀 {len(user_id_overrides)} user ID override(s) configured.")
     else:
-        org_id = "356b50f7-bcbd-42aa-9392-e1605f42f7a1"
+        org_id = get_env_org_id()
         embedding_model = get_env_embedding_model()
         skip_empty_embeddings = False
         target_embedding_dim = None
         user_id_overrides = {}
     
     if st.button("🚀 Start Extraction", type="primary", use_container_width=True):
+        if generate_sql and not org_id:
+            st.error("Please select an organization before starting extraction.")
+            st.stop()
         # Create progress containers
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -1243,9 +1283,6 @@ def main():
     
     selected_emails, selected_user_ids = result
     
-    # User groups should appear under select users
-    render_user_groups_under_users(config, prefix, selected_user_ids)
-    
     # Documents filters + selection (default all selected)
     selected_doc_ids = render_document_selection(config, prefix, selected_user_ids)
     
@@ -1258,13 +1295,21 @@ def main():
     # Conversations selection (default all selected)
     selected_conversation_ids = render_conversations_selection(config, prefix, selected_user_ids)
     
-    # Get current doc count for summary
+    # Doc count for summary (reuse cache from document filters when possible)
     filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
     if selected_user_ids:
-        doc_count = get_document_count_preview(
-            config, prefix, selected_user_ids,
-            filters.get("date_from"), filters.get("date_to"), filters.get("max_size")
+        _dc_main_k = (
+            f"{_source_scope_key(config, prefix)}|"
+            f"{tuple(sorted(str(u) for u in selected_user_ids))}|"
+            f"{_filters_fingerprint(filters)}"
         )
+        if st.session_state.get("_p2_doccount_key") == _dc_main_k:
+            doc_count = st.session_state["_p2_doccount_val"]
+        else:
+            doc_count = get_document_count_preview(
+                config, prefix, selected_user_ids,
+                filters.get("date_from"), filters.get("date_to"), filters.get("max_size"),
+            )
     else:
         doc_count = 0
     if isinstance(selected_doc_ids, list):

@@ -40,14 +40,14 @@ env/
 .streamlit/
 
 # Project specific - don't commit extracted data or backups
-output/extract/*.csv
-output/transform/*.csv
+# All generated files under output/ (migration SQL, CSV, test SQL dumps, etc.)
+output/**
+!output/**/
+!output/**/.gitkeep
 backups/*.sql
 backups/*.sql.gz
 
 # Keep directory structure
-!output/extract/.gitkeep
-!output/transform/.gitkeep
 !backups/.gitkeep
 !configs/.gitkeep
 

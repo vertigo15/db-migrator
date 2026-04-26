@@ -11,7 +11,6 @@ from utils.db import ConnectionConfig, get_connection, truncate_table, execute_i
 
 # Load order (respecting foreign key dependencies)
 LOAD_ORDER = [
-    "users_groups",
     "users",
     "folders",
     "documents",
@@ -21,11 +20,6 @@ LOAD_ORDER = [
 
 # Default target table configuration
 TARGET_TABLES = {
-    "users_groups": {
-        "target_table": "users_groups",
-        "target_schema": "user_db",
-        "conflict_columns": ["id"],
-    },
     "users": {
         "target_table": "users",
         "target_schema": "user_db",
