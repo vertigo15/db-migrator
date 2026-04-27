@@ -2494,6 +2494,7 @@ def generate_agent_insert(
     kb_inserts = ''
     has_docs_or_folders = len(docs_chosen) > 0 or len(folders_chosen) > 0
     if has_docs_or_folders:
+        re_rank_score = 0.15
         retrieved_context_size_kb = str(retrieved_context_size) if retrieved_context_size is not None else 'NULL'
         re_rank_score_kb = str(re_rank_score) if re_rank_score is not None else 'NULL'
 

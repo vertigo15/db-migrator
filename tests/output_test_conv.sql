@@ -1,7 +1,7 @@
 -- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
 -- ============================================================
--- Generated: 2026-04-26T14:40:46.960034
+-- Generated: 2026-04-27T12:17:52.649087
 -- Source: test-source
 -- Destination: conversations + messages + message_content_blocks
 -- Source rows: 3
@@ -37,7 +37,7 @@ BEGIN
     RAISE NOTICE 'This script will migrate conversations and messages';
     RAISE NOTICE 'Source rows: 3';
     RAISE NOTICE 'Namespace UUID: 0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b';
-    RAISE NOTICE 'Generated: 2026-04-26T14:40:46.960274';
+    RAISE NOTICE 'Generated: 2026-04-27T12:17:52.649295';
     RAISE NOTICE '============================================================';
     RAISE NOTICE 'PREREQUISITE: Users must be migrated first!';
     RAISE NOTICE '============================================================';
