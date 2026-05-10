@@ -832,7 +832,7 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
         st.info("Select agents above to enable prompt merging.")
         return
 
-    col1, col2 = st.columns([2, 3])
+    col1, col2 = st.columns([2, 3], vertical_alignment="bottom")
     with col1:
         company_name_options = _load_company_name_options()
         company_name = st.selectbox(
@@ -847,7 +847,7 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
     with col2:
         st.info(f"**{len(agent_ids)}** agents selected for prompt merging.")
 
-    if st.button("🚀 Merge Agent Prompts", type="primary", use_container_width=True, key="merge_prompts_btn"):
+    if st.button("🚀 Merge Agent Prompts", type="primary", use_container_width=False, key="merge_prompts_btn"):
         progress_bar = st.progress(0)
         status_text = st.empty()
 
@@ -1190,7 +1190,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                             )
                             st.rerun()
 
-        col3, col4, col5, col6 = st.columns([2, 2, 1, 1])
+        col3, col4, col5 = st.columns([2, 2, 1], vertical_alignment="bottom")
 
         # ── Organization (name + UUID for SQL) ─────────────────────────────
         with col3:
@@ -1291,12 +1291,6 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                     else:
                         st.warning("No model_names found in destination document_db.")
         with col5:
-            skip_empty_embeddings = st.checkbox(
-                "Skip empty",
-                value=False,
-                help="Skip rows without embeddings"
-            )
-        with col6:
             target_embedding_dim = st.number_input(
                 "Target dim",
                 min_value=0,
@@ -1307,6 +1301,11 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             )
             if target_embedding_dim == 0:
                 target_embedding_dim = None
+            skip_empty_embeddings = st.checkbox(
+                "Skip empty",
+                value=False,
+                help="Skip rows without embeddings"
+            )
         
         # User ID overrides for users who already exist in V5 with a different UUID
         with st.expander("👤 User ID Overrides *(optional)*"):
