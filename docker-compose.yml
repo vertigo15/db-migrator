@@ -21,6 +21,23 @@ services:
       - STREAMLIT_SERVER_HEADLESS=true
       - STREAMLIT_SERVER_ENABLE_CORS=false
       - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true
+      - PROMPT_MERGER_URL=http://prompt-merger:8100
+    depends_on:
+      prompt-merger:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - db-migrator-network
+
+  prompt-merger:
+    build:
+      context: ./prompt-merger
+      dockerfile: Dockerfile
+    container_name: prompt-merger
+    ports:
+      - "8100:8100"
+    env_file:
+      - .env
     restart: unless-stopped
     networks:
       - db-migrator-network

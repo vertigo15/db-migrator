@@ -2277,7 +2277,8 @@ def _safe_get(d: Optional[dict], key: str, default=None):
 def generate_agent_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    merged_instructions: Optional[Dict[str, str]] = None
 ) -> Optional[str]:
     """
     Generate INSERT statements for a single agent (agents + agent_settings + knowledge_bases).
@@ -2287,6 +2288,9 @@ def generate_agent_insert(
     Args:
         row: Pandas Series with playground_bot_generator_config data
         namespace_uuid: Fixed namespace UUID for deterministic IDs
+        merged_instructions: Optional dict {bot_id: merged_instruction_text} from the
+                             prompt merger service; when present, overrides the legacy
+                             character_prompts.content value for the agent's instructions.
         
     Returns:
         SQL statements or None to skip
@@ -2352,8 +2356,12 @@ def generate_agent_insert(
             model = m[:128]
             break
     
-    # Instructions
-    instructions = clean_string(_safe_get(character_prompts, 'content'))
+    # Instructions — prefer merged prompt from LLM if available
+    _merged = merged_instructions.get(bot_id) if merged_instructions else None
+    if _merged:
+        instructions = _merged
+    else:
+        instructions = clean_string(_safe_get(character_prompts, 'content'))
     
     # Enabled tools
     enabled_tools = []
@@ -2664,7 +2672,8 @@ def generate_agents_migration_sql(
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    merged_instructions: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for agents from playground_bot_generator_config.
@@ -2757,7 +2766,7 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
         
         # Generate per-agent INSERT blocks
         for _, row in agents_df.iterrows():
-            sql = generate_agent_insert(row, namespace_uuid, user_id_overrides)
+            sql = generate_agent_insert(row, namespace_uuid, user_id_overrides, merged_instructions)
             if sql:
                 sql_file.write(sql)
                 sql_file.write('\n')

@@ -10,6 +10,7 @@ Features:
 """
 import os
 import json
+import importlib.util
 from datetime import datetime, date
 import streamlit as st
 import pandas as pd
@@ -27,6 +28,7 @@ from utils.extraction import (
     get_related_counts,
     estimate_embeddings_size
 )
+import requests
 
 # Page config
 st.set_page_config(page_title="Select Data", page_icon="📋", layout="wide")
@@ -674,6 +676,272 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     return selected_agent_ids
 
 
+PROMPT_MERGER_URL = os.getenv("PROMPT_MERGER_URL", "http://localhost:8100")
+PROMPTS_MODULE_PATH = os.path.join(BASE_DIR, "prompt-merger", "prompts.py")
+
+
+def _load_prompt_constants():
+    """Load prompt merger constants from prompt-merger/prompts.py."""
+    spec = importlib.util.spec_from_file_location("prompt_merger_prompts", PROMPTS_MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_template_prompt() -> str:
+    """Load the template prompt shown to users and sent to the prompt merger."""
+    try:
+        return _load_prompt_constants().TEMPLATE_PROMPT
+    except Exception:
+        return ""
+
+
+def _load_company_name_options() -> list:
+    """Load company name options used by the prompt merger UI."""
+    try:
+        return list(_load_prompt_constants().COMPANY_NAME_OPTIONS)
+    except Exception:
+        return ["IAI", "Isracard", "Maccabi"]
+
+
+def _text_or_empty(value) -> str:
+    return value if isinstance(value, str) and value.strip() else ""
+
+
+def render_merged_prompt_review():
+    """Show what was extracted, the template, and the final merged prompt per agent."""
+    review_items = st.session_state.get("merged_prompt_review") or []
+    if not review_items:
+        return
+
+    st.markdown("#### 👁️ Review Prompt Merge Results")
+    st.caption(
+        "Review the extracted V4 prompt parts, the template sent to the LLM, "
+        "and the final prompt that will be injected into SQL generation."
+    )
+
+    summary_df = pd.DataFrame([
+        {
+            "bot_id": item.get("bot_id"),
+            "status": item.get("status"),
+            "has_tone": bool(item.get("tone")),
+            "has_guardrail": bool(item.get("guardrail")),
+            "has_response": bool(item.get("response")),
+            "merged_chars": len(item.get("merged_instruction") or ""),
+        }
+        for item in review_items
+    ])
+    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+
+    bot_ids = [item["bot_id"] for item in review_items]
+    selected_bot_id = st.selectbox(
+        "Agent to review",
+        options=bot_ids,
+        key="merged_prompt_review_agent",
+    )
+    selected = next(item for item in review_items if item["bot_id"] == selected_bot_id)
+
+    status = selected.get("status", "unknown")
+    if status == "ok":
+        st.success("This merged prompt came from the LLM and is ready for SQL generation.")
+    elif status == "template_only":
+        st.info("This agent had no prompt parts, so the company-injected template will be used.")
+    elif status == "fallback":
+        st.warning(
+            "The LLM call failed for this agent. The fallback concatenation will be injected "
+            "unless you rerun the merge successfully."
+        )
+        if selected.get("error_message"):
+            st.caption(selected["error_message"])
+
+    extracted_tab, template_tab, merged_tab = st.tabs([
+        "Extracted V4 Parts",
+        "Template",
+        "New V5 Prompt",
+    ])
+    with extracted_tab:
+        st.text_area("Tone", value=selected.get("tone") or "(not provided)", height=180, disabled=True)
+        st.text_area("Guardrail", value=selected.get("guardrail") or "(not provided)", height=180, disabled=True)
+        st.text_area("Response", value=selected.get("response") or "(not provided)", height=180, disabled=True)
+    with template_tab:
+        st.text_area(
+            "Template sent to prompt merger",
+            value=selected.get("template") or "(template not available)",
+            height=420,
+            disabled=True,
+        )
+    with merged_tab:
+        st.text_area(
+            "New prompt injected during SQL generation",
+            value=selected.get("merged_instruction") or "(no merged prompt returned)",
+            height=520,
+            disabled=True,
+        )
+
+
+def _extract_prompt_parts(config: ConnectionConfig, prefix: str, bot_ids: list) -> dict:
+    """Fetch the 3 prompt parts (tone/guardrail/response) for each agent from source DB.
+
+    Returns {bot_id: {"tone": ..., "guardrail": ..., "response": ...}}
+    """
+    if not bot_ids:
+        return {}
+
+    agents_table = get_table_name("agents", prefix)
+    placeholders = ", ".join(["%s"] * len(bot_ids))
+    query = f"""
+        SELECT bot_id, character_prompts, hack_prompt, relevant_answer_prompt
+        FROM public.{agents_table}
+        WHERE bot_id IN ({placeholders})
+    """
+    df = execute_query(config, query, tuple(bot_ids))
+    result = {}
+    for _, row in df.iterrows():
+        bid = str(row.get("bot_id", ""))
+
+        def _get_content(col_val):
+            if col_val is None:
+                return None
+            if isinstance(col_val, str):
+                try:
+                    col_val = json.loads(col_val)
+                except Exception:
+                    return col_val.strip() or None
+            if isinstance(col_val, dict):
+                return (col_val.get("content") or "").strip() or None
+            return None
+
+        result[bid] = {
+            "tone": _get_content(row.get("character_prompts")),
+            "guardrail": _get_content(row.get("hack_prompt")),
+            "response": _get_content(row.get("relevant_answer_prompt")),
+        }
+    return result
+
+
+def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_ids: list):
+    """Render the prompt merger UI: company selector + merge button + progress."""
+    st.markdown("---")
+    st.subheader("🔀 Merge Agent Prompts (V4 → V5)")
+    st.caption(
+        "Combine each agent's Tone, Guardrail, and Response prompts into a single "
+        "structured V5 instruction using the on-prem LLM."
+    )
+
+    if not agent_ids:
+        st.info("Select agents above to enable prompt merging.")
+        return
+
+    col1, col2 = st.columns([2, 3])
+    with col1:
+        company_name_options = _load_company_name_options()
+        company_name = st.selectbox(
+            "Company Name",
+            options=company_name_options,
+            index=0,
+            help="Injected into the template where [Company/Brand Name] appears.",
+            key="company_name_select",
+        )
+        st.session_state["company_name"] = company_name
+
+    with col2:
+        st.info(f"**{len(agent_ids)}** agents selected for prompt merging.")
+
+    if st.button("🚀 Merge Agent Prompts", type="primary", use_container_width=True, key="merge_prompts_btn"):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        status_text.text("Extracting prompt parts from source DB...")
+        prompt_parts = _extract_prompt_parts(config, prefix, agent_ids)
+        template_text = _load_template_prompt()
+
+        merge_requests = []
+        for bot_id in agent_ids:
+            parts = prompt_parts.get(bot_id, {})
+            merge_requests.append({
+                "bot_id": bot_id,
+                "tone": parts.get("tone"),
+                "guardrail": parts.get("guardrail"),
+                "response": parts.get("response"),
+            })
+
+        status_text.text(f"Sending {len(merge_requests)} agents to prompt merger service...")
+        progress_bar.progress(0.1)
+
+        request_url = f"{PROMPT_MERGER_URL}/merge-prompts/batch"
+
+        try:
+            resp = requests.post(
+                request_url,
+                json={
+                    "agents": merge_requests,
+                    "company_name": company_name,
+                    "template": template_text,
+                },
+                timeout=600,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.ConnectionError as exc:
+            st.error(
+                f"Could not connect to prompt merger service at `{PROMPT_MERGER_URL}`. "
+                "Make sure it is running: `cd db-migrator/prompt-merger && uvicorn main:app --port 8100`"
+            )
+            return
+        except Exception as exc:
+            st.error(f"Prompt merger request failed: {exc}")
+            return
+
+        progress_bar.progress(1.0)
+        status_text.text("Prompt merging complete!")
+
+        merged = {}
+        results_by_bot = {}
+        for r in data.get("results", []):
+            merged[r["bot_id"]] = r["merged_instruction"]
+            results_by_bot[r["bot_id"]] = r
+        st.session_state["merged_instructions"] = merged
+        st.session_state["merged_prompt_review"] = [
+            {
+                "bot_id": bot_id,
+                "tone": _text_or_empty(prompt_parts.get(bot_id, {}).get("tone")),
+                "guardrail": _text_or_empty(prompt_parts.get(bot_id, {}).get("guardrail")),
+                "response": _text_or_empty(prompt_parts.get(bot_id, {}).get("response")),
+                "template": template_text,
+                "merged_instruction": results_by_bot.get(bot_id, {}).get("merged_instruction", ""),
+                "status": results_by_bot.get(bot_id, {}).get("status", "missing"),
+                "error_message": results_by_bot.get(bot_id, {}).get("error_message"),
+            }
+            for bot_id in agent_ids
+        ]
+
+        ok_count = data.get("succeeded", 0)
+        fail_count = data.get("failed", 0)
+        total = data.get("total", 0)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total", total)
+        c2.metric("Succeeded", ok_count)
+        c3.metric("Fallback / Failed", fail_count)
+
+        statuses = {}
+        for r in data.get("results", []):
+            s = r.get("status", "unknown")
+            statuses[s] = statuses.get(s, 0) + 1
+        if statuses:
+            st.caption("Status breakdown: " + ", ".join(f"{k}: {v}" for k, v in statuses.items()))
+
+        st.success(
+            f"Merged instructions stored for **{len(merged)}** agent(s). "
+            "They will be used during extraction."
+        )
+
+    if st.session_state.get("merged_instructions"):
+        n = len(st.session_state["merged_instructions"])
+        st.success(f"✅ {n} merged instruction(s) ready in session. They will be injected during SQL generation.")
+        render_merged_prompt_review()
+
+
 def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list, doc_count: int):
     """Render related data counts."""
     st.markdown("---")
@@ -1110,6 +1378,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 selected_doc_ids=st.session_state.get("selected_doc_ids"),
                 selected_embedding_ids=st.session_state.get("selected_embedding_ids"),
                 selected_agent_ids=st.session_state.get("selected_agent_ids"),
+                merged_instructions=st.session_state.get("merged_instructions"),
             )
         
         progress_bar.progress(1.0)
@@ -1291,7 +1560,10 @@ def main():
     
     # Agents selection (default all selected)
     selected_agent_ids = render_agents_selection(config, prefix, selected_user_ids)
-    
+
+    # Prompt merger (optional step — merge V4 prompt parts into V5 template)
+    render_prompt_merger_section(config, prefix, selected_agent_ids or [])
+
     # Conversations selection (default all selected)
     selected_conversation_ids = render_conversations_selection(config, prefix, selected_user_ids)
     

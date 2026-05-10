@@ -365,12 +365,15 @@ class ExtractionEngine:
         docs_df: Optional[pd.DataFrame] = None,
         folders_df: Optional[pd.DataFrame] = None,
         embeddings_df: Optional[pd.DataFrame] = None,
+        merged_instructions: Optional[Dict[str, str]] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract agents belonging to specified users.
         
         Args:
             user_ids: List of user IDs whose agents to extract
+            merged_instructions: Optional dict {bot_id: merged_instruction_text} from the
+                                 prompt merger service (passed through to SQL generation)
             
         Returns:
             Tuple of (DataFrame, output_file_path)
@@ -478,7 +481,8 @@ class ExtractionEngine:
                     agents_df=df,
                     output_file=sql_output_path,
                     source_info=source_info,
-                    user_id_overrides=self.user_id_overrides
+                    user_id_overrides=self.user_id_overrides,
+                    merged_instructions=merged_instructions,
                 )
             except Exception as e:
                 # Log error but don't fail extraction
@@ -888,7 +892,8 @@ class ExtractionEngine:
         max_doc_size: Optional[int] = None,
         selected_doc_ids: Optional[List[str]] = None,
         selected_embedding_ids: Optional[List[str]] = None,
-        selected_agent_ids: Optional[List[str]] = None
+        selected_agent_ids: Optional[List[str]] = None,
+        merged_instructions: Optional[Dict[str, str]] = None,
     ) -> Dict:
         """
         Run full extraction pipeline.
@@ -1008,6 +1013,7 @@ class ExtractionEngine:
                 docs_df=docs_df,
                 folders_df=folders_df,
                 embeddings_df=embeddings_df,
+                merged_instructions=merged_instructions,
             )
             results["files"]["agents"] = agents_path
             results["summary"]["agents"] = len(agents_df)
