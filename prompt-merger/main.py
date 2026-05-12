@@ -1,9 +1,10 @@
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from llm_client import LLMClient
 from prompt_builder import (
@@ -27,6 +28,14 @@ logger = logging.getLogger("prompt-merger")
 
 app = FastAPI(title="Prompt Merger", version="1.0.0")
 llm = LLMClient()
+
+
+def _batch_worker_count(total: int) -> int:
+    try:
+        configured = int(os.getenv("PROMPT_MERGER_MAX_WORKERS", "4"))
+    except ValueError:
+        configured = 4
+    return max(1, min(configured, total))
 
 
 def _has_any_content(req: MergeRequest) -> bool:
@@ -71,21 +80,35 @@ def merge_single(req: MergeRequest, company_name: str = "Company"):
 
 @app.post("/merge-prompts/batch", response_model=BatchMergeResponse)
 def merge_batch(req: BatchMergeRequest):
-    results: List[MergeResult] = []
-    for agent in req.agents:
-        result = _merge_single(agent, req.company_name, req.template)
-        results.append(result)
-        logger.info(
-            "Processed %d/%d  bot_id=%s  status=%s",
-            len(results), len(req.agents), agent.bot_id, result.status,
-        )
+    if not req.agents:
+        return BatchMergeResponse(results=[], total=0, succeeded=0, failed=0)
 
-    succeeded = sum(1 for r in results if r.status in ("ok", "template_only"))
-    failed = sum(1 for r in results if r.status == "fallback")
+    results: List[Optional[MergeResult]] = [None] * len(req.agents)
+    max_workers = _batch_worker_count(len(req.agents))
+    logger.info("Processing %d prompt merge request(s) with %d worker(s)", len(req.agents), max_workers)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_merge_single, agent, req.company_name, req.template): (idx, agent)
+            for idx, agent in enumerate(req.agents)
+        }
+        for processed, future in enumerate(as_completed(future_map), start=1):
+            idx, agent = future_map[future]
+            result = future.result()
+            results[idx] = result
+            logger.info(
+                "Processed %d/%d  bot_id=%s  status=%s",
+                processed, len(req.agents), agent.bot_id, result.status,
+            )
+
+    final_results = [result for result in results if result is not None]
+
+    succeeded = sum(1 for r in final_results if r.status in ("ok", "template_only"))
+    failed = sum(1 for r in final_results if r.status == "fallback")
 
     return BatchMergeResponse(
-        results=results,
-        total=len(results),
+        results=final_results,
+        total=len(final_results),
         succeeded=succeeded,
         failed=failed,
     )
@@ -98,4 +121,23 @@ def health():
         "provider": llm.provider,
         "model": llm.model,
         "base_url": llm.effective_url,
+    }
+
+
+@app.get("/ready")
+def ready():
+    try:
+        readiness = llm.readiness()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"LLM readiness check failed: {exc}") from exc
+
+    if not readiness["model_available"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Configured model `{llm.model}` is not available from the LLM endpoint",
+        )
+
+    return {
+        "status": "ready",
+        **readiness,
     }

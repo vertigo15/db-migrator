@@ -1,20 +1,53 @@
 import os
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
-import requests
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 
-class LLMClient:
-    """Generic LLM wrapper for prompt merger.
+@dataclass(frozen=True)
+class LLMConfig:
+    """Environment-driven configuration for an OpenAI-compatible LLM endpoint."""
 
-    Supported providers:
-    - openai_compatible: any endpoint implementing OpenAI chat completions
-    - bedrock_converse: Bedrock Converse-style HTTP endpoint with bearer token
-    """
+    provider_name: str
+    base_url: str
+    api_key: str
+    model: str
+    temperature: float
+    max_tokens: int
+
+    @classmethod
+    def from_env(
+        cls,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> "LLMConfig":
+        resolved_base_url = base_url or os.getenv("LLM_BASE_URL")
+        resolved_model = model or os.getenv("LLM_MODEL")
+
+        if not resolved_base_url:
+            raise ValueError("LLM_BASE_URL is required")
+        if not resolved_model:
+            raise ValueError("LLM_MODEL is required")
+
+        return cls(
+            provider_name=os.getenv("LLM_PROVIDER_NAME", "openai_compatible"),
+            base_url=resolved_base_url,
+            api_key=api_key or os.getenv("LLM_API_KEY", "not-needed"),
+            model=resolved_model,
+            temperature=temperature if temperature is not None else float(os.getenv("LLM_TEMPERATURE", "0.3")),
+            max_tokens=max_tokens if max_tokens is not None else int(os.getenv("LLM_MAX_TOKENS", "4096")),
+        )
+
+
+class LLMClient:
+    """OpenAI-compatible LLM wrapper for prompt merger."""
 
     def __init__(
         self,
@@ -24,38 +57,40 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ):
-        self.provider = os.getenv("LLM_PROVIDER", "openai_compatible").strip().lower()
-        self.base_url = base_url or os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
-        self.api_key = api_key or os.getenv("LLM_API_KEY", "not-needed")
-        self.bedrock_converse_url = os.getenv("BEDROCK_CONVERSE_URL", "")
-        self.bedrock_auth_token = os.getenv("BEDROCK_AUTH_TOKEN", "")
-        self.model = model or os.getenv("LLM_MODEL", "gemma-3-12b-it")
-        self.temperature = temperature if temperature is not None else float(os.getenv("LLM_TEMPERATURE", "0.3"))
-        self.max_tokens = max_tokens if max_tokens is not None else int(os.getenv("LLM_MAX_TOKENS", "4096"))
-
-        self.client = None
-        if self.provider == "openai_compatible":
-            self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
-
-        if self.provider == "bedrock_converse" and not self.bedrock_converse_url:
-            raise ValueError("BEDROCK_CONVERSE_URL is required when LLM_PROVIDER=bedrock_converse")
-        if self.provider == "bedrock_converse" and not self.bedrock_auth_token:
-            raise ValueError("BEDROCK_AUTH_TOKEN is required when LLM_PROVIDER=bedrock_converse")
+        self.config = LLMConfig.from_env(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        self.provider = self.config.provider_name
+        self.base_url = self.config.base_url
+        self.api_key = self.config.api_key
+        self.model = self.config.model
+        self.temperature = self.config.temperature
+        self.max_tokens = self.config.max_tokens
+        self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
 
     @property
     def effective_url(self) -> str:
-        if self.provider == "bedrock_converse":
-            return self.bedrock_converse_url
         return self.base_url
+
+    def readiness(self) -> dict:
+        """Check that the configured endpoint is reachable and exposes the model."""
+        models = self.client.models.list()
+        model_ids = [model.id for model in models.data]
+        return {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.model,
+            "model_available": self.model in model_ids,
+            "available_models": model_ids,
+        }
 
     def chat(self, system: str, user: str) -> str:
         """Send a chat request and return the assistant's text."""
-        if self.provider == "bedrock_converse":
-            return self._chat_bedrock_converse(system, user)
-        return self._chat_openai_compatible(system, user)
-
-    def _chat_openai_compatible(self, system: str, user: str) -> str:
-        logger.info("OpenAI-compatible LLM request: model=%s base_url=%s", self.model, self.base_url)
+        logger.info("LLM request: provider=%s model=%s base_url=%s", self.provider, self.model, self.base_url)
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -66,39 +101,5 @@ class LLMClient:
             max_tokens=self.max_tokens,
         )
         content = response.choices[0].message.content or ""
-        logger.info("OpenAI-compatible LLM response: %d chars", len(content))
-        return content
-
-    def _chat_bedrock_converse(self, system: str, user: str) -> str:
-        logger.info("Bedrock Converse LLM request: model=%s url=%s", self.model, self.bedrock_converse_url)
-        payload = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"text": user or "Processing..."}],
-                }
-            ],
-            "inferenceConfig": {
-                "temperature": self.temperature,
-                "maxTokens": self.max_tokens,
-            },
-            "system": [{"text": system}] if system else [],
-        }
-        response = requests.post(
-            self.bedrock_converse_url,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.bedrock_auth_token}",
-            },
-            json=payload,
-            timeout=300,
-        )
-        response.raise_for_status()
-        data = response.json()
-        contents = data.get("output", {}).get("message", {}).get("content", [])
-        text_parts = [item["text"] for item in contents if isinstance(item, dict) and item.get("text")]
-        content = "".join(text_parts).strip()
-        logger.info("Bedrock Converse LLM response: %d chars", len(content))
-        if not content:
-            raise ValueError("Bedrock Converse response did not contain text output")
+        logger.info("LLM response: provider=%s chars=%d", self.provider, len(content))
         return content

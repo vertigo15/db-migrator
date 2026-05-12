@@ -10,8 +10,9 @@ from llm_client import LLMClient
 
 
 def main() -> int:
-    client = LLMClient()
+    client = None
     try:
+        client = LLMClient()
         content = client.chat(
             system="You are a connectivity smoke test. Reply with exactly: OK",
             user="Return OK",
@@ -28,9 +29,9 @@ def main() -> int:
     except Exception as exc:
         print(json.dumps({
             "status": "error",
-            "provider": client.provider,
-            "base_url": client.effective_url,
-            "model": client.model,
+            "provider": getattr(client, "provider", None),
+            "base_url": getattr(client, "effective_url", None),
+            "model": getattr(client, "model", None),
             "exception_type": type(exc).__name__,
             "exception_message": str(exc)[:1000],
         }, ensure_ascii=False))
