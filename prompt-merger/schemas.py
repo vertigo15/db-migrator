@@ -9,10 +9,17 @@ class MergeRequest(BaseModel):
     response: Optional[str] = None
 
 
+class LLMOverride(BaseModel):
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+
+
 class BatchMergeRequest(BaseModel):
     agents: List[MergeRequest]
     company_name: str
     template: Optional[str] = None
+    llm_override: Optional[LLMOverride] = None
 
 
 class MergeResult(BaseModel):

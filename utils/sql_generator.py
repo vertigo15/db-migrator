@@ -4,6 +4,7 @@ Integrated with the extraction engine to create SQL files alongside CSV exports.
 """
 import os
 import json
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import pandas as pd
@@ -19,9 +20,10 @@ import glob
 # for the same inputs, allowing independent computation across databases.
 # The output has the v4 version nibble set so it passes UUID v4 validation.
 # ============================================================
-USER_NAMESPACE_UUID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'   # Users (step 01)
-DOC_NAMESPACE_UUID  = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step 03)
-NAMESPACE_UUID      = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'   # Folders, agents, chunks, embeddings
+USER_NAMESPACE_UUID        = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'   # Users (step 01)
+DOC_NAMESPACE_UUID         = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step 03)
+NAMESPACE_UUID             = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'   # Folders, agents, chunks, embeddings
+CONVERSIONS_NAMESPACE_UUID = 'c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f'   # Conversions (step 07)
 
 
 def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None) -> str:
@@ -2324,7 +2326,14 @@ def generate_agent_insert(
     
     # Extract fields
     bot_name = clean_string(_safe_get(bot_data, 'bot_name')) or 'Unnamed Agent'
-    bot_description = (_safe_get(bot_data, 'bot_description') or '')[:2048]
+    raw_desc = (_safe_get(bot_data, 'bot_description') or '').strip()
+    raw_intended = (_safe_get(bot_data, 'bot_intended_use') or '').strip()
+    desc_parts = []
+    if raw_desc:
+        desc_parts.append(f"Description: {raw_desc}")
+    if raw_intended:
+        desc_parts.append(f"Intended Use: {raw_intended}")
+    bot_description = (' | '.join(desc_parts))[:2048] if desc_parts else ''
     first_message = clean_string(row.get('first_message'))
     
     # Derive agent_type — all legacy bots migrate as 'cortex'
@@ -2363,11 +2372,22 @@ def generate_agent_insert(
     else:
         instructions = clean_string(_safe_get(character_prompts, 'content'))
     
-    # Enabled tools
+    # Enabled tools — toolkit_settings.data contains capability flags.
+    # Known keys: chat, canvas, code, graph (all boolean).
+    ALLOWED_TOOLS = {'chat', 'canvas', 'code', 'graph'}
     enabled_tools = []
     ts_data = _safe_get(toolkit_settings, 'data') if toolkit_settings else None
     if isinstance(ts_data, dict):
-        enabled_tools = [k for k, v in ts_data.items() if str(v).lower() == 'true']
+        enabled_tools = [
+            k for k, v in ts_data.items()
+            if k in ALLOWED_TOOLS and str(v).lower() == 'true'
+        ]
+    # Attachment -> upload-files: toolkit_settings.attachment is
+    # {"image": bool, "document": bool}. If either is true, enable upload-files.
+    attachment = _safe_get(toolkit_settings, 'attachment') if toolkit_settings else None
+    if isinstance(attachment, dict):
+        if any(str(v).lower() == 'true' for v in attachment.values()):
+            enabled_tools.append('upload-files')
     enabled_tools_sql = escape_json_for_sql(enabled_tools)
     
     # Conversation starters
@@ -2377,12 +2397,15 @@ def generate_agent_insert(
         conversation_starters_sql = escape_json_for_sql([])
     
     # RAG settings
-    base_answers_on_files_only = False
+    # isAnswerBasedOnBestGrade: 'true' = Best Grade -> combines_multiple_answers ON
+    #                           'false' = All above passing grade -> combines_multiple_answers OFF
+    combines_multiple_answers = True
     for src in [toolkit_settings, relevant_answer_prompt]:
         val = _safe_get(src, 'isAnswerBasedOnBestGrade')
         if val is not None:
-            base_answers_on_files_only = str(val).lower() == 'true'
+            combines_multiple_answers = str(val).lower() == 'true'
             break
+    base_answers_on_files_only = False
     
     retrieved_context_size = None
     for src_key in [('vectorsNumber', toolkit_settings), ('vectorsNumber', _safe_get(grade_prompt, 'vectors') if grade_prompt else None)]:
@@ -2413,15 +2436,16 @@ def generate_agent_insert(
     show_source_links = False
     show_source_text = False
     follow_up_questions = False
+    additional_links = False
     if isinstance(qs, (list, dict)):
         qs_items = qs if isinstance(qs, list) else list(qs.keys())
         show_source_links = 'Display the source link' in qs_items
         show_source_text = 'Display the source text' in qs_items
         follow_up_questions = 'Follow-up questions' in qs_items
-    
-    additional_links = False
-    if additional_links_title and str(_safe_get(additional_links_title, 'is_selected', '')).lower() == 'true':
-        additional_links = True
+        additional_links = 'Web page link' in qs_items
+    if not additional_links and additional_links_title:
+        if str(_safe_get(additional_links_title, 'is_selected', '')).lower() == 'true':
+            additional_links = True
     
     # Parse timestamps
     created_at_val = row.get('created_at')
@@ -2638,7 +2662,7 @@ BEGIN
             {conversation_starters_sql},
             NULL::uuid,
             {str(base_answers_on_files_only).lower()},
-            true,
+            {str(combines_multiple_answers).lower()},
             {str(retrieved_context_size) if retrieved_context_size is not None else 'NULL::integer'},
             {str(re_rank_score) if re_rank_score is not None else 'NULL::numeric'},
             NULL::text,
@@ -2788,4 +2812,216 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
         'agents_processed': agents_processed,
         'settings_processed': agents_processed,
         'kb_items_linked': 0  # Tracked per-agent at runtime via RAISE NOTICE
+    }
+
+
+# ============================================================
+# Date parsing for jeen_dev_translate.last_updated
+# Three observed formats:
+#   1. Hebrew with day name: "שלישי 11 יוני, 2024"
+#   2. Hebrew abbreviated:   "10 ספט׳, 2024"
+#   3. English:              "12 May, 2026"
+# ============================================================
+_MONTH_MAP = {
+    # Hebrew full
+    'ינואר': 1, 'פברואר': 2, 'מרץ': 3, 'אפריל': 4,
+    'מאי': 5, 'יוני': 6, 'יולי': 7, 'אוגוסט': 8,
+    'ספטמבר': 9, 'אוקטובר': 10, 'נובמבר': 11, 'דצמבר': 12,
+    # Hebrew abbreviated (with geresh ׳)
+    "ינו׳": 1, "פבר׳": 2, "אפר׳": 4,
+    "אוג׳": 8, "ספט׳": 9, "אוק׳": 10, "נוב׳": 11, "דצמ׳": 12,
+    # English full
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    # English abbreviated
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
+    'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9,
+    'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+_DATE_RE = re.compile(
+    r'(?:^\S+\s+)?(\d{1,2})\s+([^\s,]+),?\s+(\d{4})$'
+)
+
+
+def parse_hebrew_date(val: Optional[str]) -> Optional[str]:
+    """Parse a locale date string into ISO-8601 (YYYY-MM-DD).
+
+    Handles Hebrew (full/abbreviated) and English month names.
+    Returns None if parsing fails.
+    """
+    if not val or not isinstance(val, str):
+        return None
+    val = val.strip()
+    m = _DATE_RE.match(val)
+    if not m:
+        return None
+    day, month_name, year = int(m.group(1)), m.group(2), int(m.group(3))
+    month = _MONTH_MAP.get(month_name) or _MONTH_MAP.get(month_name.lower())
+    if not month:
+        return None
+    try:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    except Exception:
+        return None
+
+
+# ============================================================
+# CONVERSIONS MIGRATION SQL (step 07)
+# Source: jeen_dev_translate -> Target: conversions
+# ============================================================
+VALID_CONVERSION_TYPES = {'input', 'output', 'input+output'}
+
+
+def generate_conversions_migration_sql(
+    translate_df: pd.DataFrame,
+    output_file: str,
+    source_info: str,
+    namespace_uuid: str = CONVERSIONS_NAMESPACE_UUID,
+    max_records_per_insert: int = 100,
+    user_id_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Generate SQL migration for jeen_dev_translate -> conversions table.
+
+    Handles:
+      - conversion_type ENUM validation
+      - original_text / converted_text truncation to 1024 chars
+      - Hebrew date string parsing for updated_at
+      - Deterministic UUID generation
+      - user_id resolution via bot_id -> playground_bot_generator_config join
+
+    Args:
+        translate_df: DataFrame with columns from jeen_dev_translate
+                      (joined with playground_bot_generator_config for user_id)
+        output_file: Path for the output SQL file
+        source_info: Source database description string
+        namespace_uuid: Namespace for deterministic UUID generation
+        max_records_per_insert: Batch size for INSERT grouping
+        user_id_overrides: Optional user_id old->new mapping overrides
+
+    Returns:
+        Dictionary with generation stats
+    """
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    cleanup_old_migration_files(output_file, '07_conversions_')
+
+    rows_processed = 0
+    rows_skipped = 0
+
+    with open(output_file, 'w', encoding='utf-8') as sql_file:
+        header = f"""-- ============================================================
+-- CONVERSIONS & AGENT_CONVERSIONS MIGRATION SQL
+-- ============================================================
+-- Generated: {datetime.now().isoformat()}
+-- Source: {source_info}
+-- Destination: conversions + agent_conversions
+-- Source rows: {len(translate_df)}
+--
+-- IMPORTANT: Run users + agents migration first.
+--
+-- Data transformations:
+--   - conversion_type: validated against ENUM ('input','output','input+output')
+--   - original_text / converted_text: truncated to 1024 chars
+--   - updated_at: parsed from Hebrew/English locale string to TIMESTAMPTZ
+--   - agent_conversions: links each conversion to its source agent
+--
+-- Uses deterministic UUID generation (deterministic_uuid_v4).
+-- Conversions Namespace UUID: {namespace_uuid}
+-- Agent Namespace UUID: {NAMESPACE_UUID}
+-- ============================================================
+
+SET client_encoding = 'UTF8';
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+"""
+        sql_file.write(header)
+        sql_file.write(generate_migration_schema_setup())
+        sql_file.write('\n')
+
+        for _, row in translate_df.iterrows():
+            source_id = row.get('id')
+            bot_id = row.get('bot_id')
+            user_id = row.get('user_id')
+            src = row.get('src')
+            translated = row.get('translated')
+            conv_type = row.get('type')
+            last_updated = row.get('last_updated')
+
+            if not bot_id or _is_scalar_na(bot_id):
+                rows_skipped += 1
+                continue
+
+            if not user_id or _is_scalar_na(user_id):
+                rows_skipped += 1
+                continue
+
+            conv_type_str = str(conv_type).strip() if conv_type and not _is_scalar_na(conv_type) else 'input'
+            if conv_type_str not in VALID_CONVERSION_TYPES:
+                conv_type_str = 'input'
+
+            original_text = (str(src).strip()[:1024]) if src and not _is_scalar_na(src) else ''
+            converted_text = (str(translated).strip()[:1024]) if translated and not _is_scalar_na(translated) else ''
+
+            parsed_date = parse_hebrew_date(str(last_updated) if last_updated and not _is_scalar_na(last_updated) else None)
+            updated_at_sql = f"'{parsed_date}'::timestamptz" if parsed_date else "NOW()"
+
+            conv_id_input = f"conv-{source_id}-{bot_id}"
+            user_id_sql = resolve_user_id_sql(str(user_id), user_id_overrides)
+
+            is_active_val = 'true'
+            raw_active = row.get('is_active')
+            if raw_active is not None and not _is_scalar_na(raw_active):
+                is_active_val = 'true' if str(raw_active).lower() == 'true' else 'false'
+
+            sql_file.write(f"""
+DO $$
+DECLARE
+    v_conversion_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, {escape_sql_string(conv_id_input)});
+    v_user_id uuid := {user_id_sql};
+    v_agent_id uuid := migration.deterministic_uuid_v4('{NAMESPACE_UUID}'::uuid, '{bot_id}-agent');
+BEGIN
+    -- 1. Insert conversion entity
+    IF NOT EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id) THEN
+        INSERT INTO conversions (
+            id, user_id, conversion_type, original_text, converted_text,
+            deleted_at, created_at, updated_at
+        ) VALUES (
+            v_conversion_id,
+            v_user_id,
+            '{conv_type_str}'::conversions_conversion_type_enum,
+            {escape_sql_string(original_text)},
+            {escape_sql_string(converted_text)},
+            NULL,
+            {updated_at_sql},
+            {updated_at_sql}
+        );
+        RAISE NOTICE 'Conversion % inserted (bot_id=%)', v_conversion_id, {escape_sql_string(str(bot_id))};
+    END IF;
+
+    -- 2. Link conversion to agent
+    IF NOT EXISTS (SELECT 1 FROM agent_conversions WHERE agent_id = v_agent_id AND conversion_id = v_conversion_id) THEN
+        INSERT INTO agent_conversions (agent_id, conversion_id, created_at, is_active)
+        VALUES (v_agent_id, v_conversion_id, {updated_at_sql}, {is_active_val});
+        RAISE NOTICE 'agent_conversions link: agent=% conversion=%', v_agent_id, v_conversion_id;
+    END IF;
+END $$;
+""")
+            rows_processed += 1
+
+        sql_file.write(f"""
+-- ============================================================
+-- MIGRATION SUMMARY
+-- ============================================================
+-- Conversions processed: {rows_processed}
+-- Agent_conversions links created: {rows_processed}
+-- Skipped (no bot_id/user_id): {rows_skipped}
+-- ============================================================
+""")
+
+    return {
+        'file': output_file,
+        'conversions_processed': rows_processed,
+        'conversions_skipped': rows_skipped,
     }

@@ -16,6 +16,7 @@ from prompt_builder import (
 from schemas import (
     BatchMergeRequest,
     BatchMergeResponse,
+    LLMOverride,
     MergeRequest,
     MergeResult,
 )
@@ -45,7 +46,20 @@ def _has_any_content(req: MergeRequest) -> bool:
     )
 
 
-def _merge_single(req: MergeRequest, company_name: str, template: Optional[str]) -> MergeResult:
+def _resolve_llm(override: Optional[LLMOverride]) -> LLMClient:
+    """Return an LLMClient built from overrides, or fall back to the default."""
+    if override and any([override.base_url, override.model, override.api_key]):
+        return LLMClient(
+            base_url=override.base_url,
+            model=override.model,
+            api_key=override.api_key,
+        )
+    return llm
+
+
+def _merge_single(req: MergeRequest, company_name: str, template: Optional[str],
+                   client: Optional[LLMClient] = None) -> MergeResult:
+    active_llm = client or llm
     if not _has_any_content(req):
         return MergeResult(
             bot_id=req.bot_id,
@@ -57,7 +71,7 @@ def _merge_single(req: MergeRequest, company_name: str, template: Optional[str])
     user = build_user_message(req.tone, req.guardrail, req.response)
 
     try:
-        merged = llm.chat(system, user)
+        merged = active_llm.chat(system, user)
         return MergeResult(
             bot_id=req.bot_id,
             merged_instruction=merged,
@@ -83,13 +97,14 @@ def merge_batch(req: BatchMergeRequest):
     if not req.agents:
         return BatchMergeResponse(results=[], total=0, succeeded=0, failed=0)
 
+    active_client = _resolve_llm(req.llm_override)
     results: List[Optional[MergeResult]] = [None] * len(req.agents)
     max_workers = _batch_worker_count(len(req.agents))
     logger.info("Processing %d prompt merge request(s) with %d worker(s)", len(req.agents), max_workers)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(_merge_single, agent, req.company_name, req.template): (idx, agent)
+            executor.submit(_merge_single, agent, req.company_name, req.template, active_client): (idx, agent)
             for idx, agent in enumerate(req.agents)
         }
         for processed, future in enumerate(as_completed(future_map), start=1):

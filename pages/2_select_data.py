@@ -819,6 +819,79 @@ def _extract_prompt_parts(config: ConnectionConfig, prefix: str, bot_ids: list) 
     return result
 
 
+def _init_llm_session_state():
+    """Initialize LLM config in session state from environment defaults."""
+    if "llm_base_url" not in st.session_state:
+        st.session_state["llm_base_url"] = os.getenv("LLM_BASE_URL", "")
+    if "llm_model" not in st.session_state:
+        st.session_state["llm_model"] = os.getenv("LLM_MODEL", "")
+    if "llm_api_key" not in st.session_state:
+        st.session_state["llm_api_key"] = os.getenv("LLM_API_KEY", "")
+
+
+def _render_llm_config_panel():
+    """Render the LLM configuration expander and return override dict (or None)."""
+    _init_llm_session_state()
+
+    with st.expander("⚙️ LLM Connection", expanded=False):
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            base_url = st.text_input(
+                "Base URL",
+                value=st.session_state["llm_base_url"],
+                key="llm_base_url_input",
+                help="OpenAI-compatible endpoint, e.g. https://host/v1",
+            )
+        with c2:
+            model = st.text_input(
+                "Model ID",
+                value=st.session_state["llm_model"],
+                key="llm_model_input",
+                help="Model identifier, e.g. openai/gpt-oss-120b",
+            )
+        api_key = st.text_input(
+            "API Key",
+            value=st.session_state["llm_api_key"],
+            type="password",
+            key="llm_api_key_input",
+            help="Bearer token for the LLM endpoint (leave empty if not required).",
+        )
+
+        st.session_state["llm_base_url"] = base_url
+        st.session_state["llm_model"] = model
+        st.session_state["llm_api_key"] = api_key
+
+        test_col, status_col = st.columns([1, 3])
+        with test_col:
+            test_pressed = st.button("Test LLM", key="test_llm_btn")
+        if test_pressed:
+            with status_col:
+                with st.spinner("Checking..."):
+                    try:
+                        health_url = f"{PROMPT_MERGER_URL}/health"
+                        resp = requests.get(health_url, timeout=5)
+                        resp.raise_for_status()
+                        info = resp.json()
+                        st.success(
+                            f"Service OK — provider: **{info.get('provider')}**, "
+                            f"model: **{info.get('model')}**, "
+                            f"url: `{info.get('base_url', '')[:60]}`"
+                        )
+                    except requests.ConnectionError:
+                        st.error(f"Cannot reach prompt-merger at `{PROMPT_MERGER_URL}`")
+                    except Exception as exc:
+                        st.error(f"Health check failed: {exc}")
+
+    has_override = (
+        base_url != os.getenv("LLM_BASE_URL", "")
+        or model != os.getenv("LLM_MODEL", "")
+        or api_key != os.getenv("LLM_API_KEY", "")
+    )
+    if has_override:
+        return {"base_url": base_url or None, "model": model or None, "api_key": api_key or None}
+    return None
+
+
 def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_ids: list):
     """Render the prompt merger UI: company selector + merge button + progress."""
     st.markdown("---")
@@ -827,6 +900,8 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
         "Combine each agent's Tone, Guardrail, and Response prompts into a single "
         "structured V5 instruction using the on-prem LLM."
     )
+
+    llm_override = _render_llm_config_panel()
 
     if not agent_ids:
         st.info("Select agents above to enable prompt merging.")
@@ -871,13 +946,16 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
         request_url = f"{PROMPT_MERGER_URL}/merge-prompts/batch"
 
         try:
+            payload = {
+                "agents": merge_requests,
+                "company_name": company_name,
+                "template": template_text,
+            }
+            if llm_override:
+                payload["llm_override"] = llm_override
             resp = requests.post(
                 request_url,
-                json={
-                    "agents": merge_requests,
-                    "company_name": company_name,
-                    "template": template_text,
-                },
+                json=payload,
                 timeout=600,
             )
             resp.raise_for_status()
@@ -1096,7 +1174,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
     filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
     
     # Export options
-    col1, col2 = st.columns([1, 1])
+    col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
         generate_sql = st.checkbox(
             "📝 Generate SQL migration files",
@@ -1108,6 +1186,12 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             "📄 Export CSV files",
             value=False,
             help="Export data as CSV files (can be disabled if you only need SQL)"
+        )
+    with col3:
+        extract_conversions = st.checkbox(
+            "🔄 Extract conversions",
+            value=True,
+            help="Extract jeen_dev_translate table and generate conversions migration SQL"
         )
     
     # SQL-specific options (shown only if SQL generation is enabled)
@@ -1378,6 +1462,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 selected_embedding_ids=st.session_state.get("selected_embedding_ids"),
                 selected_agent_ids=st.session_state.get("selected_agent_ids"),
                 merged_instructions=st.session_state.get("merged_instructions"),
+                extract_conversions=extract_conversions,
             )
         
         progress_bar.progress(1.0)
