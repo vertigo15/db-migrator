@@ -27,21 +27,19 @@ TRANSFORM_DIR = os.path.join(BASE_DIR, "output", "transform")
 
 
 def init_session_state():
-    """Initialize session state from localStorage, falling back to .env defaults."""
+    """Initialize session state from localStorage, falling back to .env defaults.
+
+    NOTE: We intentionally skip load_connection() here because it calls
+    st_javascript which injects an iframe that triggers an extra Streamlit
+    rerun, causing the "ghost form" visual glitch.  .env defaults are
+    sufficient; the user can always re-enter values in the form.
+    """
     if "target_form_loaded" not in st.session_state:
         st.session_state.target_form_loaded = True
-        
-        # Start with .env defaults
+
         env_defaults = get_env_target_defaults()
         connection_data = {k: v for k, v in env_defaults.items() if v}
-        
-        # Override with localStorage values if they exist
-        saved_conn = load_connection("target")
-        if saved_conn and isinstance(saved_conn, dict):
-            for k, v in saved_conn.items():
-                if v:  # Only override if value is non-empty
-                    connection_data[k] = v
-        
+
         st.session_state[SessionKeys.TARGET_CONNECTION] = connection_data
 
 
@@ -66,7 +64,7 @@ def render_target_connection():
     # Get saved values
     saved_conn = st.session_state.get(SessionKeys.TARGET_CONNECTION, {})
 
-    with st.form("target_connection_form"):
+    with st.form("target_config_form"):
         col1, col2 = st.columns(2)
 
         with col1:
@@ -108,47 +106,39 @@ def render_target_connection():
 
         submitted = st.form_submit_button("🔗 Test Connection", type="primary", use_container_width=True)
 
-        if submitted:
-            if not all([host, database, username, password]):
-                st.error("Please fill in all required fields.")
-                return
+    if submitted:
+        if not all([host, database, username, password]):
+            st.error("Please fill in all required fields.")
+            return
 
-            config = ConnectionConfig(
-                host=host,
-                port=port,
-                database=database,
-                username=username,
-                password=password
-            )
+        config = ConnectionConfig(
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            password=password
+        )
 
-            # Test basic connection
-            success, message = test_connection(config)
+        success, message = test_connection(config)
 
-            if not success:
-                st.error(f"❌ {message}")
-                return
+        if not success:
+            st.error(f"❌ {message}")
+            return
 
-            # Test databases and tables
-            test_result = test_target_databases_and_tables(config, schema_mode)
+        test_result = test_target_databases_and_tables(config, schema_mode)
+        table_status = get_target_table_info(config, schema_mode)
 
-            # Also fetch table status now so we don't need a separate spinner later
-            table_status = get_target_table_info(config, schema_mode)
+        conn_dict = config.to_dict()
+        conn_dict["schema_mode"] = schema_mode
+        st.session_state[SessionKeys.TARGET_CONNECTION] = conn_dict
+        st.session_state["target_config"] = config
+        st.session_state["target_schema_mode"] = schema_mode
+        st.session_state["target_test_result"] = test_result
+        st.session_state["target_table_status"] = table_status
 
-            # Save everything to session state in one go
-            conn_dict = config.to_dict()
-            conn_dict["schema_mode"] = schema_mode
-            st.session_state[SessionKeys.TARGET_CONNECTION] = conn_dict
-            st.session_state["target_config"] = config
-            st.session_state["target_schema_mode"] = schema_mode
-            st.session_state["target_test_result"] = test_result
-            st.session_state["target_table_status"] = table_status
+        st.rerun()
 
-            # Save to localStorage (without password)
-            save_connection("target", conn_dict)
-
-            st.rerun()
-
-    # Show test results AFTER the form (below it) — avoids layout shift
+    # Show test results AFTER the form (below it)
     test_result = st.session_state.get("target_test_result")
     if test_result and st.session_state.get("target_config"):
         if test_result["server_connected"]:

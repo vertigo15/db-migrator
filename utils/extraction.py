@@ -19,7 +19,8 @@ from utils.sql_generator import (
     generate_folders_migration_sql,
     generate_documents_migration_sql,
     generate_chunks_embeddings_migration_sql,
-    generate_conversations_logs_migration_sql
+    generate_conversations_logs_migration_sql,
+    generate_conversions_migration_sql,
 )
 
 
@@ -365,12 +366,15 @@ class ExtractionEngine:
         docs_df: Optional[pd.DataFrame] = None,
         folders_df: Optional[pd.DataFrame] = None,
         embeddings_df: Optional[pd.DataFrame] = None,
+        merged_instructions: Optional[Dict[str, str]] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract agents belonging to specified users.
         
         Args:
             user_ids: List of user IDs whose agents to extract
+            merged_instructions: Optional dict {bot_id: merged_instruction_text} from the
+                                 prompt merger service (passed through to SQL generation)
             
         Returns:
             Tuple of (DataFrame, output_file_path)
@@ -478,7 +482,8 @@ class ExtractionEngine:
                     agents_df=df,
                     output_file=sql_output_path,
                     source_info=source_info,
-                    user_id_overrides=self.user_id_overrides
+                    user_id_overrides=self.user_id_overrides,
+                    merged_instructions=merged_instructions,
                 )
             except Exception as e:
                 # Log error but don't fail extraction
@@ -880,6 +885,55 @@ class ExtractionEngine:
         
         return df, output_path
     
+    def extract_translate(
+        self,
+        bot_ids: List[str]
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        Extract conversion/translation rows linked to specified agents.
+
+        Args:
+            bot_ids: List of agent bot_id values whose conversions to extract
+
+        Returns:
+            Tuple of (DataFrame, output_file_path)
+        """
+        table_name = get_table_name("translate", self.prefix)
+        placeholders = ", ".join(["%s"] * len(bot_ids))
+
+        query = f"""
+            SELECT t.id, t.bot_id, t.src, t.translated, t.type, t.last_updated, t.is_active,
+                   a.user_id
+            FROM public.{table_name} t
+            LEFT JOIN public.playground_bot_generator_config a ON t.bot_id = a.bot_id
+            WHERE t.bot_id IN ({placeholders})
+        """
+        df = execute_query(self.config, query, tuple(bot_ids))
+
+        output_path = os.path.join(self.output_dir, f"translate_{self.timestamp}.csv")
+        if self.export_csv:
+            df.to_csv(output_path, index=False)
+
+        if self.generate_sql and len(df) > 0:
+            sql_output_path = os.path.join(
+                self.sql_output_dir, f"07_conversions_{self.timestamp}.sql"
+            )
+            source_info = (
+                f"{self.config.host}:{self.config.port}/{self.config.database}"
+                f" (table: {table_name})"
+            )
+            try:
+                generate_conversions_migration_sql(
+                    translate_df=df,
+                    output_file=sql_output_path,
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides,
+                )
+            except Exception as e:
+                print(f"Warning: Failed to generate SQL for conversions: {str(e)}")
+
+        return df, output_path
+
     def run_full_extraction(
         self,
         user_emails: List[str],
@@ -888,7 +942,9 @@ class ExtractionEngine:
         max_doc_size: Optional[int] = None,
         selected_doc_ids: Optional[List[str]] = None,
         selected_embedding_ids: Optional[List[str]] = None,
-        selected_agent_ids: Optional[List[str]] = None
+        selected_agent_ids: Optional[List[str]] = None,
+        merged_instructions: Optional[Dict[str, str]] = None,
+        extract_conversions: bool = True,
     ) -> Dict:
         """
         Run full extraction pipeline.
@@ -910,7 +966,7 @@ class ExtractionEngine:
             "errors": []
         }
         
-        total_steps = 7
+        total_steps = 8
         current_step = 0
         embeddings_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
         
@@ -1008,6 +1064,7 @@ class ExtractionEngine:
                 docs_df=docs_df,
                 folders_df=folders_df,
                 embeddings_df=embeddings_df,
+                merged_instructions=merged_instructions,
             )
             results["files"]["agents"] = agents_path
             results["summary"]["agents"] = len(agents_df)
@@ -1050,7 +1107,28 @@ class ExtractionEngine:
                 sql_path = os.path.join(self.sql_output_dir, f"05_conversations_{self.timestamp}.sql")
                 if os.path.exists(sql_path):
                     results["sql_files"]["conversations"] = sql_path
-            
+
+            # 8. Extract translate table (conversions)
+            current_step += 1
+            self._report_progress("translate", current_step, total_steps)
+            if extract_conversions:
+                bot_ids = agents_df["bot_id"].tolist() if len(agents_df) > 0 else []
+                if bot_ids:
+                    translate_df, translate_path = self.extract_translate(bot_ids)
+                    results["files"]["translate"] = translate_path
+                    results["summary"]["translate"] = len(translate_df)
+
+                    if self.generate_sql and len(translate_df) > 0:
+                        sql_path = os.path.join(
+                            self.sql_output_dir, f"07_conversions_{self.timestamp}.sql"
+                        )
+                        if os.path.exists(sql_path):
+                            results["sql_files"]["conversions"] = sql_path
+                else:
+                    results["summary"]["translate"] = 0
+            else:
+                results["summary"]["translate"] = 0
+
         except Exception as e:
             results["errors"].append(f"Extraction failed: {str(e)}")
         

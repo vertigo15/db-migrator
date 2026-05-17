@@ -32,6 +32,7 @@ DB_MAPPING = {
     "04_chunks_embeddings_": "document_db",
     "05_conversations_": "completion_db",
     "06_agents_": "completion_db",
+    "07_conversions_": "completion_db",
 }
 
 # Table mapping for rollback
@@ -42,6 +43,7 @@ TABLE_MAPPING = {
     "04_chunks_embeddings_": {"tables": ["chunks", "embeddings"], "mapping_table": "documents"},
     "05_conversations_": {"tables": ["conversations", "messages", "message_content_blocks"], "mapping_table": "conversations"},
     "06_agents_": {"tables": ["agents", "agent_settings", "knowledge_bases", "knowledge_base_assignments", "knowledge_base_items"], "mapping_table": "agents"},
+    "07_conversions_": {"tables": ["agent_conversions", "conversions"], "mapping_table": "conversions"},
 }
 
 

@@ -59,3 +59,8 @@ backups/*.sql.gz
 # OS files
 .DS_Store
 Thumbs.db
+
+
+
+sql_files_16_4_2026/
+docs_maor/

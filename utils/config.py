@@ -100,6 +100,16 @@ TABLE_DEFINITIONS: Dict[str, TableDefinition] = {
             FROM public.{table_name}
         """
     ),
+    "translate": TableDefinition(
+        logical_name="translate",
+        name_template="{prefix}_translate",
+        query_template="""
+            SELECT t.id, t.bot_id, t.src, t.translated, t.type, t.last_updated, t.is_active,
+                   a.user_id
+            FROM public.{table_name} t
+            LEFT JOIN public.playground_bot_generator_config a ON t.bot_id = a.bot_id
+        """
+    ),
 }
 
 # Extraction order (respecting foreign keys)
@@ -110,6 +120,7 @@ EXTRACTION_ORDER = [
     "embeddings",
     "agents",
     "logs",
+    "translate",
 ]
 
 
