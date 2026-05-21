@@ -131,6 +131,10 @@ def get_table_name(logical_name: str, prefix: str) -> str:
     
     table_def = TABLE_DEFINITIONS[logical_name]
     if table_def.has_prefix:
+        if not prefix:
+            if table_def.name_template == "{prefix}":
+                return logical_name
+            return table_def.name_template.format(prefix="").lstrip("_")
         return table_def.name_template.format(prefix=prefix)
     return table_def.name_template
 

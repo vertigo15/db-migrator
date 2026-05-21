@@ -389,8 +389,35 @@ def render_migration_files():
     if "migration_status" not in st.session_state:
         st.session_state.migration_status = {}
     
-    # Display each migration file
-    for idx, file_info in enumerate(migration_files):
+    # Show all expected steps in order, greying out missing ones
+    ALL_STEPS = [
+        ("01_users_", "user_db", "Users"),
+        ("02_folders_", "document_db", "Document folders"),
+        ("03_documents_", "document_db", "Documents"),
+        ("04_chunks_embeddings_", "document_db", "Chunks & embeddings"),
+        ("05_conversations_", "completion_db", "Conversations"),
+        ("06_agents_", "completion_db", "Agents"),
+        ("07_conversions_", "completion_db", "Agent-conversation links"),
+    ]
+    files_by_prefix = {}
+    for file_info in migration_files:
+        for prefix, _, _ in ALL_STEPS:
+            if file_info["filename"].startswith(prefix):
+                files_by_prefix[prefix] = file_info
+                break
+
+    for step_prefix, step_db, step_label in ALL_STEPS:
+        file_info = files_by_prefix.get(step_prefix)
+        if not file_info:
+            st.markdown(
+                f"<div style='padding:12px 16px;border-radius:4px;background:#f0f0f0;"
+                f"color:#999;margin-bottom:8px'>"
+                f"🗃️ {step_prefix[:-1]} — <em>{step_label}: 0 rows, skipped</em>"
+                f" &nbsp;(target: {step_db})</div>",
+                unsafe_allow_html=True,
+            )
+            continue
+
         filename = file_info["filename"]
         target_db = file_info["target_db"]
         
@@ -399,7 +426,7 @@ def render_migration_files():
             col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
             
             with col1:
-                st.markdown(f"### {idx + 1}. {filename}")
+                st.markdown(f"### {step_prefix[:2]}. {filename}")
                 st.caption(f"📊 Target DB: **{target_db}** | Size: {file_info['size']:,} bytes | Modified: {file_info['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
             
             with col2:

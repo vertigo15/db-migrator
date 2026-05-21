@@ -101,20 +101,70 @@ ORPHAN_CHECKS = [
         "needs_user_ids": False,
     },
     {
-        "key": "agent_docs_no_agent",
+        "key": "agent_kb_items_no_agent",
         "db": "completion_db",
-        "label": "agent_documents → agents",
-        "description": "Agent-document links whose agent does not exist",
+        "label": "knowledge_base_items (via missing agents)",
+        "description": "Knowledge base items tied to assignments whose agent does not exist",
         "category": "🔗 Intra-DB (completion_db)",
         "count_sql": (
-            "SELECT COUNT(*) FROM public.agent_documents "
-            "WHERE agent_id NOT IN (SELECT id FROM public.agents)"
+            "SELECT COUNT(*) FROM public.knowledge_base_items "
+            "WHERE knowledge_base_id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id NOT IN (SELECT id FROM public.agents)"
+            ")"
         ),
         "delete_sql": (
-            "DELETE FROM public.agent_documents "
-            "WHERE agent_id NOT IN (SELECT id FROM public.agents)"
+            "DELETE FROM public.knowledge_base_items "
+            "WHERE knowledge_base_id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id NOT IN (SELECT id FROM public.agents)"
+            ")"
         ),
         "delete_order": 4,
+        "needs_user_ids": False,
+    },
+    {
+        "key": "agent_kbs_no_agent",
+        "db": "completion_db",
+        "label": "knowledge_bases → agents",
+        "description": "Knowledge bases assigned to agents that do not exist",
+        "category": "🔗 Intra-DB (completion_db)",
+        "count_sql": (
+            "SELECT COUNT(*) FROM public.knowledge_bases "
+            "WHERE id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id NOT IN (SELECT id FROM public.agents)"
+            ")"
+        ),
+        "delete_sql": (
+            "DELETE FROM public.knowledge_bases "
+            "WHERE id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id NOT IN (SELECT id FROM public.agents)"
+            ")"
+        ),
+        "delete_order": 5,
+        "needs_user_ids": False,
+    },
+    {
+        "key": "kb_assignments_no_kb",
+        "db": "completion_db",
+        "label": "knowledge_base_assignments → knowledge_bases",
+        "description": "Knowledge base assignments whose knowledge base does not exist",
+        "category": "🔗 Intra-DB (completion_db)",
+        "count_sql": (
+            "SELECT COUNT(*) FROM public.knowledge_base_assignments "
+            "WHERE knowledge_base_id NOT IN (SELECT id FROM public.knowledge_bases)"
+        ),
+        "delete_sql": (
+            "DELETE FROM public.knowledge_base_assignments "
+            "WHERE knowledge_base_id NOT IN (SELECT id FROM public.knowledge_bases)"
+        ),
+        "delete_order": 6,
         "needs_user_ids": False,
     },
     # ── Intra-DB: document_db ────────────────────────────────────────────────
@@ -231,24 +281,61 @@ ORPHAN_CHECKS = [
         "needs_user_ids": True,
     },
     {
-        "key": "agent_docs_orphan_user",
+        "key": "agent_kb_items_orphan_user",
         "db": "completion_db",
-        "label": "agent_documents (via user-orphan agents)",
-        "description": "Agent-document links tied to agents from non-existent users",
+        "label": "knowledge_base_items (via user-orphan agents)",
+        "description": "Knowledge base items tied to agents from non-existent users",
         "category": "👤 Cross-DB (user reference)",
         "count_sql": (
-            "SELECT COUNT(*) FROM public.agent_documents "
-            "WHERE agent_id IN ("
-            "  SELECT id FROM public.agents WHERE user_id NOT IN ({user_ids_ph})"
+            "SELECT COUNT(*) FROM public.knowledge_base_items "
+            "WHERE knowledge_base_id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id IN ("
+            "    SELECT id FROM public.agents WHERE user_id NOT IN ({user_ids_ph})"
+            "  )"
             ")"
         ),
         "delete_sql": (
-            "DELETE FROM public.agent_documents "
-            "WHERE agent_id IN ("
-            "  SELECT id FROM public.agents WHERE user_id NOT IN ({user_ids_ph})"
+            "DELETE FROM public.knowledge_base_items "
+            "WHERE knowledge_base_id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id IN ("
+            "    SELECT id FROM public.agents WHERE user_id NOT IN ({user_ids_ph})"
+            "  )"
             ")"
         ),
         "delete_order": 11,
+        "needs_user_ids": True,
+    },
+    {
+        "key": "agent_kbs_orphan_user",
+        "db": "completion_db",
+        "label": "knowledge_bases (via user-orphan agents)",
+        "description": "Knowledge bases assigned to agents from non-existent users",
+        "category": "👤 Cross-DB (user reference)",
+        "count_sql": (
+            "SELECT COUNT(*) FROM public.knowledge_bases "
+            "WHERE id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id IN ("
+            "    SELECT id FROM public.agents WHERE user_id NOT IN ({user_ids_ph})"
+            "  )"
+            ")"
+        ),
+        "delete_sql": (
+            "DELETE FROM public.knowledge_bases "
+            "WHERE id IN ("
+            "  SELECT knowledge_base_id FROM public.knowledge_base_assignments "
+            "  WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+            "  AND assigned_to_id IN ("
+            "    SELECT id FROM public.agents WHERE user_id NOT IN ({user_ids_ph})"
+            "  )"
+            ")"
+        ),
+        "delete_order": 12,
         "needs_user_ids": True,
     },
     {

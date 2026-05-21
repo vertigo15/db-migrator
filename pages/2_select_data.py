@@ -12,6 +12,7 @@ import os
 import json
 import importlib.util
 from datetime import datetime, date
+from typing import Optional, Tuple
 import streamlit as st
 import pandas as pd
 
@@ -696,6 +697,18 @@ def _load_template_prompt() -> str:
         return ""
 
 
+def _load_no_doc_prompt_defaults() -> Tuple[str, str]:
+    """Load default prompt constants used for no-document agents."""
+    try:
+        constants = _load_prompt_constants()
+        return (
+            getattr(constants, "V4_NO_DOC_DEFAULT_TEMPLATE", ""),
+            getattr(constants, "V5_CORTEX_DEFAULT_RESPONSE_INSTRUCTIONS", ""),
+        )
+    except Exception:
+        return "", ""
+
+
 def _load_company_name_options() -> list:
     """Load company name options used by the prompt merger UI."""
     try:
@@ -708,6 +721,85 @@ def _text_or_empty(value) -> str:
     return value if isinstance(value, str) and value.strip() else ""
 
 
+def _normalize_prompt_for_compare(value: Optional[str]) -> str:
+    """Normalize only storage noise, not meaningful user edits."""
+    return (value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _array_has_values(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return any(str(item).strip() for item in value if item is not None)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped in ("{}", "[]"):
+            return False
+        if stripped.startswith("{") and stripped.endswith("}"):
+            return any(part.strip().strip('"') for part in stripped.strip("{}").split(","))
+        return True
+    try:
+        is_na = pd.isna(value)
+        if isinstance(is_na, bool) and is_na:
+            return False
+    except Exception:
+        pass
+    return bool(value)
+
+
+def _has_agent_knowledge(docs_chosen, chosen_docs_folders) -> bool:
+    return _array_has_values(docs_chosen) or _array_has_values(chosen_docs_folders)
+
+
+def _resolve_no_doc_instruction(
+    tone: Optional[str],
+    v4_default_template: str,
+    v5_default_instructions: str,
+) -> Tuple[str, str]:
+    tone_text = _text_or_empty(tone)
+    if (
+        tone_text
+        and _normalize_prompt_for_compare(tone_text)
+        != _normalize_prompt_for_compare(v4_default_template)
+    ):
+        return tone_text.strip(), "v4_user_prompt"
+    return v5_default_instructions.strip(), "v5_default_response_instructions"
+
+
+def _build_prompt_merge_routes(
+    agent_ids: list,
+    prompt_parts: dict,
+    v4_default_template: str,
+    v5_default_instructions: str,
+) -> Tuple[list, list]:
+    """Split selected agents into LLM merge requests and local no-doc results."""
+    merge_requests = []
+    local_results = []
+    for bot_id in agent_ids:
+        parts = prompt_parts.get(bot_id, {})
+        if parts.get("has_knowledge"):
+            merge_requests.append({
+                "bot_id": bot_id,
+                "tone": parts.get("tone"),
+                "guardrail": parts.get("guardrail"),
+                "response": parts.get("response"),
+            })
+        else:
+            merged_instruction, status = _resolve_no_doc_instruction(
+                parts.get("tone"),
+                v4_default_template,
+                v5_default_instructions,
+            )
+            local_results.append({
+                "bot_id": bot_id,
+                "merged_instruction": merged_instruction,
+                "status": status,
+                "error_message": None,
+                "sent_to_llm": False,
+            })
+    return merge_requests, local_results
+
+
 def render_merged_prompt_review():
     """Show what was extracted, the template, and the final merged prompt per agent."""
     review_items = st.session_state.get("merged_prompt_review") or []
@@ -716,27 +808,29 @@ def render_merged_prompt_review():
 
     st.markdown("#### 👁️ Review Prompt Merge Results")
     st.caption(
-        "Review the extracted V4 prompt parts, the template sent to the LLM, "
+        "Review the extracted V4 prompt parts, the routing decision, "
         "and the final prompt that will be injected into SQL generation."
     )
 
     summary_df = pd.DataFrame([
         {
-            "bot_id": item.get("bot_id"),
-            "status": item.get("status"),
-            "has_tone": bool(item.get("tone")),
-            "has_guardrail": bool(item.get("guardrail")),
-            "has_response": bool(item.get("response")),
-            "merged_chars": len(item.get("merged_instruction") or ""),
+            "agent_name": item.get("agent_name") or item.get("bot_id"),
+            "has_documents": bool(item.get("has_knowledge")),
+            "sent_to_llm": bool(item.get("sent_to_llm")),
         }
         for item in review_items
     ])
     st.dataframe(summary_df, hide_index=True, use_container_width=True)
 
     bot_ids = [item["bot_id"] for item in review_items]
+    agent_labels = {
+        item["bot_id"]: item.get("agent_name") or item["bot_id"]
+        for item in review_items
+    }
     selected_bot_id = st.selectbox(
         "Agent to review",
         options=bot_ids,
+        format_func=lambda bot_id: agent_labels.get(bot_id, bot_id),
         key="merged_prompt_review_agent",
     )
     selected = next(item for item in review_items if item["bot_id"] == selected_bot_id)
@@ -746,6 +840,10 @@ def render_merged_prompt_review():
         st.success("This merged prompt came from the LLM and is ready for SQL generation.")
     elif status == "template_only":
         st.info("This agent had no prompt parts, so the company-injected template will be used.")
+    elif status == "v4_user_prompt":
+        st.info("This no-document agent used its customized V4 tone prompt directly, without an LLM call.")
+    elif status == "v5_default_response_instructions":
+        st.info("This no-document agent kept the V4 default template, so the V5 Cortex default instructions will be used.")
     elif status == "fallback":
         st.warning(
             "The LLM call failed for this agent. The fallback concatenation will be injected "
@@ -765,7 +863,7 @@ def render_merged_prompt_review():
         st.text_area("Response", value=selected.get("response") or "(not provided)", height=180, disabled=True)
     with template_tab:
         st.text_area(
-            "Template sent to prompt merger",
+            "Template / local default reference",
             value=selected.get("template") or "(template not available)",
             height=420,
             disabled=True,
@@ -780,9 +878,9 @@ def render_merged_prompt_review():
 
 
 def _extract_prompt_parts(config: ConnectionConfig, prefix: str, bot_ids: list) -> dict:
-    """Fetch the 3 prompt parts (tone/guardrail/response) for each agent from source DB.
+    """Fetch prompt parts and attached-knowledge flags for each agent from source DB.
 
-    Returns {bot_id: {"tone": ..., "guardrail": ..., "response": ...}}
+    Returns {bot_id: {"tone": ..., "guardrail": ..., "response": ..., "has_knowledge": ...}}
     """
     if not bot_ids:
         return {}
@@ -790,7 +888,8 @@ def _extract_prompt_parts(config: ConnectionConfig, prefix: str, bot_ids: list) 
     agents_table = get_table_name("agents", prefix)
     placeholders = ", ".join(["%s"] * len(bot_ids))
     query = f"""
-        SELECT bot_id, character_prompts, hack_prompt, relevant_answer_prompt
+        SELECT bot_id, bot_data, character_prompts, hack_prompt, relevant_answer_prompt,
+               docs_chosen, chosen_docs_folders
         FROM public.{agents_table}
         WHERE bot_id IN ({placeholders})
     """
@@ -811,10 +910,27 @@ def _extract_prompt_parts(config: ConnectionConfig, prefix: str, bot_ids: list) 
                 return (col_val.get("content") or "").strip() or None
             return None
 
+        def _get_bot_name(col_val):
+            if col_val is None:
+                return None
+            if isinstance(col_val, str):
+                try:
+                    col_val = json.loads(col_val)
+                except Exception:
+                    return None
+            if isinstance(col_val, dict):
+                return (col_val.get("bot_name") or "").strip() or None
+            return None
+
         result[bid] = {
+            "agent_name": _get_bot_name(row.get("bot_data")),
             "tone": _get_content(row.get("character_prompts")),
             "guardrail": _get_content(row.get("hack_prompt")),
             "response": _get_content(row.get("relevant_answer_prompt")),
+            "has_knowledge": _has_agent_knowledge(
+                row.get("docs_chosen"),
+                row.get("chosen_docs_folders"),
+            ),
         }
     return result
 
@@ -882,14 +998,7 @@ def _render_llm_config_panel():
                     except Exception as exc:
                         st.error(f"Health check failed: {exc}")
 
-    has_override = (
-        base_url != os.getenv("LLM_BASE_URL", "")
-        or model != os.getenv("LLM_MODEL", "")
-        or api_key != os.getenv("LLM_API_KEY", "")
-    )
-    if has_override:
-        return {"base_url": base_url or None, "model": model or None, "api_key": api_key or None}
-    return None
+    return {"base_url": base_url or None, "model": model or None, "api_key": api_key or None}
 
 
 def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_ids: list):
@@ -897,8 +1006,8 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
     st.markdown("---")
     st.subheader("🔀 Merge Agent Prompts (V4 → V5)")
     st.caption(
-        "Combine each agent's Tone, Guardrail, and Response prompts into a single "
-        "structured V5 instruction using the on-prem LLM."
+        "Knowledge agents are merged from Tone, Guardrail, and Response using the on-prem LLM. "
+        "No-document agents are handled locally and are not sent to the LLM."
     )
 
     llm_override = _render_llm_config_panel()
@@ -920,7 +1029,7 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
         st.session_state["company_name"] = company_name
 
     with col2:
-        st.info(f"**{len(agent_ids)}** agents selected for prompt merging.")
+        st.info(f"**{len(agent_ids)}** agents found. Only those with attached documents will be sent to the LLM.")
 
     if st.button("🚀 Merge Agent Prompts", type="primary", use_container_width=False, key="merge_prompts_btn"):
         progress_bar = st.progress(0)
@@ -929,63 +1038,72 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
         status_text.text("Extracting prompt parts from source DB...")
         prompt_parts = _extract_prompt_parts(config, prefix, agent_ids)
         template_text = _load_template_prompt()
+        v4_default_template, v5_default_instructions = _load_no_doc_prompt_defaults()
+        merge_requests, local_results = _build_prompt_merge_routes(
+            agent_ids,
+            prompt_parts,
+            v4_default_template,
+            v5_default_instructions,
+        )
 
-        merge_requests = []
-        for bot_id in agent_ids:
-            parts = prompt_parts.get(bot_id, {})
-            merge_requests.append({
-                "bot_id": bot_id,
-                "tone": parts.get("tone"),
-                "guardrail": parts.get("guardrail"),
-                "response": parts.get("response"),
-            })
-
-        status_text.text(f"Sending {len(merge_requests)} agents to prompt merger service...")
+        status_text.text(
+            f"Sending {len(merge_requests)} knowledge agent(s) to prompt merger service; "
+            f"handling {len(local_results)} no-document agent(s) locally..."
+        )
         progress_bar.progress(0.1)
 
-        request_url = f"{PROMPT_MERGER_URL}/merge-prompts/batch"
+        data = {"results": []}
+        if merge_requests:
+            request_url = f"{PROMPT_MERGER_URL}/merge-prompts/batch"
 
-        try:
-            payload = {
-                "agents": merge_requests,
-                "company_name": company_name,
-                "template": template_text,
-            }
-            if llm_override:
-                payload["llm_override"] = llm_override
-            resp = requests.post(
-                request_url,
-                json=payload,
-                timeout=600,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.ConnectionError as exc:
-            st.error(
-                f"Could not connect to prompt merger service at `{PROMPT_MERGER_URL}`. "
-                "Make sure it is running: `cd db-migrator/prompt-merger && uvicorn main:app --port 8100`"
-            )
-            return
-        except Exception as exc:
-            st.error(f"Prompt merger request failed: {exc}")
-            return
+            try:
+                payload = {
+                    "agents": merge_requests,
+                    "company_name": company_name,
+                    "template": template_text,
+                }
+                if llm_override:
+                    payload["llm_override"] = llm_override
+                resp = requests.post(
+                    request_url,
+                    json=payload,
+                    timeout=600,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.ConnectionError as exc:
+                st.error(
+                    f"Could not connect to prompt merger service at `{PROMPT_MERGER_URL}`. "
+                    "Make sure it is running: `cd db-migrator/prompt-merger && uvicorn main:app --port 8100`"
+                )
+                return
+            except Exception as exc:
+                st.error(f"Prompt merger request failed: {exc}")
+                return
 
         progress_bar.progress(1.0)
         status_text.text("Prompt merging complete!")
 
         merged = {}
         results_by_bot = {}
-        for r in data.get("results", []):
+        all_results = [
+            {**r, "sent_to_llm": True}
+            for r in data.get("results", [])
+        ] + local_results
+        for r in all_results:
             merged[r["bot_id"]] = r["merged_instruction"]
             results_by_bot[r["bot_id"]] = r
         st.session_state["merged_instructions"] = merged
         st.session_state["merged_prompt_review"] = [
             {
                 "bot_id": bot_id,
+                "agent_name": _text_or_empty(prompt_parts.get(bot_id, {}).get("agent_name")),
                 "tone": _text_or_empty(prompt_parts.get(bot_id, {}).get("tone")),
                 "guardrail": _text_or_empty(prompt_parts.get(bot_id, {}).get("guardrail")),
                 "response": _text_or_empty(prompt_parts.get(bot_id, {}).get("response")),
-                "template": template_text,
+                "has_knowledge": bool(prompt_parts.get(bot_id, {}).get("has_knowledge")),
+                "sent_to_llm": bool(results_by_bot.get(bot_id, {}).get("sent_to_llm")),
+                "template": template_text if prompt_parts.get(bot_id, {}).get("has_knowledge") else v5_default_instructions,
                 "merged_instruction": results_by_bot.get(bot_id, {}).get("merged_instruction", ""),
                 "status": results_by_bot.get(bot_id, {}).get("status", "missing"),
                 "error_message": results_by_bot.get(bot_id, {}).get("error_message"),
@@ -993,9 +1111,15 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
             for bot_id in agent_ids
         ]
 
-        ok_count = data.get("succeeded", 0)
-        fail_count = data.get("failed", 0)
-        total = data.get("total", 0)
+        success_statuses = {
+            "ok",
+            "template_only",
+            "v4_user_prompt",
+            "v5_default_response_instructions",
+        }
+        ok_count = sum(1 for r in all_results if r.get("status") in success_statuses)
+        fail_count = sum(1 for r in all_results if r.get("status") == "fallback")
+        total = len(all_results)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Total", total)
@@ -1003,7 +1127,7 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
         c3.metric("Fallback / Failed", fail_count)
 
         statuses = {}
-        for r in data.get("results", []):
+        for r in all_results:
             s = r.get("status", "unknown")
             statuses[s] = statuses.get(s, 0) + 1
         if statuses:
@@ -1588,16 +1712,25 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                                 key=f"dl_sql_{table}"
                             )
             
-            # SQL file preview expanders
+            # SQL file preview expanders — show all expected steps in order
             st.subheader("👁️ SQL Files Preview")
-            for table, filepath in results.get("sql_files", {}).items():
-                if os.path.exists(filepath):
+            ALL_STEPS = [
+                ("01", "users", "Users"),
+                ("02", "folders", "Document folders"),
+                ("03", "documents", "Documents"),
+                ("04", "chunks_embeddings", "Chunks & embeddings"),
+                ("05", "conversations", "Conversations"),
+                ("06", "agents", "Agents"),
+                ("07", "conversions", "Agent-conversation links"),
+            ]
+            sql_files = results.get("sql_files", {})
+            for step_num, table_key, step_label in ALL_STEPS:
+                filepath = sql_files.get(table_key)
+                if filepath and os.path.exists(filepath):
                     file_size = os.path.getsize(filepath)
                     size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024 * 1024):.1f} MB"
-                    # Use actual filename with numbered prefix
                     display_name = os.path.basename(filepath)
-                    
-                    # Expander with inline download button
+
                     col_exp, col_btn = st.columns([10, 1])
                     with col_exp:
                         expander_label = f"🗃️ {display_name} ({size_str})"
@@ -1608,17 +1741,23 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                                 data=f,
                                 file_name=display_name,
                                 mime="text/plain",
-                                key=f"save_sql_{table}",
+                                key=f"save_sql_{table_key}",
                                 help="Save SQL file"
                             )
-                    
+
                     with st.expander(expander_label):
                         with open(filepath, "r", encoding="utf-8") as f:
-                            # Read first 50KB for preview (large files truncated)
                             content = f.read(50000)
                             if file_size > 50000:
                                 content += "\n\n-- [TRUNCATED - File too large for full preview] --"
                         st.code(content, language="sql")
+                else:
+                    st.markdown(
+                        f"<div style='padding:12px 16px;border-radius:4px;background:#f0f0f0;"
+                        f"color:#999;margin-bottom:8px'>"
+                        f"🗃️ {step_num}_{table_key} — <em>{step_label}: 0 rows, skipped</em></div>",
+                        unsafe_allow_html=True,
+                    )
 
 
 def main():

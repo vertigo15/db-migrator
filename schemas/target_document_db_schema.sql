@@ -11,22 +11,25 @@
 -- ============================================================
 
 -- Enum types
-CREATE TYPE IF NOT EXISTS public.folders_folder_type_enum AS ENUM ('regular', 'public', 'shared', 'system');
-CREATE TYPE IF NOT EXISTS public.documents_status_enum AS ENUM ('PENDING', 'UPLOADED', 'PROCESSING', 'COMPLETED', 'FAILED', 'DELETED');
-CREATE TYPE IF NOT EXISTS public.documents_source_type_enum AS ENUM ('upload', 'external');
-CREATE TYPE IF NOT EXISTS public.documents_content_type_enum AS ENUM ('pdf', 'docx', 'doc', 'txt', 'csv', 'xlsx', 'xls', 'pptx', 'html', 'md', 'json', 'xml', 'rtf', 'odt', 'ods', 'odp', 'epub', 'msg', 'eml', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'svg', 'webp', 'mp3', 'wav', 'mp4', 'avi', 'mkv', 'webm', 'url', 'link', 'other');
-CREATE TYPE IF NOT EXISTS public.chunks_content_type_enum AS ENUM ('text', 'table', 'image');
+CREATE TYPE IF NOT EXISTS public.folders_folder_type_enum AS ENUM ('document', 'agent', 'default');
+CREATE TYPE IF NOT EXISTS public.folders_source_type_enum AS ENUM ('upload', 'external_reference', 'external_ingested');
+CREATE TYPE IF NOT EXISTS public.documents_status_enum AS ENUM ('PENDING_UPLOAD', 'UPLOADED', 'FAILED');
+CREATE TYPE IF NOT EXISTS public.documents_source_type_enum AS ENUM ('upload', 'external_reference', 'external_ingested');
+CREATE TYPE IF NOT EXISTS public.chunks_content_type_enum AS ENUM ('text', 'heading', 'table', 'code', 'list');
 CREATE TYPE IF NOT EXISTS public.document_processing_status_enum AS ENUM ('PENDING', 'PROCESSING', 'READY', 'COMPLETED', 'FAILED', 'CANCELLED');
+CREATE TYPE IF NOT EXISTS public.upload_batch_status_enum AS ENUM ('pending', 'enumerating', 'processing', 'completed', 'partial_failure', 'failed');
+CREATE TYPE IF NOT EXISTS public.upload_batch_batch_type_enum AS ENUM ('external_folder', 'direct_upload');
+CREATE TYPE IF NOT EXISTS public.upload_batch_ingestion_mode_enum AS ENUM ('reference', 'full');
 
 -- ── folders ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS public.folders (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     folder_name VARCHAR(255) NOT NULL,
-    user_id UUID,
     parent_id UUID,
-    folder_type public.folders_folder_type_enum DEFAULT 'regular',
-    source_type VARCHAR(50),
-    organization_id UUID,
+    folder_type public.folders_folder_type_enum NOT NULL DEFAULT 'default',
+    source_type public.folders_source_type_enum NOT NULL DEFAULT 'upload',
+    user_id UUID NOT NULL,
+    upload_batch_id UUID,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     deleted_at TIMESTAMPTZ,
@@ -43,19 +46,20 @@ CREATE INDEX IF NOT EXISTS idx_folders_parent ON public.folders(parent_id);
 -- ── documents ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS public.documents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    status public.documents_status_enum NOT NULL DEFAULT 'PENDING',
-    file_name VARCHAR(512),
-    file_size BIGINT,
+    status public.documents_status_enum NOT NULL DEFAULT 'PENDING_UPLOAD',
+    file_name VARCHAR(512) NOT NULL,
+    file_size BIGINT NOT NULL,
     storage_type VARCHAR(64),
-    storage_path TEXT,
+    storage_path VARCHAR(512),
     storage_id VARCHAR(512),
     metadata JSONB,
-    content_type public.documents_content_type_enum,
-    source_type public.documents_source_type_enum DEFAULT 'upload',
+    content_type VARCHAR(128),
+    source_type public.documents_source_type_enum NOT NULL DEFAULT 'upload',
     parsing_technique_id UUID,
     organization_id UUID,
     user_id UUID,
     folder_id UUID,
+    upload_batch_id UUID,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     deleted_at TIMESTAMPTZ,
@@ -74,39 +78,52 @@ CREATE INDEX IF NOT EXISTS idx_documents_created ON public.documents(created_at)
 CREATE TABLE IF NOT EXISTS public.document_processing (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
-    parsing_technique_id UUID,
-    chunk_size INTEGER,
-    chunk_overlap INTEGER,
+    parsing_technique_id UUID NOT NULL,
+    chunk_size INTEGER NOT NULL,
+    chunk_overlap INTEGER NOT NULL,
     status public.document_processing_status_enum NOT NULL DEFAULT 'PENDING',
     is_active BOOLEAN NOT NULL DEFAULT true,
     translate_to_english BOOLEAN NOT NULL DEFAULT false,
-    embedding_model_id UUID,
+    embedding_model_id UUID NOT NULL,
     is_ready BOOLEAN NOT NULL DEFAULT false,
     prepend_doc_title BOOLEAN NOT NULL DEFAULT false,
     deleted_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_doc_processing_document ON public.document_processing(document_id);
+
+-- ── parsing_techniques ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.parsing_techniques (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(128) NOT NULL,
+    description TEXT,
+    icon VARCHAR(128),
+    category VARCHAR(128),
+    is_enabled BOOLEAN NOT NULL DEFAULT true,
+    parser_method_key VARCHAR(128) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
 
 -- ── chunks ──────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS public.chunks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
-    chunk_index INTEGER,
-    content TEXT,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
     content_hash VARCHAR(128),
-    content_type public.chunks_content_type_enum DEFAULT 'text',
+    content_type public.chunks_content_type_enum NOT NULL DEFAULT 'text',
     page_number INTEGER,
     char_count INTEGER,
     word_count INTEGER,
-    metadata JSONB,
+    metadata JSONB NOT NULL DEFAULT '{}',
     translated_content TEXT,
-    link_url TEXT,
-    link_title TEXT,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
+    document_processing_id UUID,
+    link TEXT,
+    link_title VARCHAR(512),
+    task_id UUID,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON public.chunks(document_id);
@@ -120,7 +137,8 @@ CREATE TABLE IF NOT EXISTS public.embeddings (
     document_id UUID NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
     embedding vector NOT NULL,
     dimension SMALLINT NOT NULL,
-    model_name VARCHAR(256),
+    model_name VARCHAR(256) NOT NULL,
+    task_id UUID,
     created_at TIMESTAMPTZ DEFAULT now(),
 
     CONSTRAINT uq_embeddings_chunk_model UNIQUE (chunk_id, model_name)
