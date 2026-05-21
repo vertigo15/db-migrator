@@ -12,7 +12,8 @@ from utils.db import (
     test_connection, 
     check_tables_exist, 
     run_pg_dump,
-    get_table_row_count
+    get_table_row_count,
+    execute_query,
 )
 from utils.storage import save_connection, save_to_storage
 from utils.config import SessionKeys, get_all_table_names
@@ -31,6 +32,36 @@ def _fmt_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in result.select_dtypes(include=['float64', 'float32']).columns:
         result[col] = result[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
     return result
+
+
+def _get_agent_knowledge_counts(config: ConnectionConfig, prefix: str) -> dict:
+    """Return total agents split by whether they reference docs or folders."""
+    agents_table = get_all_table_names(prefix).get("agents", "playground_bot_generator_config")
+    query = f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (
+                WHERE COALESCE(array_length(docs_chosen, 1), 0) > 0
+                   OR COALESCE(array_length(chosen_docs_folders, 1), 0) > 0
+            ) AS with_knowledge,
+            COUNT(*) FILTER (
+                WHERE COALESCE(array_length(docs_chosen, 1), 0) = 0
+                  AND COALESCE(array_length(chosen_docs_folders, 1), 0) = 0
+            ) AS without_knowledge
+        FROM public.{agents_table}
+    """
+    try:
+        df = execute_query(config, query)
+        if df.empty:
+            return {}
+        row = df.iloc[0]
+        return {
+            "total": int(row.get("total") or 0),
+            "with_knowledge": int(row.get("with_knowledge") or 0),
+            "without_knowledge": int(row.get("without_knowledge") or 0),
+        }
+    except Exception:
+        return {}
 
 
 # Page config
@@ -75,6 +106,11 @@ DEFAULTS = load_defaults()
 def render_connection_form():
     """Render the database connection form."""
     st.subheader("Connection Details")
+    current_prefix = (
+        st.session_state[SessionKeys.TABLE_PREFIX]
+        if SessionKeys.TABLE_PREFIX in st.session_state
+        else DEFAULTS["prefix"]
+    )
     
     with st.form("source_connection_form"):
         col1, col2 = st.columns(2)
@@ -87,8 +123,12 @@ def render_connection_form():
         with col2:
             port = st.number_input("Port", value=int(DEFAULTS["port"]), min_value=1, max_value=65535)
             password = st.text_input("Password", type="password", value=DEFAULTS["password"], placeholder="••••••••")
-            table_prefix = st.text_input("Table Prefix", value=DEFAULTS["prefix"], placeholder="jeen_dev",
-                                        help="Prefix for table names (e.g., 'jeen_dev' for 'jeen_dev_users')")
+            table_prefix = st.text_input(
+                "Table Prefix",
+                value=current_prefix,
+                placeholder="jeen_dev",
+                help="Prefix for table names (e.g., 'jeen_dev' for 'jeen_dev_users'). Leave empty for unprefixed tables.",
+            )
         
         submitted = st.form_submit_button("🔗 Test Connection", type="primary", use_container_width=True)
         
@@ -201,7 +241,10 @@ def render_audit_section():
         for logical_name, info in table_status.items():
             if info["exists"]:
                 count = get_table_row_count(config, info["actual_name"])
-                summary_items.append({"table": logical_name, "count": count})
+                item = {"table": logical_name, "count": count}
+                if logical_name == "agents":
+                    item["knowledge_counts"] = _get_agent_knowledge_counts(config, prefix)
+                summary_items.append(item)
         
         if summary_items:
             st.session_state["audit_counts"] = summary_items
@@ -209,7 +252,17 @@ def render_audit_section():
             cols = st.columns(len(summary_items))
             for i, item in enumerate(summary_items):
                 with cols[i]:
-                    st.markdown(f"**{item['table']}**<br>**{item['count']:,}**", unsafe_allow_html=True)
+                    if item["table"] == "agents" and item.get("knowledge_counts"):
+                        counts = item["knowledge_counts"]
+                        st.markdown(
+                            f"**{item['table']}**<br>"
+                            f"**{item['count']:,}**<br>"
+                            f"<small>With attached documents: **{counts['with_knowledge']:,}**<br>"
+                            f"Without attached documents: **{counts['without_knowledge']:,}**</small>",
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(f"**{item['table']}**<br>**{item['count']:,}**", unsafe_allow_html=True)
     
     # Calculate button (secondary style - not red/green)
     if st.button("📊 Calculate Audit Statistics", type="secondary", use_container_width=True):

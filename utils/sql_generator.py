@@ -801,6 +801,7 @@ BEGIN
         folder_name,
         parent_id,
         folder_type,
+        source_type,
         user_id,
         created_at,
         updated_at,
@@ -810,6 +811,7 @@ BEGIN
         {escape_sql_string(folder_name)},
         {parent_id_sql},
         '{folder_type}'::public.folders_folder_type_enum,
+        'upload'::public.folders_source_type_enum,
         v_user_id,
         {created_at_sql},
         now(),
@@ -931,34 +933,26 @@ WHERE batch_id = '{batch_id}';
 
 
 def get_content_type(doc_type: Optional[str]) -> str:
-    """Map document type to MIME content type."""
+    """Map document type/extension to the V5 content_type value (short extension format)."""
     if not doc_type:
-        return 'application/octet-stream'
+        return 'other'
     
-    doc_type = doc_type.strip().lower()
+    doc_type = doc_type.strip().lower().lstrip('.')
     
-    mime_types = {
-        'pdf': 'application/pdf',
-        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'doc': 'application/msword',
-        'ppt': 'application/vnd.ms-powerpoint',
-        'xls': 'application/vnd.ms-excel',
-        'txt': 'text/plain',
-        'csv': 'text/csv',
-        'html': 'text/html',
-        'json': 'application/json',
-        'png': 'image/png',
-        'jpg': 'image/jpeg',
-        'jpeg': 'image/jpeg',
-        'gif': 'image/gif',
-        'svg': 'image/svg+xml',
-        'mp3': 'audio/mpeg',
-        'mp4': 'video/mp4'
+    known_types = {
+        'pdf', 'docx', 'doc', 'txt', 'csv', 'xlsx', 'xls', 'pptx',
+        'html', 'md', 'json', 'xml', 'rtf', 'odt', 'ods', 'odp', 'epub',
+        'msg', 'eml', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'svg',
+        'webp', 'mp3', 'wav', 'mp4', 'avi', 'mkv', 'webm', 'url', 'link',
     }
     
-    return mime_types.get(doc_type, 'application/octet-stream')
+    aliases = {
+        'ppt': 'pptx',
+        'htm': 'html',
+    }
+    
+    normalized = aliases.get(doc_type, doc_type)
+    return normalized if normalized in known_types else 'other'
 
 
 def generate_document_insert(

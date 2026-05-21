@@ -8,28 +8,31 @@
 -- Create users table
 CREATE TABLE IF NOT EXISTS public.users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    firstname VARCHAR(255),
-    lastname VARCHAR(255),
     email VARCHAR(255) NOT NULL,
-    mobile_user_id VARCHAR(255),
-    organization_id UUID NOT NULL,
-    group_id UUID,
-    created_at TIMESTAMP DEFAULT now(),
-    updated_at TIMESTAMP DEFAULT now(),
-    last_connected TIMESTAMP,
-    
-    -- Constraints
-    CONSTRAINT uq_email UNIQUE (email)
+    first_name VARCHAR(255) NOT NULL,
+    last_name VARCHAR(255),
+    username VARCHAR(255) NOT NULL,
+    avatar_url VARCHAR(512),
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    zitadel_user_id VARCHAR(255),
+    preferred_language VARCHAR(10),
+    organization_id UUID,
+
+    CONSTRAINT uq_username UNIQUE (username)
 );
 
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_users_email ON public.users(email);
 CREATE INDEX IF NOT EXISTS idx_users_org ON public.users(organization_id);
-CREATE INDEX IF NOT EXISTS idx_users_group ON public.users(group_id);
+CREATE INDEX IF NOT EXISTS idx_users_zitadel ON public.users(zitadel_user_id);
 
 -- Comments for documentation
 COMMENT ON TABLE public.users IS 'User accounts';
-COMMENT ON COLUMN public.users.organization_id IS 'Organization UUID (from Azure AD)';
+COMMENT ON COLUMN public.users.organization_id IS 'Organization UUID';
+COMMENT ON COLUMN public.users.zitadel_user_id IS 'External identity provider user ID';
 
 -- ============================================================
 -- USER_DB SCHEMA CREATION COMPLETE

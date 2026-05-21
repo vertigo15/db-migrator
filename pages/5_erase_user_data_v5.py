@@ -47,7 +47,9 @@ V5_DATABASES = {
             "message_content_blocks": {"pk": "id", "user_col": None, "parent": "messages", "fk": "message_id"},
             "agents":                 {"pk": "id", "user_col": "user_id"},
             "agent_settings":         {"pk": "id", "user_col": None, "parent": "agents", "fk": "agent_id"},
-            "agent_documents":        {"pk": "id", "user_col": None, "parent": "agents", "fk": "agent_id"},
+            "knowledge_bases":        {"pk": "id", "user_col": None},
+            "knowledge_base_assignments": {"pk": "id", "user_col": None},
+            "knowledge_base_items":   {"pk": "id", "user_col": None},
         },
     },
 }
@@ -79,9 +81,27 @@ DELETION_STEPS = [
      "DELETE FROM public.messages WHERE user_id IN ({placeholders})"),
     ("completion_db", "conversations", "Conversations",
      "DELETE FROM public.conversations WHERE user_id IN ({placeholders})"),
-    # --- completion_db — agents CASCADE to agent_settings + agent_documents ---
-    ("completion_db", "agent_documents", "Agent ↔ Document links",
-     "DELETE FROM public.agent_documents WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
+    # --- completion_db — agent knowledge-base links, then agents ---
+    # Delete whole knowledge bases only when they are exclusively assigned to
+    # selected agents. Shared KBs keep their items and only lose the agent assignment.
+    ("completion_db", "knowledge_bases", "Knowledge bases exclusively assigned to agents",
+     "WITH selected_agents AS (SELECT id FROM public.agents WHERE user_id IN ({placeholders})) "
+     "DELETE FROM public.knowledge_bases kb WHERE EXISTS ("
+     "SELECT 1 FROM public.knowledge_base_assignments kba "
+     "WHERE kba.knowledge_base_id = kb.id "
+     "AND kba.assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND kba.assigned_to_id IN (SELECT id FROM selected_agents)"
+     ") AND NOT EXISTS ("
+     "SELECT 1 FROM public.knowledge_base_assignments other_kba "
+     "WHERE other_kba.knowledge_base_id = kb.id "
+     "AND NOT ("
+     "other_kba.assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND other_kba.assigned_to_id IN (SELECT id FROM selected_agents)"
+     "))"),
+    ("completion_db", "knowledge_base_assignments", "Knowledge base assignments for agents",
+     "DELETE FROM public.knowledge_base_assignments "
+     "WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND assigned_to_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("completion_db", "agent_settings", "Agent settings",
      "DELETE FROM public.agent_settings WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("completion_db", "agents", "Agents",
@@ -127,8 +147,39 @@ COUNT_QUERIES = [
      "SELECT COUNT(*) FROM public.messages WHERE user_id IN ({placeholders})"),
     ("completion_db", "conversations", "Conversations",
      "SELECT COUNT(*) FROM public.conversations WHERE user_id IN ({placeholders})"),
-    ("completion_db", "agent_documents", "Agent ↔ Document links",
-     "SELECT COUNT(*) FROM public.agent_documents WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "knowledge_base_items", "Knowledge base items for exclusively assigned agent KBs",
+     "WITH selected_agents AS (SELECT id FROM public.agents WHERE user_id IN ({placeholders})) "
+     "SELECT COUNT(*) FROM public.knowledge_base_items WHERE knowledge_base_id IN ("
+     "SELECT kb.id FROM public.knowledge_bases kb WHERE EXISTS ("
+     "SELECT 1 FROM public.knowledge_base_assignments kba "
+     "WHERE kba.knowledge_base_id = kb.id "
+     "AND kba.assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND kba.assigned_to_id IN (SELECT id FROM selected_agents)"
+     ") AND NOT EXISTS ("
+     "SELECT 1 FROM public.knowledge_base_assignments other_kba "
+     "WHERE other_kba.knowledge_base_id = kb.id "
+     "AND NOT ("
+     "other_kba.assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND other_kba.assigned_to_id IN (SELECT id FROM selected_agents)"
+     ")))"),
+    ("completion_db", "knowledge_base_assignments", "Knowledge base assignments for agents",
+     "SELECT COUNT(*) FROM public.knowledge_base_assignments "
+     "WHERE assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND assigned_to_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
+    ("completion_db", "knowledge_bases", "Knowledge bases exclusively assigned to agents",
+     "WITH selected_agents AS (SELECT id FROM public.agents WHERE user_id IN ({placeholders})) "
+     "SELECT COUNT(*) FROM public.knowledge_bases kb WHERE EXISTS ("
+     "SELECT 1 FROM public.knowledge_base_assignments kba "
+     "WHERE kba.knowledge_base_id = kb.id "
+     "AND kba.assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND kba.assigned_to_id IN (SELECT id FROM selected_agents)"
+     ") AND NOT EXISTS ("
+     "SELECT 1 FROM public.knowledge_base_assignments other_kba "
+     "WHERE other_kba.knowledge_base_id = kb.id "
+     "AND NOT ("
+     "other_kba.assigned_to_type = 'agent'::public.knowledge_base_assignments_assigned_to_type_enum "
+     "AND other_kba.assigned_to_id IN (SELECT id FROM selected_agents)"
+     "))"),
     ("completion_db", "agent_settings", "Agent settings",
      "SELECT COUNT(*) FROM public.agent_settings WHERE agent_id IN (SELECT id FROM public.agents WHERE user_id IN ({placeholders}))"),
     ("completion_db", "agents", "Agents",
