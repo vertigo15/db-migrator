@@ -9,8 +9,10 @@ Features:
 - CSV preview and download
 """
 import os
+import sys
 import json
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 from typing import Optional, Tuple
 import streamlit as st
@@ -29,7 +31,6 @@ from utils.extraction import (
     get_related_counts,
     estimate_embeddings_size
 )
-import requests
 
 # Page config
 st.set_page_config(page_title="Select Data", page_icon="📋", layout="wide")
@@ -535,41 +536,151 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
     return selected_embedding_ids
 
 def render_conversations_selection(config: ConnectionConfig, prefix: str, user_ids: list):
-    """Render selectable conversations list (default all selected)."""
+    """Render selectable conversations list with date/retention filters."""
     st.markdown("---")
     st.subheader("💬 Select Conversations")
     if not user_ids:
         st.info("No selected users, so no conversations to select.")
         st.session_state["selected_conversation_ids"] = []
         return []
+
     logs_table = get_table_name("logs", prefix)
     placeholders = ", ".join(["%s"] * len(user_ids))
-    query = f"""
-        SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id
-        FROM public.{logs_table}
-        WHERE user_id IN ({placeholders})
-        ORDER BY created_at DESC
-        LIMIT 5000
-    """
-    _ck = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}"
+
+    # ── Filters ──────────────────────────────────────────────────────────────
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        conv_date_from_raw = st.text_input(
+            "Created After",
+            value="",
+            key="conv_date_from",
+            placeholder="YYYY-MM-DD",
+            help="Only migrate conversations created on or after this date. Type freely, e.g. 2024-01-01",
+        )
+    with col2:
+        conv_date_to_raw = st.text_input(
+            "Created Before",
+            value="",
+            key="conv_date_to",
+            placeholder="YYYY-MM-DD",
+            help="Only migrate conversations created on or before this date. Type freely, e.g. 2025-12-31",
+        )
+    with col3:
+        conv_max_per_user = st.number_input(
+            "Max per user (0 = no limit)",
+            min_value=0,
+            value=0,
+            step=100,
+            key="conv_max_per_user",
+            help="Keep only the N most recent conversations per user. Useful for trimming large log tables (e.g. 500K records).",
+        )
+
+    def _parse_conv_date(raw: str, end_of_day: bool = False):
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                d = datetime.strptime(raw, fmt)
+                return d.replace(hour=23, minute=59, second=59) if end_of_day else d
+            except ValueError:
+                continue
+        st.warning(f"⚠️ Could not parse date '{raw}' — use YYYY-MM-DD format.")
+        return None
+
+    conv_date_from_dt = _parse_conv_date(conv_date_from_raw, end_of_day=False)
+    conv_date_to_dt = _parse_conv_date(conv_date_to_raw, end_of_day=True)
+    conv_max_per_user_val = int(conv_max_per_user) if conv_max_per_user and conv_max_per_user > 0 else None
+
+    # Store filter values for use during extraction
+    st.session_state["conv_date_from"] = conv_date_from_dt
+    st.session_state["conv_date_to"] = conv_date_to_dt
+    st.session_state["conv_max_per_user"] = conv_max_per_user_val
+
+    # ── Count query (fast — no data transfer) ────────────────────────────────
+    _ck = (
+        f"{_source_scope_key(config, prefix)}"
+        f"|{tuple(sorted(str(u) for u in user_ids))}"
+        f"|{conv_date_from_raw}|{conv_date_to_raw}|{conv_max_per_user}"
+    )
     if st.session_state.get("_p2_conv_df_key") == _ck:
         convs_df = st.session_state["_p2_conv_df"]
+        total_count = st.session_state.get("_p2_conv_total", len(convs_df))
     else:
+        # COUNT first (fast)
+        count_where = f"WHERE user_id IN ({placeholders})"
+        count_params = list(user_ids)
+        if conv_date_from_dt:
+            count_where += " AND created_at >= %s"
+            count_params.append(conv_date_from_dt)
+        if conv_date_to_dt:
+            count_where += " AND created_at <= %s"
+            count_params.append(conv_date_to_dt)
+        count_df = execute_query(
+            config,
+            f"SELECT COUNT(*) AS cnt FROM public.{logs_table} {count_where}",
+            tuple(count_params),
+        )
+        total_count = int(count_df["cnt"].iloc[0]) if not count_df.empty else 0
+
+        # Fetch display rows with filters applied
+        fetch_params = list(user_ids)
+        date_where = ""
+        if conv_date_from_dt:
+            date_where += " AND created_at >= %s"
+            fetch_params.append(conv_date_from_dt)
+        if conv_date_to_dt:
+            date_where += " AND created_at <= %s"
+            fetch_params.append(conv_date_to_dt)
+
+        if conv_max_per_user_val:
+            query = f"""
+                SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id
+                FROM (
+                    SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id,
+                           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS _rn
+                    FROM public.{logs_table}
+                    WHERE user_id IN ({placeholders}){date_where}
+                ) _r
+                WHERE _rn <= %s
+                ORDER BY created_at DESC
+                LIMIT 5000
+            """
+            fetch_params.append(conv_max_per_user_val)
+        else:
+            query = f"""
+                SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id
+                FROM public.{logs_table}
+                WHERE user_id IN ({placeholders}){date_where}
+                ORDER BY created_at DESC
+                LIMIT 5000
+            """
+
         with st.spinner("Loading conversations..."):
-            convs_df = execute_query(config, query, tuple(user_ids))
+            convs_df = execute_query(config, query, tuple(fetch_params))
         st.session_state["_p2_conv_df_key"] = _ck
         st.session_state["_p2_conv_df"] = convs_df.copy()
+        st.session_state["_p2_conv_total"] = total_count
+
     if not convs_df.empty and "created_at" in convs_df.columns:
         convs_df["created_at"] = pd.to_datetime(convs_df["created_at"], unit="s", errors="coerce")
+
+    # ── Count metrics ─────────────────────────────────────────────────────────
+    mc1, mc2 = st.columns(2)
+    mc1.metric("📊 Matching Conversations", f"{total_count:,}",
+               help="Total matching current filters — this is what will be migrated.")
+    if total_count > 5000:
+        mc2.warning(f"Showing first 5,000 of {total_count:,} for preview — all matching records will be extracted.")
+
     if convs_df.empty:
-        st.info("No conversations found for selected users.")
+        st.info("No conversations found for selected users with current filters.")
         st.session_state["selected_conversation_ids"] = []
         return []
-    
+
     # Truncate question/answer for display
     convs_df["question_preview"] = convs_df["question"].astype(str).str[:100] + "..."
     convs_df["answer_preview"] = convs_df["answer"].astype(str).str[:100] + "..."
-    
+
     search = st.text_input("🔍 Search conversations", placeholder="Search by id/user_id/question...", key="conv_search")
     filtered_df = convs_df.copy()
     if search:
@@ -677,8 +788,8 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     return selected_agent_ids
 
 
-PROMPT_MERGER_URL = os.getenv("PROMPT_MERGER_URL", "http://localhost:8100")
-PROMPTS_MODULE_PATH = os.path.join(BASE_DIR, "prompt-merger", "prompts.py")
+PROMPT_MERGER_DIR = os.path.join(BASE_DIR, "prompt-merger")
+PROMPTS_MODULE_PATH = os.path.join(PROMPT_MERGER_DIR, "prompts.py")
 
 
 def _load_prompt_constants():
@@ -687,6 +798,65 @@ def _load_prompt_constants():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _get_prompt_merger_modules():
+    """Lazily add prompt-merger/ to sys.path and import its modules."""
+    if PROMPT_MERGER_DIR not in sys.path:
+        sys.path.insert(0, PROMPT_MERGER_DIR)
+    from llm_client import LLMClient  # noqa: PLC0415
+    from prompt_builder import (  # noqa: PLC0415
+        build_system_message, build_user_message,
+        build_fallback, build_template_only,
+    )
+    return LLMClient, build_system_message, build_user_message, build_fallback, build_template_only
+
+
+def _run_batch_merge_direct(
+    merge_requests: list,
+    company_name: str,
+    template_text: str,
+    llm_override: dict,
+) -> dict:
+    """Run prompt merging in-process using LLMClient (no HTTP)."""
+    LLMClient, build_system_message, build_user_message, build_fallback, build_template_only = (
+        _get_prompt_merger_modules()
+    )
+
+    override = llm_override or {}
+    client = LLMClient(
+        base_url=override.get("base_url") or None,
+        model=override.get("model") or None,
+        api_key=override.get("api_key") or None,
+    )
+    tpl = template_text or None
+
+    def _merge_one(req: dict) -> dict:
+        tone, guardrail, response = req.get("tone"), req.get("guardrail"), req.get("response")
+        has_content = any(v and v.strip() for v in (tone, guardrail, response) if v)
+        if not has_content:
+            return {
+                "bot_id": req["bot_id"],
+                "merged_instruction": build_template_only(company_name, tpl),
+                "status": "template_only",
+                "error_message": None,
+            }
+        system = build_system_message(company_name, tpl)
+        user = build_user_message(tone, guardrail, response)
+        try:
+            merged = client.chat(system, user)
+            return {"bot_id": req["bot_id"], "merged_instruction": merged, "status": "ok", "error_message": None}
+        except Exception as exc:
+            fallback = build_fallback(tone, guardrail, response)
+            return {"bot_id": req["bot_id"], "merged_instruction": fallback, "status": "fallback", "error_message": str(exc)}
+
+    max_workers = max(1, min(int(os.getenv("PROMPT_MERGER_MAX_WORKERS", "4")), len(merge_requests)))
+    results: list = [None] * len(merge_requests)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_merge_one, req): i for i, req in enumerate(merge_requests)}
+        for future in as_completed(future_map):
+            results[future_map[future]] = future.result()
+    return {"results": [r for r in results if r is not None]}
 
 
 def _load_template_prompt() -> str:
@@ -984,19 +1154,20 @@ def _render_llm_config_panel():
             with status_col:
                 with st.spinner("Checking..."):
                     try:
-                        health_url = f"{PROMPT_MERGER_URL}/health"
-                        resp = requests.get(health_url, timeout=5)
-                        resp.raise_for_status()
-                        info = resp.json()
+                        LLMClient, *_ = _get_prompt_merger_modules()
+                        client = LLMClient(
+                            base_url=base_url or None,
+                            model=model or None,
+                            api_key=api_key or None,
+                        )
+                        info = client.readiness()
                         st.success(
-                            f"Service OK — provider: **{info.get('provider')}**, "
+                            f"LLM OK — provider: **{info.get('provider')}**, "
                             f"model: **{info.get('model')}**, "
                             f"url: `{info.get('base_url', '')[:60]}`"
                         )
-                    except requests.ConnectionError:
-                        st.error(f"Cannot reach prompt-merger at `{PROMPT_MERGER_URL}`")
                     except Exception as exc:
-                        st.error(f"Health check failed: {exc}")
+                        st.error(f"LLM check failed: {exc}")
 
     return {"base_url": base_url or None, "model": model or None, "api_key": api_key or None}
 
@@ -1054,31 +1225,15 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
 
         data = {"results": []}
         if merge_requests:
-            request_url = f"{PROMPT_MERGER_URL}/merge-prompts/batch"
-
             try:
-                payload = {
-                    "agents": merge_requests,
-                    "company_name": company_name,
-                    "template": template_text,
-                }
-                if llm_override:
-                    payload["llm_override"] = llm_override
-                resp = requests.post(
-                    request_url,
-                    json=payload,
-                    timeout=600,
+                data = _run_batch_merge_direct(
+                    merge_requests=merge_requests,
+                    company_name=company_name,
+                    template_text=template_text,
+                    llm_override=llm_override,
                 )
-                resp.raise_for_status()
-                data = resp.json()
-            except requests.ConnectionError as exc:
-                st.error(
-                    f"Could not connect to prompt merger service at `{PROMPT_MERGER_URL}`. "
-                    "Make sure it is running: `cd db-migrator/prompt-merger && uvicorn main:app --port 8100`"
-                )
-                return
             except Exception as exc:
-                st.error(f"Prompt merger request failed: {exc}")
+                st.error(f"Prompt merge failed: {exc}")
                 return
 
         progress_bar.progress(1.0)
@@ -1587,6 +1742,9 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 selected_agent_ids=st.session_state.get("selected_agent_ids"),
                 merged_instructions=st.session_state.get("merged_instructions"),
                 extract_conversions=extract_conversions,
+                conv_date_from=st.session_state.get("conv_date_from"),
+                conv_date_to=st.session_state.get("conv_date_to"),
+                conv_max_per_user=st.session_state.get("conv_max_per_user"),
             )
         
         progress_bar.progress(1.0)

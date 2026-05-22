@@ -4,10 +4,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: jeen-db-migrator:latest
     container_name: db-migrator
     ports:
       - "8501:8501"
+    env_file:
+      - .env
     volumes:
+      # Mount external .env so the app reads customer config without rebuilding
+      - ./.env:/app/.env:ro
       # Persist output files
       - ./output:/app/output
       # Persist saved configurations
@@ -15,29 +20,9 @@ services:
       # Persist backups
       - ./backups:/app/backups
     environment:
-      # Optional: Set default connection values
-      # - SOURCE_HOST=your-source-db-host
-      # - TARGET_HOST=your-target-db-host
       - STREAMLIT_SERVER_HEADLESS=true
       - STREAMLIT_SERVER_ENABLE_CORS=false
       - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true
-      - PROMPT_MERGER_URL=http://prompt-merger:8100
-    depends_on:
-      prompt-merger:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - db-migrator-network
-
-  prompt-merger:
-    build:
-      context: ./prompt-merger
-      dockerfile: Dockerfile
-    container_name: prompt-merger
-    ports:
-      - "8100:8100"
-    env_file:
-      - .env
     restart: unless-stopped
     networks:
       - db-migrator-network

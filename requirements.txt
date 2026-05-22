@@ -7,3 +7,6 @@ pyyaml>=6.0.1
 python-dotenv>=1.0.0
 reportlab>=4.0.0
 requests>=2.31.0
+# LLM client (prompt merger — inlined from prompt-merger service)
+openai>=1.0.0
+pydantic>=2.0.0

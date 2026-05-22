@@ -1,11 +1,15 @@
 
 services:
   db-migrator:
-    image: db-migrator:latest
+    image: jeen-db-migrator:latest
     container_name: db-migrator
     ports:
       - "8501:8501"
+    env_file:
+      - .env
     volumes:
+      # Mount external .env so the app reads customer config without rebuilding
+      - ./.env:/app/.env:ro
       # Persist output files
       - ./output:/app/output
       # Persist saved configurations

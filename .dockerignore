@@ -1,0 +1,37 @@
+# Never bake credentials into the image — mount .env at runtime via docker-compose
+.env
+.env.local
+.env.*.local
+
+# prompt-merger is inlined into the main app — its Dockerfile is no longer used
+prompt-merger/Dockerfile
+
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Generated output (mounted as volumes)
+output/
+backups/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

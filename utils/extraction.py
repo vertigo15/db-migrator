@@ -840,29 +840,62 @@ class ExtractionEngine:
 
     def extract_logs(
         self,
-        user_ids: List[str]
+        user_ids: List[str],
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        max_per_user: Optional[int] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract conversation logs belonging to specified users.
-        
+
         Args:
             user_ids: List of user IDs whose logs to extract
-            
+            date_from: Optional start date filter (keep logs created on or after)
+            date_to: Optional end date filter (keep logs created on or before)
+            max_per_user: If set, keep only the most recent N logs per user
+
         Returns:
             Tuple of (DataFrame, output_file_path)
         """
         table_name = get_table_name("logs", self.prefix)
         placeholders = ", ".join(["%s"] * len(user_ids))
-        
-        query = f"""
-            SELECT id, user_id, chat_id, question, question_in_english, answer, created_at,
+
+        # Build optional date WHERE clauses
+        date_where = ""
+        date_params: List = []
+        if date_from:
+            date_where += " AND created_at >= %s"
+            date_params.append(date_from)
+        if date_to:
+            date_where += " AND created_at <= %s"
+            date_params.append(date_to)
+
+        cols = """id, user_id, chat_id, question, question_in_english, answer, created_at,
                    message_index, question_number, token_amount, words_amount, is_like,
                    type, bot_id, toolkit_settings, title, category, sentiment,
-                   sourcetext, sourcelink, webpagelink, documents_selected, calculated_time
-            FROM public.{table_name}
-            WHERE user_id IN ({placeholders})
-        """
-        df = execute_query(self.config, query, tuple(user_ids))
+                   sourcetext, sourcelink, webpagelink, documents_selected, calculated_time"""
+
+        if max_per_user and max_per_user > 0:
+            query = f"""
+                SELECT {cols}
+                FROM (
+                    SELECT {cols},
+                           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS _rn
+                    FROM public.{table_name}
+                    WHERE user_id IN ({placeholders}){date_where}
+                ) _ranked
+                WHERE _rn <= %s
+            """
+            params: tuple = tuple(list(user_ids) + date_params + [max_per_user])
+        else:
+            query = f"""
+                SELECT {cols}
+                FROM public.{table_name}
+                WHERE user_id IN ({placeholders}){date_where}
+            """
+            params = tuple(list(user_ids) + date_params)
+
+        df = execute_query(self.config, query, params)
         
         output_path = os.path.join(self.output_dir, f"logs_{self.timestamp}.csv")
         if self.export_csv:
@@ -945,6 +978,9 @@ class ExtractionEngine:
         selected_agent_ids: Optional[List[str]] = None,
         merged_instructions: Optional[Dict[str, str]] = None,
         extract_conversions: bool = True,
+        conv_date_from: Optional[datetime] = None,
+        conv_date_to: Optional[datetime] = None,
+        conv_max_per_user: Optional[int] = None,
     ) -> Dict:
         """
         Run full extraction pipeline.
@@ -1098,7 +1134,12 @@ class ExtractionEngine:
             # 7. Extract logs (conversations/messages)
             current_step += 1
             self._report_progress("logs", current_step, total_steps)
-            logs_df, logs_path = self.extract_logs(user_ids)
+            logs_df, logs_path = self.extract_logs(
+                user_ids,
+                date_from=conv_date_from,
+                date_to=conv_date_to,
+                max_per_user=conv_max_per_user,
+            )
             results["files"]["logs"] = logs_path
             results["summary"]["logs"] = len(logs_df)
             
