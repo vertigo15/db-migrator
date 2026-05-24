@@ -13,7 +13,7 @@ import sys
 import json
 import importlib.util
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
 import streamlit as st
 import pandas as pd
@@ -187,7 +187,7 @@ def load_users_data(config: ConnectionConfig, prefix: str) -> pd.DataFrame:
     """Load users from the source database."""
     table_name = get_table_name("users", prefix)
     query = f"""
-        SELECT id, name, last_name, email, company_name, created_at, last_connected
+        SELECT id, name, email, company_name, created_at, last_connected
         FROM public.{table_name}
         ORDER BY email
     """
@@ -242,7 +242,6 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     if search:
         mask = (
             users_df["name"].str.contains(search, case=False, na=False) |
-            users_df["last_name"].str.contains(search, case=False, na=False) |
             users_df["email"].str.contains(search, case=False, na=False) |
             users_df["company_name"].str.contains(search, case=False, na=False)
         )
@@ -257,7 +256,7 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
         filtered_df["selected"] = filtered_df["email"].isin(saved_emails)
     
     # Reorder columns
-    display_cols = ["selected", "name", "last_name", "email", "company_name", "created_at", "last_connected"]
+    display_cols = ["selected", "name", "email", "company_name", "created_at", "last_connected"]
     filtered_df = filtered_df[display_cols]
     
     # Display editable dataframe
@@ -269,8 +268,7 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
                 help="Select users to migrate",
                 default=False
             ),
-            "name": st.column_config.TextColumn("First Name"),
-            "last_name": st.column_config.TextColumn("Last Name"),
+            "name": st.column_config.TextColumn("Name"),
             "email": st.column_config.TextColumn("Email"),
             "company_name": st.column_config.TextColumn("Company"),
             "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
@@ -548,11 +546,15 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
     placeholders = ", ".join(["%s"] * len(user_ids))
 
     # ── Filters ──────────────────────────────────────────────────────────────
+    if "conv_date_from" not in st.session_state:
+        st.session_state["conv_date_from"] = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+    if "conv_date_to" not in st.session_state:
+        st.session_state["conv_date_to"] = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+
     col1, col2, col3 = st.columns(3)
     with col1:
         conv_date_from_raw = st.text_input(
             "Created After",
-            value="",
             key="conv_date_from",
             placeholder="YYYY-MM-DD",
             help="Only migrate conversations created on or after this date. Type freely, e.g. 2024-01-01",
@@ -560,7 +562,6 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
     with col2:
         conv_date_to_raw = st.text_input(
             "Created Before",
-            value="",
             key="conv_date_to",
             placeholder="YYYY-MM-DD",
             help="Only migrate conversations created on or before this date. Type freely, e.g. 2025-12-31",
@@ -592,10 +593,10 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
     conv_date_to_dt = _parse_conv_date(conv_date_to_raw, end_of_day=True)
     conv_max_per_user_val = int(conv_max_per_user) if conv_max_per_user and conv_max_per_user > 0 else None
 
-    # Store filter values for use during extraction
-    st.session_state["conv_date_from"] = conv_date_from_dt
-    st.session_state["conv_date_to"] = conv_date_to_dt
-    st.session_state["conv_max_per_user"] = conv_max_per_user_val
+    # Store parsed filter values under separate keys (widget keys are reserved by Streamlit)
+    st.session_state["conv_date_from_parsed"] = conv_date_from_dt
+    st.session_state["conv_date_to_parsed"] = conv_date_to_dt
+    st.session_state["conv_max_per_user_parsed"] = conv_max_per_user_val
 
     # ── Count query (fast — no data transfer) ────────────────────────────────
     _ck = (
@@ -1742,9 +1743,9 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 selected_agent_ids=st.session_state.get("selected_agent_ids"),
                 merged_instructions=st.session_state.get("merged_instructions"),
                 extract_conversions=extract_conversions,
-                conv_date_from=st.session_state.get("conv_date_from"),
-                conv_date_to=st.session_state.get("conv_date_to"),
-                conv_max_per_user=st.session_state.get("conv_max_per_user"),
+                conv_date_from=st.session_state.get("conv_date_from_parsed"),
+                conv_date_to=st.session_state.get("conv_date_to_parsed"),
+                conv_max_per_user=st.session_state.get("conv_max_per_user_parsed"),
             )
         
         progress_bar.progress(1.0)
