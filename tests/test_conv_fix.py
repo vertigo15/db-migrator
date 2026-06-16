@@ -14,7 +14,8 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from utils.sql_generator import (
     clean_string, escape_sql_string, escape_sql_string_with_dollar_quotes,
-    generate_conversations_logs_migration_sql, _is_scalar_na
+    generate_conversations_logs_migration_sql, _is_scalar_na,
+    extract_question_from_jsonb,
 )
 
 # ─── 1. clean_string ────────────────────────────────────────────────────────
@@ -44,6 +45,22 @@ def test_is_scalar_na():
     assert _is_scalar_na({'k': 'v'}) is False
     assert _is_scalar_na(0) is False
     print("PASS: _is_scalar_na")
+
+# ─── 3b. extract_question_from_jsonb ─────────────────────────────────────────
+def test_extract_question_from_jsonb():
+    # Dev JSONB array format
+    dev_json = '[null, {"value": "What is AI?"}]'
+    assert extract_question_from_jsonb(dev_json) == 'What is AI?'
+
+    # Customer plain text (VARCHAR)
+    assert extract_question_from_jsonb('שלום, מה שלומך?') == 'שלום, מה שלומך?'
+    assert extract_question_from_jsonb('Plain question text') == 'Plain question text'
+
+    # Empty / missing
+    assert extract_question_from_jsonb(None) == '[no question text]'
+    assert extract_question_from_jsonb('') == '[no question text]'
+
+    print("PASS: extract_question_from_jsonb")
 
 # ─── 4 & 5. End-to-end generation ─────────────────────────────────────────────
 def test_generation():
@@ -112,6 +129,7 @@ if __name__ == '__main__':
     test_is_scalar_na()
     test_clean_string()
     test_escape_sql_string()
+    test_extract_question_from_jsonb()
     test_generation()
     print()
     print("All tests passed.")

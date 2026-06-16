@@ -7,6 +7,32 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
+_READINESS_SYSTEM = "You are a connectivity smoke test. Reply with exactly: OK"
+_READINESS_USER = "Return OK"
+
+
+def validate_base_url(base_url: str) -> str:
+    """
+    Validate and normalize an OpenAI-compatible API base URL.
+
+    Raises:
+        ValueError: If the URL is empty or includes a resource path such as
+            /chat/completions instead of the API root (/v1).
+    """
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        raise ValueError("Base URL is required")
+
+    lower = url.lower()
+    if lower.endswith("/chat/completions"):
+        suggested = url[: -len("/chat/completions")].rstrip("/") or "https://host/v1"
+        raise ValueError(
+            "Base URL should end with /v1, not /chat/completions. "
+            f"Use the API root instead, e.g. `{suggested}`"
+        )
+
+    return url
+
 
 @dataclass(frozen=True)
 class LLMConfig:
@@ -38,7 +64,7 @@ class LLMConfig:
 
         return cls(
             provider_name=os.getenv("LLM_PROVIDER_NAME", "openai_compatible"),
-            base_url=resolved_base_url,
+            base_url=validate_base_url(resolved_base_url),
             api_key=api_key or os.getenv("LLM_API_KEY", "not-needed"),
             model=resolved_model,
             temperature=temperature if temperature is not None else float(os.getenv("LLM_TEMPERATURE", "0.3")),
@@ -77,15 +103,37 @@ class LLMClient:
         return self.base_url
 
     def readiness(self) -> dict:
-        """Check that the configured endpoint is reachable and exposes the model."""
-        models = self.client.models.list()
-        model_ids = [model.id for model in models.data]
+        """
+        Verify the endpoint via POST /chat/completions.
+
+        On-prem gateways often do not implement GET /models; a minimal chat
+        request matches the path used by prompt merging in production.
+        """
+        logger.info(
+            "LLM readiness check: provider=%s model=%s base_url=%s",
+            self.provider,
+            self.model,
+            self.base_url,
+        )
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": _READINESS_SYSTEM},
+                {"role": "user", "content": _READINESS_USER},
+            ],
+            temperature=0,
+            max_tokens=16,
+        )
+        content = response.choices[0].message.content or ""
+        logger.info("LLM readiness OK: provider=%s chars=%d", self.provider, len(content))
         return {
             "provider": self.provider,
             "base_url": self.base_url,
             "model": self.model,
-            "model_available": self.model in model_ids,
-            "available_models": model_ids,
+            "chat_ok": True,
+            "response_preview": content[:200],
+            # Kept for callers that still check model_available.
+            "model_available": True,
         }
 
     def chat(self, system: str, user: str) -> str:

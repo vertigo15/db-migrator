@@ -1861,27 +1861,37 @@ END $$;
 
 def extract_question_from_jsonb(question_data) -> str:
     """
-    Extract user question from the question jsonb column.
-    Format: question->[1]->>'value' (index 1 is current turn's user question)
+    Extract user question from the question column.
+
+    Dev/source DB (JSONB): array where index [1] holds {"value": "..."}.
+    Customer DB (plain text): use the raw string when JSON parsing fails or
+    the value is not in the expected array shape.
     """
     if _is_scalar_na(question_data):
         return '[no question text]'
     if not question_data:  # handles empty string, empty list, etc.
         return '[no question text]'
-    
+
+    raw_text = clean_string(question_data) if isinstance(question_data, str) else None
+
     try:
         if isinstance(question_data, str):
             question_json = json.loads(question_data.replace("'", '"'))
         else:
             question_json = question_data
-        
-        # Try to get question from index 1
+
         if isinstance(question_json, list) and len(question_json) > 1:
             if isinstance(question_json[1], dict) and 'value' in question_json[1]:
-                return question_json[1]['value']
-        
+                value = question_json[1]['value']
+                if value is not None and str(value).strip():
+                    return str(value)
+
+        if raw_text:
+            return raw_text
         return '[no question text]'
-    except:
+    except (json.JSONDecodeError, TypeError, ValueError):
+        if raw_text:
+            return raw_text
         return '[no question text]'
 
 

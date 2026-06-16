@@ -146,10 +146,10 @@ def ready():
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"LLM readiness check failed: {exc}") from exc
 
-    if not readiness["model_available"]:
+    if not readiness.get("chat_ok"):
         raise HTTPException(
             status_code=503,
-            detail=f"Configured model `{llm.model}` is not available from the LLM endpoint",
+            detail=f"Configured model `{llm.model}` is not reachable via chat/completions",
         )
 
     return {
