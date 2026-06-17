@@ -1116,6 +1116,20 @@ def _init_llm_session_state():
         st.session_state["llm_api_key"] = os.getenv("LLM_API_KEY", "")
 
 
+def _llm_base_url_error(base_url: str) -> Optional[str]:
+    """Return a user-facing error if Base URL format is invalid, else None."""
+    url = (base_url or "").strip()
+    if not url:
+        return "Base URL is required."
+    if url.rstrip("/").lower().endswith("/chat/completions"):
+        suggested = url.rstrip("/")[: -len("/chat/completions")].rstrip("/") or "https://host/v1"
+        return (
+            "Base URL should end with /v1, not /chat/completions. "
+            f"Use the API root instead, e.g. `{suggested}`"
+        )
+    return None
+
+
 def _render_llm_config_panel():
     """Render the LLM configuration expander and return override dict (or None)."""
     _init_llm_session_state()
@@ -1127,7 +1141,7 @@ def _render_llm_config_panel():
                 "Base URL",
                 value=st.session_state["llm_base_url"],
                 key="llm_base_url_input",
-                help="OpenAI-compatible endpoint, e.g. https://host/v1",
+                help="OpenAI-compatible API root ending in /v1 (not /v1/chat/completions).",
             )
         with c2:
             model = st.text_input(
@@ -1148,27 +1162,40 @@ def _render_llm_config_panel():
         st.session_state["llm_model"] = model
         st.session_state["llm_api_key"] = api_key
 
+        base_url_error = _llm_base_url_error(base_url)
+        if base_url_error:
+            st.warning(base_url_error)
+
         test_col, status_col = st.columns([1, 3])
         with test_col:
             test_pressed = st.button("Test LLM", key="test_llm_btn")
         if test_pressed:
             with status_col:
-                with st.spinner("Checking..."):
-                    try:
-                        LLMClient, *_ = _get_prompt_merger_modules()
-                        client = LLMClient(
-                            base_url=base_url or None,
-                            model=model or None,
-                            api_key=api_key or None,
-                        )
-                        info = client.readiness()
-                        st.success(
-                            f"LLM OK — provider: **{info.get('provider')}**, "
-                            f"model: **{info.get('model')}**, "
-                            f"url: `{info.get('base_url', '')[:60]}`"
-                        )
-                    except Exception as exc:
-                        st.error(f"LLM check failed: {exc}")
+                if base_url_error:
+                    st.error(base_url_error)
+                elif not (model or "").strip():
+                    st.error("Model ID is required.")
+                else:
+                    with st.spinner("Checking..."):
+                        try:
+                            LLMClient, *_ = _get_prompt_merger_modules()
+                            client = LLMClient(
+                                base_url=base_url or None,
+                                model=model or None,
+                                api_key=api_key or None,
+                            )
+                            info = client.readiness()
+                            preview = (info.get("response_preview") or "").strip()
+                            preview_note = f", reply: `{preview[:40]}`" if preview else ""
+                            st.success(
+                                f"LLM OK — provider: **{info.get('provider')}**, "
+                                f"model: **{info.get('model')}**, "
+                                f"url: `{info.get('base_url', '')[:60]}`{preview_note}"
+                            )
+                        except ValueError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(f"LLM check failed: {exc}")
 
     return {"base_url": base_url or None, "model": model or None, "api_key": api_key or None}
 
@@ -1204,6 +1231,14 @@ def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_id
         st.info(f"**{len(agent_ids)}** agents found. Only those with attached documents will be sent to the LLM.")
 
     if st.button("🚀 Merge Agent Prompts", type="primary", use_container_width=False, key="merge_prompts_btn"):
+        base_url_error = _llm_base_url_error(llm_override.get("base_url") or "")
+        if base_url_error:
+            st.error(base_url_error)
+            return
+        if not (llm_override.get("model") or "").strip():
+            st.error("Model ID is required in LLM Connection settings.")
+            return
+
         progress_bar = st.progress(0)
         status_text = st.empty()
 
