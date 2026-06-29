@@ -561,7 +561,6 @@ BEGIN
             metadata,
             created_at,
             updated_at,
-            deleted_at,
             zitadel_user_id,
             organization_id
         ) VALUES (
@@ -574,7 +573,6 @@ BEGIN
             {metadata_sql},
             {created_at_sql},
             now(),
-            NULL,
             NULL,
             '{org_id}'::uuid
         )
@@ -595,7 +593,7 @@ BEGIN
             RAISE NOTICE 'User %: username conflict, using email as username instead', v_email;
             INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
-                metadata, created_at, updated_at, deleted_at, zitadel_user_id,
+                metadata, created_at, updated_at, zitadel_user_id,
                 organization_id
             ) VALUES (
                 v_new_id,
@@ -603,7 +601,7 @@ BEGIN
                 {escape_sql_string(first_name)},
                 {escape_sql_string(last_name)},
                 {escape_sql_string(email)},
-                NULL, {metadata_sql}, {created_at_sql}, now(), NULL, NULL,
+                NULL, {metadata_sql}, {created_at_sql}, now(), NULL,
                 '{org_id}'::uuid
             )
             ON CONFLICT (email) DO UPDATE SET
@@ -1859,40 +1857,99 @@ END $$;
     }
 
 
-def extract_question_from_jsonb(question_data) -> str:
-    """
-    Extract user question from the question column.
+_NO_QUESTION = '[no question text]'
 
-    Dev/source DB (JSONB): array where index [1] holds {"value": "..."}.
-    Customer DB (plain text): use the raw string when JSON parsing fails or
-    the value is not in the expected array shape.
+
+def _is_empty_question(question_data) -> bool:
+    """Return True when the raw value from the logs row is absent or empty.
+
+    Covers NULL-like scalars (NaN, None, pd.NA), empty strings, and empty
+    collections so callers can short-circuit before any parsing attempt.
     """
     if _is_scalar_na(question_data):
-        return '[no question text]'
-    if not question_data:  # handles empty string, empty list, etc.
-        return '[no question text]'
+        return True
+    if not question_data:
+        return True
+    return False
 
-    raw_text = clean_string(question_data) if isinstance(question_data, str) else None
 
+def _try_parse_json(raw: str):
+    """Attempt to parse a raw string as JSON.
+
+    Normalises single-quoted JSON produced by some PostgreSQL drivers before
+    parsing. Returns the parsed Python object on success, or ``None`` if the
+    string is not valid JSON (i.e. it is genuine plain text).
+    """
     try:
-        if isinstance(question_data, str):
-            question_json = json.loads(question_data.replace("'", '"'))
-        else:
-            question_json = question_data
+        return json.loads(raw.replace("'", '"'))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
 
-        if isinstance(question_json, list) and len(question_json) > 1:
-            if isinstance(question_json[1], dict) and 'value' in question_json[1]:
-                value = question_json[1]['value']
-                if value is not None and str(value).strip():
-                    return str(value)
 
-        if raw_text:
-            return raw_text
-        return '[no question text]'
-    except (json.JSONDecodeError, TypeError, ValueError):
-        if raw_text:
-            return raw_text
-        return '[no question text]'
+def _extract_value_from_question_array(question_json) -> str | None:
+    """Pull the user's question text out of the conversation array.
+
+    Both the source DB (JSONB) and the customer DB (character varying storing
+    JSON) encode each log entry as an array structured as:
+      - index 0  : the preceding assistant message
+      - index 1  : the current user message → ``{"value": "<question text>", ...}``
+      - index 2+ : older turns kept as context (ignored here)
+
+    Returns the non-empty question string if the expected structure is found,
+    otherwise ``None``.
+    """
+    if not (isinstance(question_json, list) and len(question_json) > 1):
+        return None
+    entry = question_json[1]
+    if not (isinstance(entry, dict) and 'value' in entry):
+        return None
+    value = entry['value']
+    if value is not None and str(value).strip():
+        return str(value)
+    return None
+
+
+def _extract_from_string(question_str: str) -> str:
+    """Handle string input by detecting its format and routing accordingly.
+
+    Two cases are supported:
+    - **JSON-encoded array** (both dev DB and customer DB with character varying):
+      parsed and forwarded to :func:`_extract_value_from_question_array`.
+    - **Genuine plain text**: returned as-is after cleaning.
+
+    Returns the question text or ``_NO_QUESTION`` if nothing usable is found.
+    """
+    parsed = _try_parse_json(question_str)
+    if parsed is not None:
+        extracted = _extract_value_from_question_array(parsed)
+        if extracted:
+            return extracted
+
+    # Not a JSON array — treat the whole string as the question
+    return clean_string(question_str) or _NO_QUESTION
+
+
+def extract_question_from_jsonb(question_data) -> str:
+    """Extract the user's question text from the logs ``question`` column.
+
+    Orchestrates the helper functions above based on the Python type of the
+    incoming value, which differs by DB and pandas behaviour:
+
+    - **Already-parsed list** (pandas delivered JSONB natively): forwarded
+      directly to :func:`_extract_value_from_question_array`.
+    - **String** (character varying, or JSONB delivered as raw text): delegated
+      to :func:`_extract_from_string` which auto-detects JSON vs plain text.
+
+    Returns ``'[no question text]'`` when no usable text can be found.
+    """
+    if _is_empty_question(question_data):
+        return _NO_QUESTION
+
+    if isinstance(question_data, str):
+        return _extract_from_string(question_data)
+
+    # Already a Python object — pandas delivered the JSONB column as a list
+    return _extract_value_from_question_array(question_data) or _NO_QUESTION
 
 
 def generate_conversations_logs_migration_sql(
