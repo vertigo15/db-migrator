@@ -14,7 +14,7 @@ The same flow can be referenced by several agents, so the script also reports
 which flows are shared by more than one agent.
 
 The universe of all known workflows is taken from
-    public.jeen_dev_langflow_user_permissions.flow_permissions[].flowId
+    public.{TABLE_PREFIX}_langflow_user_permissions.flow_permissions[].flowId
 (the Langflow flow definitions live in a separate Langflow DB; this permissions
 table is the authoritative list of provisioned flows available in this source
 DB). A workflow that exists there but is referenced by no agent is "dead weight".
@@ -26,6 +26,8 @@ Excluded from the agent output:
 Usage:
     python list_workflow_agents.py            # print report + write CSV to output/
     python list_workflow_agents.py --no-csv   # print report only
+
+Set TABLE_PREFIX in .env for customer-specific source table names.
 """
 import os
 import sys
@@ -33,6 +35,7 @@ import csv
 from datetime import datetime
 
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 
 try:
@@ -52,6 +55,16 @@ def get_source_config():
         "password": os.getenv("SOURCE_DB_PASSWORD", ""),
         "sslmode": os.getenv("SOURCE_DB_SSLMODE", "require"),
     }
+
+
+def get_table_prefix() -> str:
+    """Return the source table prefix from environment."""
+    return os.getenv("TABLE_PREFIX", "jeen_dev").strip()
+
+
+def get_langflow_permissions_table(prefix: str) -> str:
+    """Return the source DB langflow permissions table for the configured prefix."""
+    return f"{prefix}_langflow_user_permissions" if prefix else "langflow_user_permissions"
 
 
 # One row per (agent, flow). LEFT JOIN LATERAL keeps Workflow agents that have
@@ -75,19 +88,22 @@ ORDER BY c.bot_id, flow_name;
 
 # Universe of all known/provisioned workflows (distinct flow ids in the Langflow
 # permissions table). Used to find workflows that no agent references.
-ALL_FLOWS_QUERY = """
+ALL_FLOWS_QUERY = sql.SQL("""
 SELECT DISTINCT (p->>'flowId') AS flow_id
-FROM public.jeen_dev_langflow_user_permissions,
+FROM public.{permissions_table},
      jsonb_array_elements(flow_permissions) AS p
 WHERE NULLIF(p->>'flowId', '') IS NOT NULL;
-"""
+""")
 
 
 def main():
     write_csv = "--no-csv" not in sys.argv
     cfg = get_source_config()
+    prefix = get_table_prefix()
+    permissions_table = get_langflow_permissions_table(prefix)
 
     print(f"Connecting to source DB {cfg['user']}@{cfg['host']}:{cfg['port']}/{cfg['dbname']} ...")
+    print(f"Using Langflow permissions table: public.{permissions_table}")
     # Read-only connection: open a read-only transaction as an extra safety net.
     conn = psycopg2.connect(**cfg)
     conn.set_session(readonly=True, autocommit=False)
@@ -95,7 +111,7 @@ def main():
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(AGENT_FLOW_QUERY)
         rows = cur.fetchall()
-        cur.execute(ALL_FLOWS_QUERY)
+        cur.execute(ALL_FLOWS_QUERY.format(permissions_table=sql.Identifier(permissions_table)))
         all_flow_ids = {r["flow_id"] for r in cur.fetchall()}
         cur.close()
     finally:
