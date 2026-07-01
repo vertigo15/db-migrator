@@ -13,7 +13,13 @@ The Langflow flow(s) it uses are stored inside the agent row itself at:
 The same flow can be referenced by several agents, so the script also reports
 which flows are shared by more than one agent.
 
-Excluded from the output:
+The universe of all known workflows is taken from
+    public.jeen_dev_langflow_user_permissions.flow_permissions[].flowId
+(the Langflow flow definitions live in a separate Langflow DB; this permissions
+table is the authoritative list of provisioned flows available in this source
+DB). A workflow that exists there but is referenced by no agent is "dead weight".
+
+Excluded from the agent output:
   - soft-deleted agents (deleted_at IS NOT NULL)
   - agents tagged 'Workflow' that reference no flow (empty flows array)
 
@@ -67,6 +73,16 @@ ORDER BY c.bot_id, flow_name;
 """
 
 
+# Universe of all known/provisioned workflows (distinct flow ids in the Langflow
+# permissions table). Used to find workflows that no agent references.
+ALL_FLOWS_QUERY = """
+SELECT DISTINCT (p->>'flowId') AS flow_id
+FROM public.jeen_dev_langflow_user_permissions,
+     jsonb_array_elements(flow_permissions) AS p
+WHERE NULLIF(p->>'flowId', '') IS NOT NULL;
+"""
+
+
 def main():
     write_csv = "--no-csv" not in sys.argv
     cfg = get_source_config()
@@ -79,6 +95,8 @@ def main():
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(AGENT_FLOW_QUERY)
         rows = cur.fetchall()
+        cur.execute(ALL_FLOWS_QUERY)
+        all_flow_ids = {r["flow_id"] for r in cur.fetchall()}
         cur.close()
     finally:
         conn.rollback()  # nothing to commit; read-only
@@ -101,12 +119,25 @@ def main():
             fa["agents"].add(aid)
 
     total_agents = len(agents)
-    distinct_flows = len(flow_to_agents)
+    referenced_flow_ids = set(flow_to_agents)
+    distinct_flows = len(referenced_flow_ids)
     shared_flows = {fid: v for fid, v in flow_to_agents.items() if len(v["agents"]) > 1}
+
+    # Workflow universe vs. usage.
+    total_workflows = len(all_flow_ids)
+    unused_flow_ids = all_flow_ids - referenced_flow_ids            # dead weight
+    orphan_flow_ids = referenced_flow_ids - all_flow_ids            # referenced but not provisioned
 
     # ---- Report ----------------------------------------------------------
     line = "=" * 78
-    print(f"\n{line}\nSUMMARY\n{line}")
+    print(f"\n{line}\n1. OVERALL COUNTS\n{line}")
+    print(f"Workflows (total provisioned)          : {total_workflows}")
+    print(f"Agents that use workflows              : {total_agents}")
+    print(f"Workflows in use (referenced by agents): {distinct_flows}")
+    print(f"Workflows NOT used by any agent (dead) : {len(unused_flow_ids)}")
+    print(f"Referenced flows not in permissions    : {len(orphan_flow_ids)}")
+
+    print(f"\n{line}\nSUMMARY (agent scope)\n{line}")
     print("Scope: model='Workflow', NOT soft-deleted, referencing >=1 Langflow flow.")
     print(f"Agents that actually use a workflow : {total_agents}")
     print(f"Distinct Langflow flows referenced  : {distinct_flows}")
@@ -132,6 +163,13 @@ def main():
 
     print(f"\nTotal: {len(active_ids)} non-deleted agents reference a Langflow flow.")
 
+    # ---- Dead workflows: provisioned but referenced by no agent ----------
+    dead_ids = sorted(unused_flow_ids)
+    print(f"\n{line}\nUNUSED / DEAD WORKFLOWS ({len(dead_ids)})\n{line}")
+    print("Provisioned in langflow permissions but referenced by no agent.")
+    for fid in dead_ids:
+        print(fid)
+
     # ---- CSV -------------------------------------------------------------
     if write_csv:
         out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -153,6 +191,12 @@ def main():
         with open(ids_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(active_ids) + "\n")
         print(f"Agent IDs written: {ids_path}")
+
+        # Plain list of unused/dead workflow ids (one per line).
+        dead_path = os.path.join(out_dir, f"unused_workflow_ids_{ts}.txt")
+        with open(dead_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(dead_ids) + "\n")
+        print(f"Unused workflow IDs written: {dead_path}")
 
 
 if __name__ == "__main__":
