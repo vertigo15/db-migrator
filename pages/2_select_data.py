@@ -734,9 +734,14 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     placeholders = ", ".join(["%s"] * len(user_ids))
     query = f"""
         SELECT bot_id, user_id, folder_id, created_at,
+               COALESCE(NULLIF(bot_data->>'bot_name', ''), NULLIF(bot_data->>'botName', ''), '') AS agent_name,
                COALESCE(array_length(docs_chosen, 1), 0) AS docs,
                COALESCE(array_length(chosen_docs_folders, 1), 0) AS folders,
-               array_to_string(docs_chosen, ', ') AS doc_ids
+               array_to_string(docs_chosen, ', ') AS doc_ids,
+               (lower(trim(character_prompts->>'model')) = 'workflow'
+                AND COALESCE(jsonb_array_length(character_prompts->'agentFlow'->'flows'), 0) > 0)
+                   AS uses_workflow,
+               character_prompts->'agentFlow'->'flows'->0->>'id' AS flow_id
         FROM public.{agents_table}
         WHERE user_id IN ({placeholders})
         ORDER BY created_at DESC
@@ -756,15 +761,21 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         st.info("No agents found for selected users.")
         st.session_state["selected_agent_ids"] = []
         return []
-    search = st.text_input("🔍 Search agents", placeholder="Search by bot_id/user_id/folder_id...", key="agent_search")
+    _wf_total = int(agents_df["uses_workflow"].sum()) if "uses_workflow" in agents_df.columns else 0
+    st.caption(f"🔀 {_wf_total} of {len(agents_df)} agents reference a Langflow workflow.")
+    search = st.text_input("🔍 Search agents", placeholder="Search by name/bot_id/user_id/folder_id...", key="agent_search")
+    only_workflow = st.checkbox("🔀 Show only Langflow-workflow agents", value=False, key="agent_workflow_only")
     filtered_df = agents_df.copy()
     if search:
         mask = (
-            filtered_df["bot_id"].astype(str).str.contains(search, case=False, na=False)
+            filtered_df["agent_name"].astype(str).str.contains(search, case=False, na=False)
+            | filtered_df["bot_id"].astype(str).str.contains(search, case=False, na=False)
             | filtered_df["user_id"].astype(str).str.contains(search, case=False, na=False)
             | filtered_df["folder_id"].astype(str).str.contains(search, case=False, na=False)
         )
         filtered_df = filtered_df[mask]
+    if only_workflow:
+        filtered_df = filtered_df[filtered_df["uses_workflow"] == True]
     select_all_agents = st.checkbox("Select all agents in current list", value=True, key="select_all_agents")
     previous = st.session_state.get("selected_agent_ids")
     if select_all_agents:
@@ -774,13 +785,23 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
             filtered_df["selected"] = filtered_df["bot_id"].isin(previous)
         else:
             filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
+    filtered_df = filtered_df[["selected", "agent_name", "uses_workflow", "flow_id", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,
         use_container_width=True,
         height=320,
-        column_config={"created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD")},
+        column_config={
+            "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
+            "agent_name": st.column_config.TextColumn("Agent Name", help="Agent display name (bot_data.bot_name)"),
+            "uses_workflow": st.column_config.CheckboxColumn(
+                "🔀 Workflow",
+                disabled=True,
+                help="Agent references a Langflow workflow (model='Workflow' with a flow assigned)",
+            ),
+            "flow_id": st.column_config.TextColumn("Flow ID", help="Referenced Langflow flow id (first, if multiple)"),
+        },
+        disabled=["agent_name", "uses_workflow", "flow_id"],
         key="agents_editor",
     )
     selected_agent_ids = edited_df[edited_df["selected"] == True]["bot_id"].astype(str).tolist()

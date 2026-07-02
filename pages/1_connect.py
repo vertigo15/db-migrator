@@ -64,6 +64,76 @@ def _get_agent_knowledge_counts(config: ConnectionConfig, prefix: str) -> dict:
         return {}
 
 
+def _get_workflow_counts(config: ConnectionConfig, prefix: str) -> dict:
+    """Return Langflow workflow usage counts.
+
+    NOTE: the authoritative list of provisioned Langflow flows lives in a separate
+    Langflow DB that this tool does not connect to. Every count below is derived
+    purely from the source DB, using the langflow permissions table as a proxy for
+    "all known workflows" -- so `granted` is flows that appear in permission grants,
+    not the true provisioned total.
+
+    - granted:      distinct flows that appear in the langflow permissions table
+    - agents_using: non-deleted workflow agents that reference >=1 flow id
+    - in_use:       distinct flows actually referenced by a live agent
+    - dead:         granted flows referenced by no live agent (dead weight)
+    - orphans:      flows referenced by live agents but absent from the perms table
+                    (proves the perms table is not a complete universe; because of
+                     these, in_use + dead = granted + orphans)
+
+    On failure returns {"error": <message>} so the caller can distinguish a real
+    zero from a query/schema problem.
+    """
+    names = get_all_table_names(prefix)
+    agents_table = names.get("agents", "playground_bot_generator_config")
+    perms_table = names.get("langflow_user_permissions", f"{prefix}_langflow_user_permissions")
+    query = f"""
+        WITH all_flows AS (
+            SELECT DISTINCT (p->>'flowId') AS flow_id
+            FROM public.{perms_table},
+                 jsonb_array_elements(flow_permissions) AS p
+            WHERE NULLIF(p->>'flowId', '') IS NOT NULL
+        ),
+        referenced AS (
+            SELECT DISTINCT (f->>'id') AS flow_id, c.bot_id
+            FROM public.{agents_table} c,
+                 jsonb_array_elements(c.character_prompts->'agentFlow'->'flows') AS f
+            WHERE lower(trim(c.character_prompts->>'model')) = 'workflow'
+              AND c.deleted_at IS NULL
+              AND NULLIF(f->>'id', '') IS NOT NULL
+        ),
+        referenced_flows AS (
+            SELECT DISTINCT flow_id FROM referenced
+        )
+        SELECT
+            (SELECT COUNT(*) FROM all_flows)                                AS granted,
+            (SELECT COUNT(DISTINCT bot_id) FROM referenced)                 AS agents_using,
+            (SELECT COUNT(*) FROM referenced_flows)                         AS in_use,
+            (SELECT COUNT(*) FROM all_flows a
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM referenced_flows r WHERE r.flow_id = a.flow_id
+                 ))                                                         AS dead,
+            (SELECT COUNT(*) FROM referenced_flows r
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM all_flows a WHERE a.flow_id = r.flow_id
+                 ))                                                         AS orphans
+    """
+    try:
+        df = execute_query(config, query)
+        if df.empty:
+            return {}
+        row = df.iloc[0]
+        return {
+            "granted": int(row.get("granted") or 0),
+            "agents_using": int(row.get("agents_using") or 0),
+            "in_use": int(row.get("in_use") or 0),
+            "dead": int(row.get("dead") or 0),
+            "orphans": int(row.get("orphans") or 0),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Page config
 st.set_page_config(page_title="Connect to Source DB", page_icon="🔌", layout="wide")
 st.title("🔌 Connect to Source Database")
@@ -263,7 +333,37 @@ def render_audit_section():
                         )
                     else:
                         st.markdown(f"**{item['table']}**<br>**{item['count']:,}**", unsafe_allow_html=True)
-    
+
+        # Workflow (Langflow) usage metrics
+        wf = _get_workflow_counts(config, prefix)
+        if wf:
+            st.session_state["audit_workflow_counts"] = wf
+            st.markdown("**🔀 Workflows (Langflow)**")
+            if wf.get("error"):
+                st.warning(
+                    "Could not compute workflow stats (the langflow permissions "
+                    f"table may be missing or have an unexpected shape): {wf['error']}"
+                )
+            else:
+                wf_cols = st.columns(5)
+                with wf_cols[0]:
+                    st.metric("Workflows granted (perms)", f"{wf['granted']:,}")
+                with wf_cols[1]:
+                    st.metric("Agents using workflows", f"{wf['agents_using']:,}")
+                with wf_cols[2]:
+                    st.metric("Workflows in use", f"{wf['in_use']:,}")
+                with wf_cols[3]:
+                    st.metric("Unused workflows (dead)", f"{wf['dead']:,}")
+                with wf_cols[4]:
+                    st.metric("Orphan flows (not granted)", f"{wf['orphans']:,}")
+                st.caption(
+                    "Granted = distinct flows that appear in the langflow permissions "
+                    "table (a proxy — the authoritative flow list lives in a separate "
+                    "Langflow DB this tool does not query). Dead = granted flows no live "
+                    "agent references. Orphans = flows live agents reference that are NOT "
+                    "in the perms table. Reconciliation: in_use + dead = granted + orphans."
+                )
+
     # Calculate button (secondary style - not red/green)
     if st.button("📊 Calculate Audit Statistics", type="secondary", use_container_width=True):
         with st.spinner("Running audit queries... This may take a few minutes for large databases."):
