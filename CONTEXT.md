@@ -18,12 +18,12 @@ A **Streamlit-based database migration tool** that migrates data from a legacy V
 | 03 | `{prefix}_custom_documents` | `document_db.documents` + `document_processing` | MIME type mapping; agent-topup |
 | 04 | `{prefix}` (embeddings collection) | `document_db.chunks` + `embeddings` | Split into two tables |
 | 05 | `{prefix}_logs` | `completion_db.conversations` + `messages` + `message_content_blocks` | Aggregated by `chat_id` |
-| 06 | `playground_bot_generator_config` | `completion_db.agents` + `agent_settings` + `agent_documents` | JSONB decomposed |
+| 06 | `playground_bot_generator_config` | `completion_db.agents` + `agent_settings` + `knowledge_bases` + `knowledge_base_assignments` + `knowledge_base_items` | JSONB decomposed; agent document/folder choices become KB items |
 
 ### V5 Database Structure
 - **`user_db`** — users
 - **`document_db`** — folders, documents, document_processing, chunks, embeddings
-- **`completion_db`** — agents, agent_settings, agent_documents, conversations, messages, message_content_blocks
+- **`completion_db`** — agents, agent_settings, knowledge_bases, knowledge_base_assignments, knowledge_base_items, conversations, messages, message_content_blocks
 - **`migration` schema** — `id_mappings`, `batch_log`, helper functions (`deterministic_uuid_v4`, `get_new_id`, `progress_summary`)
 
 ### UUID Strategy

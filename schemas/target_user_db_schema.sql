@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS public.users (
     metadata JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
     zitadel_user_id VARCHAR(255),
     preferred_language VARCHAR(10),
     organization_id UUID,

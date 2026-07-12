@@ -1,6 +1,6 @@
 # Agent Migration Guide
 
-> **One sentence**: We take the single legacy `playground_bot_generator_config` table and split it into 3 new tables: `agents`, `agent_settings`, and `agent_documents`.
+> **One sentence**: We take the single legacy `playground_bot_generator_config` table and split it into `agents`, `agent_settings`, and the knowledge base tables (`knowledge_bases`, `knowledge_base_assignments`, `knowledge_base_items`).
 
 ---
 
@@ -144,29 +144,27 @@ One settings row per agent (1:1 relationship, enforced by unique constraint on `
 | `follow_up_questions` | `toolkit_settings->'questions_selected'` | Array contains `"Follow-up questions"` |
 | `additional_links` | `additional_links_title->>'is_selected'` | Boolean |
 
-### → `completion_db.public.agent_documents`
+### → `completion_db.public.knowledge_bases` / `knowledge_base_assignments` / `knowledge_base_items`
 
-Junction table linking agents to their knowledge base. Two sources:
+The current V5 schema no longer uses `agent_documents`. Agents with document or folder selections get one knowledge base, one assignment linking it to the agent, and one item per selected document/folder. Two legacy sources are expanded:
 
 **From `docs_chosen[]` (individual documents):**
 
 | Destination Column | Source | Logic |
 |---|---|---|
-| `id` | _(derived)_ | `uuid_generate_v5(namespace, bot_id + '-doc-' + doc_id)` |
-| `agent_id` | _(above)_ | References the agent |
-| `document_id` | `docs_chosen` element | **Looked up** via `migration.get_new_id('documents', old_doc_id)` |
-| `is_active` | _(hardcoded)_ | `true` |
-| `type` | _(hardcoded)_ | `'document'` |
+| `knowledge_bases.id` | _(derived)_ | `deterministic_uuid_v4(namespace, bot_id + '-kb')` |
+| `knowledge_base_assignments.assigned_to_id` | _(above)_ | References the agent |
+| `knowledge_base_items.item_id` | `docs_chosen` element | **Looked up** via `migration.get_new_id('documents', old_doc_id)` |
+| `knowledge_base_items.item_type` | _(hardcoded)_ | `'document'` |
 
 **From `chosen_docs_folders[]` (folders):**
 
 | Destination Column | Source | Logic |
 |---|---|---|
-| `id` | _(derived)_ | `uuid_generate_v5(namespace, bot_id + '-folder-' + folder_id)` |
-| `agent_id` | _(above)_ | References the agent |
-| `document_id` | `chosen_docs_folders` element | **Deterministic UUID**: `uuid_generate_v5(namespace, folder_id::text)` |
-| `is_active` | _(hardcoded)_ | `true` |
-| `type` | _(hardcoded)_ | `'folder'` |
+| `knowledge_bases.id` | _(derived)_ | `deterministic_uuid_v4(namespace, bot_id + '-kb')` |
+| `knowledge_base_assignments.assigned_to_id` | _(above)_ | References the agent |
+| `knowledge_base_items.item_id` | `chosen_docs_folders` element | **Looked up** via `migration.get_new_id('folders', old_folder_id)` |
+| `knowledge_base_items.item_type` | _(hardcoded)_ | `'folder'` |
 
 ### → `legacy_bot_to_agent_mapping` (tracking table)
 
@@ -246,8 +244,8 @@ One row per agent into `completion_db.public.agent_settings` (1:1 relationship).
 
 ---
 
-### Step 4: Insert Agent Documents (from docs_chosen)
-Links agents to individual documents via many-to-many junction table.
+### Step 4: Insert Knowledge Base Items (from docs_chosen)
+Links agents to individual documents through the V5 knowledge base tables.
 
 **Key logic**:
 - `CROSS JOIN LATERAL unnest(COALESCE(docs_chosen, ARRAY[]::varchar[]))` expands array
@@ -256,23 +254,23 @@ Links agents to individual documents via many-to-many junction table.
 - **Empty string check**: `AND TRIM(doc_id_elem) != ''`
 - **Verification**: `AND EXISTS (... FROM migration.id_mappings ...)` confirms document migrated
 - **Idempotency**: Deterministic UUID prevents duplicates
-- Type: `'document'::agent_documents_type_enum`
+- Type: `'document'::knowledge_base_items_item_type_enum`
 
-**SQL**: `INSERT INTO completion_db.public.agent_documents (...) SELECT DISTINCT ... CROSS JOIN LATERAL unnest(...)`
+**SQL**: `INSERT INTO completion_db.public.knowledge_base_items (...) SELECT DISTINCT ... CROSS JOIN LATERAL unnest(...)`
 
 ---
 
-### Step 5: Insert Agent Documents (from chosen_docs_folders)
-Links agents to folders (all documents in folder).
+### Step 5: Insert Knowledge Base Items (from chosen_docs_folders)
+Links agents to folders through the V5 knowledge base tables.
 
 **Key logic**:
 - `CROSS JOIN LATERAL unnest(COALESCE(chosen_docs_folders, ARRAY[]::int4[]))` expands array
-- Folder UUID computed deterministically: `uuid_generate_v5(namespace, folder_id_elem::text)`
-- **Same deterministic logic as folders migration** (consistency)
-- **Verification**: `AND EXISTS (... FROM document_db.public.folders ...)` confirms folder exists
-- Type: `'folder'::agent_documents_type_enum`
+- Folder UUID looked up via `migration.get_new_id('folders', folder_id_elem::text)`
+- **Same mapping logic as folders migration** (consistency)
+- **Verification**: `migration.get_new_id('folders', ...) IS NOT NULL` confirms folder exists
+- Type: `'folder'::knowledge_base_items_item_type_enum`
 
-**SQL**: `INSERT INTO completion_db.public.agent_documents (...) SELECT DISTINCT ... CROSS JOIN LATERAL unnest(...)`
+**SQL**: `INSERT INTO completion_db.public.knowledge_base_items (...) SELECT DISTINCT ... CROSS JOIN LATERAL unnest(...)`
 
 ---
 
@@ -310,8 +308,9 @@ All FKs use the **migration.id_mappings** table for lookups:
 |---|---|---|
 | **agents** | user_id | `migration.get_new_id('users', old_user_id)` via subquery |
 | **agents** | folder_id | Deterministic UUID (same as folders migration) |
-| **agent_documents** | document_id (docs) | `migration.get_new_id('documents', old_doc_id)` via subquery |
-| **agent_documents** | document_id (folders) | Deterministic UUID (verified against folders table) |
+| **knowledge_base_assignments** | assigned_to_id | Deterministic agent UUID |
+| **knowledge_base_items** | item_id (docs) | `migration.get_new_id('documents', old_doc_id)` via subquery |
+| **knowledge_base_items** | item_id (folders) | `migration.get_new_id('folders', old_folder_id)` via subquery |
 
 **Result**: ✅ All FKs point to correct new UUIDs, not old hashes.
 
@@ -381,11 +380,14 @@ WHERE NOT EXISTS (
 SELECT
     m.old_bot_id,
     m.bot_name,
-    COUNT(ad.id) AS linked_docs
+    COUNT(kbi.id) AS linked_items
 FROM legacy_bot_to_agent_mapping m
-LEFT JOIN completion_db.public.agent_documents ad ON ad.agent_id = m.new_agent_id
+LEFT JOIN completion_db.public.knowledge_base_assignments kba
+    ON kba.assigned_to_id = m.new_agent_id
+LEFT JOIN completion_db.public.knowledge_base_items kbi
+    ON kbi.knowledge_base_id = kba.knowledge_base_id
 GROUP BY m.old_bot_id, m.bot_name
-ORDER BY linked_docs DESC
+ORDER BY linked_items DESC
 LIMIT 10;
 ```
 
@@ -395,8 +397,18 @@ LIMIT 10;
 
 ```sql
 -- Delete in reverse FK order
-DELETE FROM completion_db.public.agent_documents
-WHERE agent_id IN (SELECT new_agent_id FROM legacy_bot_to_agent_mapping);
+DELETE FROM completion_db.public.knowledge_base_items
+WHERE knowledge_base_id IN (
+    SELECT knowledge_base_id
+    FROM completion_db.public.knowledge_base_assignments
+    WHERE assigned_to_id IN (SELECT new_agent_id FROM legacy_bot_to_agent_mapping)
+);
+
+DELETE FROM completion_db.public.knowledge_base_assignments
+WHERE assigned_to_id IN (SELECT new_agent_id FROM legacy_bot_to_agent_mapping);
+
+DELETE FROM completion_db.public.knowledge_bases
+WHERE id NOT IN (SELECT knowledge_base_id FROM completion_db.public.knowledge_base_assignments);
 
 DELETE FROM completion_db.public.agent_settings
 WHERE agent_id IN (SELECT new_agent_id FROM legacy_bot_to_agent_mapping);
@@ -456,7 +468,7 @@ WHERE deleted_at IS NULL
 - **Target Database**: `completion_db`
 - **Target Schema**: `public`
 - **Agent Type Enum**: `agents_type_enum` (values: `spark`, `cortex`, `workflow`)
-- **Document Type Enum**: `agent_documents_type_enum` (values: `document`, `folder`)
+- **Knowledge Base Item Type Enum**: `knowledge_base_items_item_type_enum` (values include `document`, `folder`)
 
 ---
 

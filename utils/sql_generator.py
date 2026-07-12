@@ -561,7 +561,6 @@ BEGIN
             metadata,
             created_at,
             updated_at,
-            deleted_at,
             zitadel_user_id,
             organization_id
         ) VALUES (
@@ -574,7 +573,6 @@ BEGIN
             {metadata_sql},
             {created_at_sql},
             now(),
-            NULL,
             NULL,
             '{org_id}'::uuid
         )
@@ -595,7 +593,7 @@ BEGIN
             RAISE NOTICE 'User %: username conflict, using email as username instead', v_email;
             INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
-                metadata, created_at, updated_at, deleted_at, zitadel_user_id,
+                metadata, created_at, updated_at, zitadel_user_id,
                 organization_id
             ) VALUES (
                 v_new_id,
@@ -603,7 +601,7 @@ BEGIN
                 {escape_sql_string(first_name)},
                 {escape_sql_string(last_name)},
                 {escape_sql_string(email)},
-                NULL, {metadata_sql}, {created_at_sql}, now(), NULL, NULL,
+                NULL, {metadata_sql}, {created_at_sql}, now(), NULL,
                 '{org_id}'::uuid
             )
             ON CONFLICT (email) DO UPDATE SET
