@@ -73,6 +73,28 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 
 
+def _ensure_source_config():
+    """Auto-populate source_config from .env if not already in session state."""
+    if "source_config" not in st.session_state:
+        from utils.config import get_env_connection_defaults, get_env_table_prefix
+        defaults = get_env_connection_defaults()
+        if defaults.get("host") and defaults.get("database") and defaults.get("username") and defaults.get("password"):
+            config = ConnectionConfig(
+                host=defaults["host"],
+                port=int(defaults["port"]),
+                database=defaults["database"],
+                username=defaults["username"],
+                password=defaults["password"],
+            )
+            st.session_state["source_config"] = config
+            st.session_state[SessionKeys.SOURCE_CONNECTION] = config.to_dict()
+            if SessionKeys.TABLE_PREFIX not in st.session_state:
+                st.session_state[SessionKeys.TABLE_PREFIX] = get_env_table_prefix()
+
+
+_ensure_source_config()
+
+
 @st.cache_data
 def load_defaults():
     """Load connection defaults from the project .env file."""

@@ -30,18 +30,21 @@ def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None)
     """
     Return a SQL expression that resolves a V4 user hash ID to a V5 user UUID.
 
-    If old_id is present in the overrides dict (user already exists in V5 with
-    a known UUID), the real V5 UUID is embedded directly into the SQL at
-    generation time — no runtime lookup required.
+    Resolution order (evaluated at SQL runtime, not at generation time):
 
-    Otherwise falls back to the deterministic_uuid_v4 formula, which
-    is the standard path for users being migrated fresh.
+    1. **Override path** — if old_id is in the overrides dict the literal V5 UUID
+       is embedded at generation time; no runtime lookup needed.
 
-    This approach avoids cross-database issues: each SQL file runs against a
-    different target DB (user_db / document_db / completion_db) and only has
-    access to its own local migration.id_mappings.  Resolving at generation
-    time means the correct UUID is always embedded regardless of which DB the
-    script runs against.
+    2. **id_mappings path** — checks migration.id_mappings at runtime.
+       Step 01 (users) always inserts a row there for every processed user.
+       For fresh migrations the mapped UUID equals the deterministic value.
+       For pre-existing V5 users the ON CONFLICT path in Step 01 captures their
+       *real* V5 UUID (which may differ from the deterministic one) and stores it
+       in id_mappings — so this lookup returns the correct UUID automatically,
+       with no manual override required.
+
+    3. **Deterministic fallback** — used only when id_mappings has no entry yet
+       (e.g. Steps 06/05 are generated before Step 01 has run).
 
     Args:
         old_id:    V4 legacy hash ID (e.g. 'de0ff05457533c93fdf3e0d1cdd0f808')
@@ -49,12 +52,24 @@ def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None)
 
     Returns:
         SQL expression string, e.g.:
-          "'7a1b2c3d-...'::uuid"                          (override path)
-          "migration.deterministic_uuid_v4('...'::uuid, 'de0ff054...')" (default path)
+          "'7a1b2c3d-...'::uuid"                    (override path)
+          "COALESCE((SELECT new_id FROM migration.id_mappings ...), deterministic_uuid_v4(...))"
     """
     if overrides and old_id and old_id in overrides:
         return f"'{overrides[old_id]}'::uuid"
-    return f"migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(old_id)})"
+    # Check migration.id_mappings first so that pre-existing V5 users (whose UUID
+    # differs from the deterministic value) are resolved to their real UUID.
+    # Step 01 (users) stores the actual V5 UUID there via the ON CONFLICT path.
+    # Falls back to deterministic when no mapping exists (e.g. fresh migrations
+    # or when agents/conversations SQL is generated before Step 01 runs).
+    deterministic = f"migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(old_id)})"
+    return (
+        f"COALESCE("
+        f"(SELECT new_id FROM migration.id_mappings "
+        f"WHERE table_name = 'users' AND old_id = {escape_sql_string(old_id)} LIMIT 1), "
+        f"{deterministic}"
+        f")"
+    )
 
 
 def cleanup_old_migration_files(output_file: str, file_prefix: str):
@@ -539,30 +554,33 @@ DECLARE
     v_old_id VARCHAR := {escape_sql_string(old_id)};
     v_email VARCHAR := {escape_sql_string(email)};
     v_new_id UUID;
+    v_existing_id UUID;
 BEGIN
-    -- Check if already migrated using mapping table (FAST)
+    -- 1. Skip if already migrated in a previous run
     IF migration.is_migrated('users', v_old_id) THEN
         RAISE NOTICE 'User % already migrated (old_id: %)', v_email, v_old_id;
         RETURN;
     END IF;
-    
-    -- Generate deterministic UUID (same namespace+input = same UUID across all databases)
+
+    -- 2. Check if this email already exists in V5 (created outside migration)
+    SELECT id INTO v_existing_id FROM public.users WHERE email = v_email LIMIT 1;
+    IF v_existing_id IS NOT NULL THEN
+        -- Link only — do NOT modify existing user data
+        INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+        VALUES ('users', v_old_id, v_existing_id, 'batch_{{{{TIMESTAMP}}}}',
+                'Linked to pre-existing V5 user (email match, no data overwrite)')
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+        RAISE NOTICE 'User % already exists in V5 (id: %), linked without modification', v_email, v_existing_id;
+        RETURN;
+    END IF;
+
+    -- 3. New user — generate deterministic UUID and INSERT
     v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
-    
-    -- Insert user (handle all unique constraint conflicts)
+
     BEGIN
         INSERT INTO public.users (
-            id,
-            email,
-            first_name,
-            last_name,
-            username,
-            avatar_url,
-            metadata,
-            created_at,
-            updated_at,
-            zitadel_user_id,
-            organization_id
+            id, email, first_name, last_name, username, avatar_url,
+            metadata, created_at, updated_at, zitadel_user_id, organization_id
         ) VALUES (
             v_new_id,
             {escape_sql_string(email)},
@@ -575,26 +593,13 @@ BEGIN
             now(),
             NULL,
             '{org_id}'::uuid
-        )
-        ON CONFLICT (email) DO UPDATE SET
-            first_name = EXCLUDED.first_name,
-            last_name = EXCLUDED.last_name,
-            metadata = EXCLUDED.metadata,
-            updated_at = now()
-        RETURNING id INTO v_new_id;
+        );
     EXCEPTION WHEN unique_violation THEN
-        -- Username conflict — check if this user already exists by email
-        SELECT id INTO v_new_id FROM public.users WHERE email = v_email;
-        IF v_new_id IS NOT NULL THEN
-            RAISE NOTICE 'User % already exists (matched by email), reusing id %', v_email, v_new_id;
-        ELSE
-            -- User doesn't exist yet, username is taken — retry with email as username
-            v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
-            RAISE NOTICE 'User %: username conflict, using email as username instead', v_email;
+        -- Username conflict — use email as username fallback
+        BEGIN
             INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
-                metadata, created_at, updated_at, zitadel_user_id,
-                organization_id
+                metadata, created_at, updated_at, zitadel_user_id, organization_id
             ) VALUES (
                 v_new_id,
                 {escape_sql_string(email)},
@@ -603,31 +608,23 @@ BEGIN
                 {escape_sql_string(email)},
                 NULL, {metadata_sql}, {created_at_sql}, now(), NULL,
                 '{org_id}'::uuid
-            )
-            ON CONFLICT (email) DO UPDATE SET
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                metadata = EXCLUDED.metadata,
-                updated_at = now()
-            RETURNING id INTO v_new_id;
-        END IF;
+            );
+            RAISE NOTICE 'User %: username conflict, used email as username', v_email;
+        EXCEPTION WHEN unique_violation THEN
+            -- Edge case: email conflict appeared between our check and insert
+            SELECT id INTO v_new_id FROM public.users WHERE email = v_email LIMIT 1;
+            IF v_new_id IS NULL THEN
+                RAISE EXCEPTION 'Cannot insert user % — unresolvable unique violation', v_email;
+            END IF;
+            RAISE NOTICE 'User % appeared concurrently in V5, linking to %', v_email, v_new_id;
+        END;
     END;
-    
-    -- Store ID mapping for fast future lookups
-    INSERT INTO migration.id_mappings (
-        table_name,
-        old_id,
-        new_id,
-        migration_batch,
-        notes
-    ) VALUES (
-        'users',
-        v_old_id,
-        v_new_id,
-        'batch_{{{{TIMESTAMP}}}}',
-        'Migrated from V4 users table'
-    );
-    
+
+    -- 4. Store ID mapping
+    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+    VALUES ('users', v_old_id, v_new_id, 'batch_{{{{TIMESTAMP}}}}', 'Migrated from V4 users table')
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+
     RAISE NOTICE 'Migrated user %: % → %', v_email, v_old_id, v_new_id;
 END $$;
 """
@@ -691,17 +688,54 @@ ON CONFLICT (batch_id) DO NOTHING;
         sql_file.write(batch_start)
         
         # Write individual INSERT statements with batch_id substitution
+        expected_old_ids = []
         for _, row in users_df.iterrows():
             sql = generate_user_insert(row, org_id, user_id_overrides)
             if sql:
-                # Replace batch placeholder with actual batch_id
                 sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
                 sql_file.write(sql)
                 sql_file.write('\n')
                 record_count += 1
+                old_id = clean_string(row.get('id'))
+                if old_id:
+                    expected_old_ids.append(old_id)
             else:
                 skipped_count += 1
-        
+
+        # Write validation block
+        if expected_old_ids:
+            ids_array = ", ".join(escape_sql_string(oid) for oid in expected_old_ids)
+            validation = f"""
+-- ============================================================
+-- VALIDATION: verify all expected users have id_mappings entries
+-- ============================================================
+DO $$
+DECLARE
+    v_expected INT := {len(expected_old_ids)};
+    v_mapped INT;
+    v_missing TEXT;
+BEGIN
+    SELECT COUNT(*) INTO v_mapped
+    FROM migration.id_mappings
+    WHERE table_name = 'users'
+      AND old_id IN ({ids_array});
+
+    IF v_mapped = v_expected THEN
+        RAISE NOTICE '[VALIDATION OK] All % users mapped successfully.', v_expected;
+    ELSE
+        SELECT string_agg(oid, ', ') INTO v_missing
+        FROM unnest(ARRAY[{ids_array}]) AS oid
+        WHERE oid NOT IN (
+            SELECT old_id FROM migration.id_mappings WHERE table_name = 'users'
+        );
+        RAISE WARNING '[VALIDATION FAILED] Expected % mappings, found %. Missing: %',
+                      v_expected, v_mapped, v_missing;
+    END IF;
+END $$;
+
+"""
+            sql_file.write(validation)
+
         # Write batch completion and footer
         footer = f"""-- Complete batch tracking
 UPDATE migration.batch_log 
@@ -2084,6 +2118,15 @@ SELECT * FROM (
 WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 
 """)
+                # Track conversations in id_mappings for rollback
+                for conv in conv_batch:
+                    sql_file.write(
+                        f"INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes) "
+                        f"VALUES ('conversations', {escape_sql_string(conv['chat_id'])}, '{conv['chat_id']}'::uuid, "
+                        f"'conversations_batch', 'Migrated conversation') "
+                        f"ON CONFLICT (table_name, old_id) DO NOTHING;\n"
+                    )
+                sql_file.write("\n")
                 conversations_processed += len(conv_batch)
                 
                 # Generate messages and content blocks INSERT
@@ -2292,8 +2335,8 @@ def generate_agent_insert(
     Args:
         row: Pandas Series with playground_bot_generator_config data
         namespace_uuid: Fixed namespace UUID for deterministic IDs
-        merged_instructions: Optional dict {bot_id: merged_instruction_text} from the
-                             prompt merger service; when present, overrides the legacy
+        merged_instructions: Optional dict {bot_id: merged_instruction_text} with
+                             concatenated prompt parts; when present, overrides the legacy
                              character_prompts.content value for the agent's instructions.
         
     Returns:
@@ -2367,7 +2410,7 @@ def generate_agent_insert(
             model = m[:128]
             break
     
-    # Instructions — prefer merged prompt from LLM if available
+    # Instructions — prefer merged (concatenated tone+guardrail+response) if available
     _merged = merged_instructions.get(bot_id) if merged_instructions else None
     if _merged:
         instructions = _merged
@@ -3008,6 +3051,11 @@ BEGIN
         VALUES (v_agent_id, v_conversion_id, {updated_at_sql}, {is_active_val});
         RAISE NOTICE 'agent_conversions link: agent=% conversion=%', v_agent_id, v_conversion_id;
     END IF;
+
+    -- 3. Track in id_mappings for rollback
+    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+    VALUES ('conversions', {escape_sql_string(conv_id_input)}, v_conversion_id, 'conversions_batch', 'Migrated conversion')
+    ON CONFLICT (table_name, old_id) DO NOTHING;
 END $$;
 """)
             rows_processed += 1

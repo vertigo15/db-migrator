@@ -297,3 +297,8 @@ EMBEDDING_MODEL_OPTIONS = [
 def get_env_embedding_model() -> str:
     """Load default embedding model from .env file (DEFAULT_EMBEDDING_MODEL)."""
     return os.getenv("DEFAULT_EMBEDDING_MODEL", "text-embedding-ada-002")
+
+
+def get_env_batch_size() -> int:
+    """Load default user batch size from .env file (DEFAULT_BATCH_SIZE)."""
+    return int(os.getenv("DEFAULT_BATCH_SIZE", "50"))

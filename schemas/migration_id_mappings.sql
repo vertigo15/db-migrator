@@ -51,6 +51,38 @@ CREATE TABLE IF NOT EXISTS migration.batch_log (
     source_info JSONB
 );
 
+-- Migration result tracking tables
+CREATE TABLE IF NOT EXISTS migration.migration_batches (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    status VARCHAR(20) NOT NULL DEFAULT 'running',
+    total_users INTEGER NOT NULL DEFAULT 0,
+    source_info JSONB,
+    notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS migration.migration_user_results (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    batch_id UUID NOT NULL REFERENCES migration.migration_batches(id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    legacy_user_id VARCHAR(255),
+    v5_user_id UUID,
+    result VARCHAR(50) NOT NULL DEFAULT 'pending',
+    failed_step VARCHAR(100),
+    error_message TEXT,
+    steps_completed JSONB DEFAULT '{}'::jsonb,
+    started_at TIMESTAMPTZ DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_results_batch
+    ON migration.migration_user_results(batch_id);
+CREATE INDEX IF NOT EXISTS idx_user_results_email
+    ON migration.migration_user_results(email);
+CREATE INDEX IF NOT EXISTS idx_user_results_result
+    ON migration.migration_user_results(result);
+
 -- Helper function: Get new ID from old ID
 CREATE OR REPLACE FUNCTION migration.get_new_id(
     p_table_name VARCHAR,

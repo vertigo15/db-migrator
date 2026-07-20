@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS public.users (
     preferred_language VARCHAR(10),
     organization_id UUID,
 
-    CONSTRAINT uq_username UNIQUE (username)
+    CONSTRAINT uq_username UNIQUE (username),
+    CONSTRAINT uq_email UNIQUE (email)
 );
 
 -- Create indexes

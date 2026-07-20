@@ -9,12 +9,9 @@ Features:
 - CSV preview and download
 """
 import os
-import sys
 import json
-import importlib.util
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
-from typing import Optional, Tuple
+from typing import Optional
 import streamlit as st
 import pandas as pd
 
@@ -23,7 +20,7 @@ from utils.storage import (
     save_selected_users, load_selected_users,
     save_document_filters, load_document_filters
 )
-from utils.config import SessionKeys, get_table_name, get_env_org_id, get_env_embedding_model, get_env_target_defaults, EMBEDDING_MODEL_OPTIONS
+from utils.config import SessionKeys, get_table_name, get_env_org_id, get_env_embedding_model, get_env_target_defaults, get_env_batch_size, EMBEDDING_MODEL_OPTIONS
 from utils.db import test_connection
 from utils.extraction import (
     ExtractionEngine,
@@ -39,6 +36,109 @@ st.title("📋 Select Data to Migrate")
 # Output directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(BASE_DIR, "output", "extract")
+
+
+def _record_migration_batch(user_emails: list, results: dict, source_config: ConnectionConfig):
+    """Write a migration batch record and per-user results to target DB tracking tables."""
+    from utils.db import get_connection
+    target_defaults = get_env_target_defaults()
+    try:
+        target_config = ConnectionConfig(
+            host=target_defaults["host"],
+            port=int(target_defaults["port"]),
+            database=target_defaults["database"],
+            username=target_defaults["username"],
+            password=target_defaults["password"],
+        )
+        conn = get_connection(target_config)
+        conn.autocommit = True
+        cursor = conn.cursor()
+
+        # Ensure tables exist
+        cursor.execute("""
+            CREATE SCHEMA IF NOT EXISTS migration;
+            CREATE TABLE IF NOT EXISTS migration.migration_batches (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                completed_at TIMESTAMPTZ,
+                status VARCHAR(20) NOT NULL DEFAULT 'running',
+                total_users INTEGER NOT NULL DEFAULT 0,
+                source_info JSONB,
+                notes TEXT
+            );
+            CREATE TABLE IF NOT EXISTS migration.migration_user_results (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                batch_id UUID NOT NULL REFERENCES migration.migration_batches(id) ON DELETE CASCADE,
+                email VARCHAR(255) NOT NULL,
+                legacy_user_id VARCHAR(255),
+                v5_user_id UUID,
+                result VARCHAR(50) NOT NULL DEFAULT 'pending',
+                failed_step VARCHAR(100),
+                error_message TEXT,
+                steps_completed JSONB DEFAULT '{}'::jsonb,
+                started_at TIMESTAMPTZ DEFAULT now(),
+                completed_at TIMESTAMPTZ
+            );
+            ALTER TABLE migration.migration_user_results
+                ADD COLUMN IF NOT EXISTS steps_completed JSONB DEFAULT '{}'::jsonb;
+        """)
+
+        source_info = json.dumps({
+            "host": source_config.host,
+            "port": source_config.port,
+            "database": source_config.database,
+        })
+
+        has_errors = bool(results.get("errors"))
+        status = "extraction_failed" if has_errors else "extracted"
+
+        cursor.execute("""
+            INSERT INTO migration.migration_batches (started_at, status, total_users, source_info)
+            VALUES (now(), %s, %s, %s::jsonb)
+            RETURNING id
+        """, (status, len(user_emails), source_info))
+        batch_id = cursor.fetchone()[0]
+
+        for email in user_emails:
+            cursor.execute("""
+                INSERT INTO migration.migration_user_results
+                    (batch_id, email, result, started_at)
+                VALUES (%s, %s, 'pending', now())
+            """, (batch_id, email))
+
+        cursor.close()
+        conn.close()
+
+        st.session_state["_current_batch_id"] = str(batch_id)
+        st.session_state["_current_batch_emails"] = user_emails
+    except Exception:
+        pass
+
+
+def _get_already_migrated_emails() -> set:
+    """Query target DB for emails that were already successfully migrated."""
+    from utils.db import get_connection
+    target_defaults = get_env_target_defaults()
+    try:
+        target_config = ConnectionConfig(
+            host=target_defaults["host"],
+            port=int(target_defaults["port"]),
+            database=target_defaults["database"],
+            username=target_defaults["username"],
+            password=target_defaults["password"],
+        )
+        conn = get_connection(target_config)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT email FROM migration.migration_user_results
+            WHERE result = 'success'
+        """)
+        emails = {row[0] for row in cursor.fetchall()}
+        cursor.close()
+        conn.close()
+        return emails
+    except Exception:
+        return set()
 
 
 def _source_scope_key(config: ConnectionConfig, prefix: str) -> str:
@@ -175,36 +275,84 @@ def convert_timestamp_to_datetime(ts):
 
 
 def check_connection():
-    """Check if source connection is available."""
+    """Check if source connection is available. Auto-loads from .env if needed."""
     if "source_config" not in st.session_state:
-        st.warning("⚠️ Please connect to the source database first.")
-        st.page_link("pages/1_connect.py", label="Go to Connect Page", icon="🔌")
-        return False
+        from utils.config import get_env_connection_defaults, get_env_table_prefix
+        defaults = get_env_connection_defaults()
+        if defaults.get("host") and defaults.get("database") and defaults.get("username"):
+            config = ConnectionConfig(
+                host=defaults["host"],
+                port=int(defaults["port"]),
+                database=defaults["database"],
+                username=defaults["username"],
+                password=defaults.get("password", ""),
+            )
+            st.session_state["source_config"] = config
+            st.session_state[SessionKeys.SOURCE_CONNECTION] = config.to_dict()
+            if SessionKeys.TABLE_PREFIX not in st.session_state:
+                st.session_state[SessionKeys.TABLE_PREFIX] = get_env_table_prefix()
+        else:
+            st.warning("⚠️ Please connect to the source database first.")
+            st.page_link("pages/1_connect.py", label="Go to Connect Page", icon="🔌")
+            return False
     return True
 
 
 def load_users_data(config: ConnectionConfig, prefix: str) -> pd.DataFrame:
-    """Load users from the source database."""
+    """Load users from the source database with document and agent counts."""
     table_name = get_table_name("users", prefix)
+    docs_table = get_table_name("custom_documents", prefix)
     query = f"""
-        SELECT id, name, email, company_name, created_at, last_connected
-        FROM public.{table_name}
-        ORDER BY email
+        SELECT u.id, u.name, u.email, u.company_name, u.created_at, u.last_connected,
+               COALESCE(d.doc_count, 0) AS doc_count,
+               COALESCE(a.agent_count, 0) AS agent_count
+        FROM public.{table_name} u
+        LEFT JOIN (
+            SELECT owner_id, COUNT(*) AS doc_count
+            FROM public.{docs_table}
+            GROUP BY owner_id
+        ) d ON d.owner_id = u.id
+        LEFT JOIN (
+            SELECT user_id, COUNT(*) AS agent_count
+            FROM public.playground_bot_generator_config
+            WHERE deleted_at IS NULL
+            GROUP BY user_id
+        ) a ON a.user_id = u.id
+        ORDER BY doc_count DESC, agent_count DESC, u.email
     """
     df = execute_query(config, query)
-    
-    # Convert timestamp columns to datetime
+
     if not df.empty:
         if 'created_at' in df.columns:
             df['created_at'] = pd.to_datetime(df['created_at'], unit='s', errors='coerce')
         if 'last_connected' in df.columns:
             df['last_connected'] = pd.to_datetime(df['last_connected'], unit='s', errors='coerce')
-    
+
     return df
 
 
+def _load_saved_emails() -> list:
+    """Load saved emails from session_state (primary) or localStorage (fallback)."""
+    ss_key = "_p2_saved_user_emails"
+    if ss_key in st.session_state:
+        return st.session_state[ss_key]
+    loaded = load_selected_users()
+    if isinstance(loaded, list):
+        emails = [e for e in loaded if isinstance(e, str)]
+        st.session_state[ss_key] = emails
+        return emails
+    st.session_state[ss_key] = []
+    return []
+
+
+def _persist_saved_emails(emails: list):
+    """Persist emails to session_state (immediate) and localStorage (async)."""
+    st.session_state["_p2_saved_user_emails"] = emails
+    save_selected_users(emails)
+
+
 def render_user_selection(config: ConnectionConfig, prefix: str):
-    """Render the user selection section."""
+    """Render the user selection section with sorting, batch select, and file import."""
     st.subheader("👥 Select Users")
 
     _usk = _source_scope_key(config, prefix)
@@ -215,86 +363,190 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
         st.session_state["_p2_users_df"] = users_df
     else:
         users_df = st.session_state["_p2_users_df"]
-    
+
     if users_df.empty:
         st.warning("No users found in the database.")
         return
-    
+
     st.caption(f"Found {len(users_df)} users in `{get_table_name('users', prefix)}`")
-    
-    # Load previously selected users from localStorage
-    saved_emails = load_selected_users()
-    if not isinstance(saved_emails, list):
-        saved_emails = []
-    else:
-        saved_emails = [e for e in saved_emails if isinstance(e, str)]
-    
-    # Select all checkbox
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        select_all = st.checkbox("Select All", value=False)
-    
-    # Search filter
-    with col2:
-        search = st.text_input("🔍 Search users", placeholder="Search by name or email...")
-    
-    # Filter dataframe
+
+    # Load previously selected users
+    saved_emails = _load_saved_emails()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SECTION 1: Filters
+    # ─────────────────────────────────────────────────────────────────────────
+    with st.expander("Filters", expanded=True):
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            email_filter = st.text_input(
+                "Email filter (whitelist)",
+                placeholder="e.g. @company.co.il",
+                help="Show only users whose email contains this text.",
+                key="_p2_email_whitelist",
+            )
+        with f_col2:
+            search = st.text_input("Search", placeholder="Search by name, email, or company...")
+
+        sort_options = {
+            "Documents (desc)": ("doc_count", False),
+            "Agents (desc)": ("agent_count", False),
+            "Email (A-Z)": ("email", True),
+            "Created (newest)": ("created_at", False),
+        }
+        sort_label = st.selectbox("Sort by", list(sort_options.keys()), index=0)
+
+    # Apply email whitelist filter
+    if email_filter:
+        users_df = users_df[users_df["email"].str.contains(email_filter, case=False, na=False)].copy()
+
+    # Apply search filter
     if search:
         mask = (
             users_df["name"].str.contains(search, case=False, na=False) |
             users_df["email"].str.contains(search, case=False, na=False) |
             users_df["company_name"].str.contains(search, case=False, na=False)
         )
-        filtered_df = users_df[mask].copy()
-    else:
-        filtered_df = users_df.copy()
-    
-    # Add selection column
+        users_df = users_df[mask].copy()
+
+    # Apply sort
+    sort_col, sort_asc = sort_options[sort_label]
+    filtered_df = users_df.sort_values(by=sort_col, ascending=sort_asc, na_position="last").reset_index(drop=True)
+
+    if email_filter or search:
+        st.caption(f"Showing {len(filtered_df)} users after filters")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SECTION 2: Bulk Selection Tools
+    # ─────────────────────────────────────────────────────────────────────────
+    with st.expander("Bulk Selection Tools", expanded=False):
+        tab_batch, tab_paste, tab_file = st.tabs(["Next Batch", "Paste Emails", "Import File"])
+
+        with tab_batch:
+            b_col1, b_col2 = st.columns([2, 3])
+            with b_col1:
+                batch_size = st.number_input(
+                    "Batch size", min_value=1, value=get_env_batch_size(), step=10, key="_p2_batch_size"
+                )
+            with b_col2:
+                st.write("")
+                if st.button("Select Next Batch", type="primary"):
+                    already_migrated = _get_already_migrated_emails()
+                    new_selection = []
+                    count = 0
+                    for email in filtered_df["email"].tolist():
+                        if count >= int(batch_size):
+                            break
+                        if email not in already_migrated:
+                            new_selection.append(email)
+                            count += 1
+                    st.session_state["_p2_batch_saved_emails"] = new_selection
+                    st.rerun()
+
+        with tab_paste:
+            pasted = st.text_area(
+                "Paste emails (one per line or comma-separated)",
+                placeholder="user1@example.com\nuser2@example.com",
+                height=120,
+                key="_p2_paste_emails",
+            )
+            if st.button("Apply Pasted Emails"):
+                if pasted.strip():
+                    raw_emails = [e.strip().lower() for e in pasted.replace(",", "\n").split("\n") if e.strip()]
+                    existing_lower = set(users_df["email"].str.lower())
+                    matched = [e for e in raw_emails if e in existing_lower]
+                    unmatched = [e for e in raw_emails if e not in existing_lower]
+                    original_case = users_df[users_df["email"].str.lower().isin(matched)]["email"].tolist()
+                    saved_emails = list(set(saved_emails + original_case))
+                    st.session_state["_p2_batch_saved_emails"] = saved_emails
+                    if unmatched:
+                        st.warning(f"{len(unmatched)} emails not found in source DB: {', '.join(unmatched[:5])}{'...' if len(unmatched) > 5 else ''}")
+                    st.rerun()
+
+        with tab_file:
+            uploaded_file = st.file_uploader(
+                "Upload CSV/Excel with an 'email' column",
+                type=["csv", "xlsx"],
+                key="_p2_user_upload",
+            )
+            if uploaded_file is not None:
+                try:
+                    if uploaded_file.name.endswith(".xlsx"):
+                        import openpyxl  # noqa: F401
+                        upload_df = pd.read_excel(uploaded_file)
+                    else:
+                        upload_df = pd.read_csv(uploaded_file)
+                    col_map = {c.lower().strip(): c for c in upload_df.columns}
+                    if "email" not in col_map:
+                        st.error("File must contain an 'email' column.")
+                    else:
+                        uploaded_emails = upload_df[col_map["email"]].dropna().str.strip().str.lower().tolist()
+                        existing_lower = set(users_df["email"].str.lower())
+                        matched = [e for e in uploaded_emails if e in existing_lower]
+                        unmatched = [e for e in uploaded_emails if e not in existing_lower]
+                        original_case = users_df[users_df["email"].str.lower().isin(matched)]["email"].tolist()
+                        saved_emails = list(set(saved_emails + original_case))
+                        st.session_state["_p2_batch_saved_emails"] = saved_emails
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Matched", len(matched))
+                        c2.metric("Unmatched", len(unmatched))
+                        c3.metric("Total in file", len(uploaded_emails))
+                        if unmatched:
+                            with st.expander("Unmatched emails"):
+                                st.write(unmatched)
+                except Exception as e:
+                    st.error(f"Error reading file: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Apply pending batch selection
+    # ─────────────────────────────────────────────────────────────────────────
+    if "_p2_batch_saved_emails" in st.session_state:
+        saved_emails = st.session_state.pop("_p2_batch_saved_emails")
+        st.session_state["_p2_saved_user_emails"] = saved_emails
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SECTION 3: User Table
+    # ─────────────────────────────────────────────────────────────────────────
+    select_all = st.checkbox("Select All", value=False)
+
     if select_all:
         filtered_df["selected"] = True
     else:
         filtered_df["selected"] = filtered_df["email"].isin(saved_emails)
-    
-    # Reorder columns
-    display_cols = ["selected", "name", "email", "company_name", "created_at", "last_connected"]
+
+    display_cols = ["selected", "name", "email", "company_name", "doc_count", "agent_count", "created_at", "last_connected"]
     filtered_df = filtered_df[display_cols]
-    
-    # Display editable dataframe
+
     edited_df = st.data_editor(
         filtered_df,
         column_config={
-            "selected": st.column_config.CheckboxColumn(
-                "Select",
-                help="Select users to migrate",
-                default=False
-            ),
+            "selected": st.column_config.CheckboxColumn("Select", help="Select users to migrate", default=False),
             "name": st.column_config.TextColumn("Name"),
             "email": st.column_config.TextColumn("Email"),
             "company_name": st.column_config.TextColumn("Company"),
+            "doc_count": st.column_config.NumberColumn("Docs", help="Number of documents owned"),
+            "agent_count": st.column_config.NumberColumn("Agents", help="Number of active agents"),
             "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
             "last_connected": st.column_config.DatetimeColumn("Last Connected", format="YYYY-MM-DD"),
         },
         hide_index=True,
         use_container_width=True,
-        height=400
+        height=400,
     )
-    
-    # Get selected emails
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SECTION 4: Persist selection
+    # ─────────────────────────────────────────────────────────────────────────
     selected_emails = edited_df[edited_df["selected"] == True]["email"].tolist()
-    
-    # Store selection
+
     st.session_state[SessionKeys.SELECTED_USERS] = selected_emails
-    
-    # Get selected user IDs
     selected_user_ids = users_df[users_df["email"].isin(selected_emails)]["id"].tolist()
     st.session_state[SessionKeys.SELECTED_USER_IDS] = selected_user_ids
-    
-    # Auto-save selection (no button needed)
-    save_selected_users(selected_emails)
-    
-    # Selection summary
+
+    _persist_saved_emails(selected_emails)
+
     st.metric("Selected Users", len(selected_emails))
-    
+
     return selected_emails, selected_user_ids
 
 def render_document_filters(config: ConnectionConfig, prefix: str, user_ids: list):
@@ -449,7 +701,8 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
             filtered_df["selected"] = filtered_df["doc_id"].isin(previous)
         else:
             filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "doc_id", "owner_id", "doc_title", "doc_name_origin", "doc_size", "created_at", "folder_id", "doc_type"]]
+    filtered_df["doc_name"] = filtered_df["doc_title"].fillna("").where(filtered_df["doc_title"].str.strip().ne(""), filtered_df["doc_name_origin"])
+    filtered_df = filtered_df[["selected", "doc_name", "doc_id", "owner_id", "doc_size", "created_at", "folder_id", "doc_type"]]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,
@@ -457,6 +710,7 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
         height=350,
         column_config={
             "selected": st.column_config.CheckboxColumn("Select", default=True),
+            "doc_name": st.column_config.TextColumn("Name"),
             "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
         },
         key="documents_editor",
@@ -733,7 +987,9 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     agents_table = get_table_name("agents", prefix)
     placeholders = ", ".join(["%s"] * len(user_ids))
     query = f"""
-        SELECT bot_id, user_id, folder_id, created_at,
+        SELECT bot_id, user_id,
+               bot_data->>'bot_name' AS agent_name,
+               folder_id, created_at,
                COALESCE(array_length(docs_chosen, 1), 0) AS docs,
                COALESCE(array_length(chosen_docs_folders, 1), 0) AS folders,
                array_to_string(docs_chosen, ', ') AS doc_ids
@@ -756,12 +1012,13 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         st.info("No agents found for selected users.")
         st.session_state["selected_agent_ids"] = []
         return []
-    search = st.text_input("🔍 Search agents", placeholder="Search by bot_id/user_id/folder_id...", key="agent_search")
+    search = st.text_input("🔍 Search agents", placeholder="Search by name/bot_id/user_id...", key="agent_search")
     filtered_df = agents_df.copy()
     if search:
         mask = (
             filtered_df["bot_id"].astype(str).str.contains(search, case=False, na=False)
             | filtered_df["user_id"].astype(str).str.contains(search, case=False, na=False)
+            | filtered_df["agent_name"].astype(str).str.contains(search, case=False, na=False)
             | filtered_df["folder_id"].astype(str).str.contains(search, case=False, na=False)
         )
         filtered_df = filtered_df[mask]
@@ -774,13 +1031,16 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
             filtered_df["selected"] = filtered_df["bot_id"].isin(previous)
         else:
             filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
+    filtered_df = filtered_df[["selected", "agent_name", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,
         use_container_width=True,
         height=320,
-        column_config={"created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD")},
+        column_config={
+            "agent_name": st.column_config.TextColumn("Name"),
+            "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
+        },
         key="agents_editor",
     )
     selected_agent_ids = edited_df[edited_df["selected"] == True]["bot_id"].astype(str).tolist()
@@ -789,550 +1049,10 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     return selected_agent_ids
 
 
-PROMPT_MERGER_DIR = os.path.join(BASE_DIR, "prompt-merger")
-PROMPTS_MODULE_PATH = os.path.join(PROMPT_MERGER_DIR, "prompts.py")
 
 
-def _load_prompt_constants():
-    """Load prompt merger constants from prompt-merger/prompts.py."""
-    spec = importlib.util.spec_from_file_location("prompt_merger_prompts", PROMPTS_MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
-def _get_prompt_merger_modules():
-    """Lazily add prompt-merger/ to sys.path and import its modules."""
-    if PROMPT_MERGER_DIR not in sys.path:
-        sys.path.insert(0, PROMPT_MERGER_DIR)
-    from llm_client import LLMClient  # noqa: PLC0415
-    from prompt_builder import (  # noqa: PLC0415
-        build_system_message, build_user_message,
-        build_fallback, build_template_only,
-    )
-    return LLMClient, build_system_message, build_user_message, build_fallback, build_template_only
-
-
-def _run_batch_merge_direct(
-    merge_requests: list,
-    company_name: str,
-    template_text: str,
-    llm_override: dict,
-) -> dict:
-    """Run prompt merging in-process using LLMClient (no HTTP)."""
-    LLMClient, build_system_message, build_user_message, build_fallback, build_template_only = (
-        _get_prompt_merger_modules()
-    )
-
-    override = llm_override or {}
-    client = LLMClient(
-        base_url=override.get("base_url") or None,
-        model=override.get("model") or None,
-        api_key=override.get("api_key") or None,
-    )
-    tpl = template_text or None
-
-    def _merge_one(req: dict) -> dict:
-        tone, guardrail, response = req.get("tone"), req.get("guardrail"), req.get("response")
-        has_content = any(v and v.strip() for v in (tone, guardrail, response) if v)
-        if not has_content:
-            return {
-                "bot_id": req["bot_id"],
-                "merged_instruction": build_template_only(company_name, tpl),
-                "status": "template_only",
-                "error_message": None,
-            }
-        system = build_system_message(company_name, tpl)
-        user = build_user_message(tone, guardrail, response)
-        try:
-            merged = client.chat(system, user)
-            return {"bot_id": req["bot_id"], "merged_instruction": merged, "status": "ok", "error_message": None}
-        except Exception as exc:
-            fallback = build_fallback(tone, guardrail, response)
-            return {"bot_id": req["bot_id"], "merged_instruction": fallback, "status": "fallback", "error_message": str(exc)}
-
-    max_workers = max(1, min(int(os.getenv("PROMPT_MERGER_MAX_WORKERS", "4")), len(merge_requests)))
-    results: list = [None] * len(merge_requests)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(_merge_one, req): i for i, req in enumerate(merge_requests)}
-        for future in as_completed(future_map):
-            results[future_map[future]] = future.result()
-    return {"results": [r for r in results if r is not None]}
-
-
-def _load_template_prompt() -> str:
-    """Load the template prompt shown to users and sent to the prompt merger."""
-    try:
-        return _load_prompt_constants().TEMPLATE_PROMPT
-    except Exception:
-        return ""
-
-
-def _load_no_doc_prompt_defaults() -> Tuple[str, str]:
-    """Load default prompt constants used for no-document agents."""
-    try:
-        constants = _load_prompt_constants()
-        return (
-            getattr(constants, "V4_NO_DOC_DEFAULT_TEMPLATE", ""),
-            getattr(constants, "V5_CORTEX_DEFAULT_RESPONSE_INSTRUCTIONS", ""),
-        )
-    except Exception:
-        return "", ""
-
-
-def _load_company_name_options() -> list:
-    """Load company name options used by the prompt merger UI."""
-    try:
-        return list(_load_prompt_constants().COMPANY_NAME_OPTIONS)
-    except Exception:
-        return ["IAI", "Isracard", "Maccabi"]
-
-
-def _text_or_empty(value) -> str:
-    return value if isinstance(value, str) and value.strip() else ""
-
-
-def _normalize_prompt_for_compare(value: Optional[str]) -> str:
-    """Normalize only storage noise, not meaningful user edits."""
-    return (value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-
-
-def _array_has_values(value) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, (list, tuple, set)):
-        return any(str(item).strip() for item in value if item is not None)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped or stripped in ("{}", "[]"):
-            return False
-        if stripped.startswith("{") and stripped.endswith("}"):
-            return any(part.strip().strip('"') for part in stripped.strip("{}").split(","))
-        return True
-    try:
-        is_na = pd.isna(value)
-        if isinstance(is_na, bool) and is_na:
-            return False
-    except Exception:
-        pass
-    return bool(value)
-
-
-def _has_agent_knowledge(docs_chosen, chosen_docs_folders) -> bool:
-    return _array_has_values(docs_chosen) or _array_has_values(chosen_docs_folders)
-
-
-def _resolve_no_doc_instruction(
-    tone: Optional[str],
-    v4_default_template: str,
-    v5_default_instructions: str,
-) -> Tuple[str, str]:
-    tone_text = _text_or_empty(tone)
-    if (
-        tone_text
-        and _normalize_prompt_for_compare(tone_text)
-        != _normalize_prompt_for_compare(v4_default_template)
-    ):
-        return tone_text.strip(), "v4_user_prompt"
-    return v5_default_instructions.strip(), "v5_default_response_instructions"
-
-
-def _build_prompt_merge_routes(
-    agent_ids: list,
-    prompt_parts: dict,
-    v4_default_template: str,
-    v5_default_instructions: str,
-) -> Tuple[list, list]:
-    """Split selected agents into LLM merge requests and local no-doc results."""
-    merge_requests = []
-    local_results = []
-    for bot_id in agent_ids:
-        parts = prompt_parts.get(bot_id, {})
-        if parts.get("has_knowledge"):
-            merge_requests.append({
-                "bot_id": bot_id,
-                "tone": parts.get("tone"),
-                "guardrail": parts.get("guardrail"),
-                "response": parts.get("response"),
-            })
-        else:
-            merged_instruction, status = _resolve_no_doc_instruction(
-                parts.get("tone"),
-                v4_default_template,
-                v5_default_instructions,
-            )
-            local_results.append({
-                "bot_id": bot_id,
-                "merged_instruction": merged_instruction,
-                "status": status,
-                "error_message": None,
-                "sent_to_llm": False,
-            })
-    return merge_requests, local_results
-
-
-def render_merged_prompt_review():
-    """Show what was extracted, the template, and the final merged prompt per agent."""
-    review_items = st.session_state.get("merged_prompt_review") or []
-    if not review_items:
-        return
-
-    st.markdown("#### 👁️ Review Prompt Merge Results")
-    st.caption(
-        "Review the extracted V4 prompt parts, the routing decision, "
-        "and the final prompt that will be injected into SQL generation."
-    )
-
-    summary_df = pd.DataFrame([
-        {
-            "agent_name": item.get("agent_name") or item.get("bot_id"),
-            "has_documents": bool(item.get("has_knowledge")),
-            "sent_to_llm": bool(item.get("sent_to_llm")),
-        }
-        for item in review_items
-    ])
-    st.dataframe(summary_df, hide_index=True, use_container_width=True)
-
-    bot_ids = [item["bot_id"] for item in review_items]
-    agent_labels = {
-        item["bot_id"]: item.get("agent_name") or item["bot_id"]
-        for item in review_items
-    }
-    selected_bot_id = st.selectbox(
-        "Agent to review",
-        options=bot_ids,
-        format_func=lambda bot_id: agent_labels.get(bot_id, bot_id),
-        key="merged_prompt_review_agent",
-    )
-    selected = next(item for item in review_items if item["bot_id"] == selected_bot_id)
-
-    status = selected.get("status", "unknown")
-    if status == "ok":
-        st.success("This merged prompt came from the LLM and is ready for SQL generation.")
-    elif status == "template_only":
-        st.info("This agent had no prompt parts, so the company-injected template will be used.")
-    elif status == "v4_user_prompt":
-        st.info("This no-document agent used its customized V4 tone prompt directly, without an LLM call.")
-    elif status == "v5_default_response_instructions":
-        st.info("This no-document agent kept the V4 default template, so the V5 Cortex default instructions will be used.")
-    elif status == "fallback":
-        st.warning(
-            "The LLM call failed for this agent. The fallback concatenation will be injected "
-            "unless you rerun the merge successfully."
-        )
-        if selected.get("error_message"):
-            st.caption(selected["error_message"])
-
-    extracted_tab, template_tab, merged_tab = st.tabs([
-        "Extracted V4 Parts",
-        "Template",
-        "New V5 Prompt",
-    ])
-    with extracted_tab:
-        st.text_area("Tone", value=selected.get("tone") or "(not provided)", height=180, disabled=True)
-        st.text_area("Guardrail", value=selected.get("guardrail") or "(not provided)", height=180, disabled=True)
-        st.text_area("Response", value=selected.get("response") or "(not provided)", height=180, disabled=True)
-    with template_tab:
-        st.text_area(
-            "Template / local default reference",
-            value=selected.get("template") or "(template not available)",
-            height=420,
-            disabled=True,
-        )
-    with merged_tab:
-        st.text_area(
-            "New prompt injected during SQL generation",
-            value=selected.get("merged_instruction") or "(no merged prompt returned)",
-            height=520,
-            disabled=True,
-        )
-
-
-def _extract_prompt_parts(config: ConnectionConfig, prefix: str, bot_ids: list) -> dict:
-    """Fetch prompt parts and attached-knowledge flags for each agent from source DB.
-
-    Returns {bot_id: {"tone": ..., "guardrail": ..., "response": ..., "has_knowledge": ...}}
-    """
-    if not bot_ids:
-        return {}
-
-    agents_table = get_table_name("agents", prefix)
-    placeholders = ", ".join(["%s"] * len(bot_ids))
-    query = f"""
-        SELECT bot_id, bot_data, character_prompts, hack_prompt, relevant_answer_prompt,
-               docs_chosen, chosen_docs_folders
-        FROM public.{agents_table}
-        WHERE bot_id IN ({placeholders})
-    """
-    df = execute_query(config, query, tuple(bot_ids))
-    result = {}
-    for _, row in df.iterrows():
-        bid = str(row.get("bot_id", ""))
-
-        def _get_content(col_val):
-            if col_val is None:
-                return None
-            if isinstance(col_val, str):
-                try:
-                    col_val = json.loads(col_val)
-                except Exception:
-                    return col_val.strip() or None
-            if isinstance(col_val, dict):
-                return (col_val.get("content") or "").strip() or None
-            return None
-
-        def _get_bot_name(col_val):
-            if col_val is None:
-                return None
-            if isinstance(col_val, str):
-                try:
-                    col_val = json.loads(col_val)
-                except Exception:
-                    return None
-            if isinstance(col_val, dict):
-                return (col_val.get("bot_name") or "").strip() or None
-            return None
-
-        result[bid] = {
-            "agent_name": _get_bot_name(row.get("bot_data")),
-            "tone": _get_content(row.get("character_prompts")),
-            "guardrail": _get_content(row.get("hack_prompt")),
-            "response": _get_content(row.get("relevant_answer_prompt")),
-            "has_knowledge": _has_agent_knowledge(
-                row.get("docs_chosen"),
-                row.get("chosen_docs_folders"),
-            ),
-        }
-    return result
-
-
-def _init_llm_session_state():
-    """Initialize LLM config in session state from environment defaults."""
-    if "llm_base_url" not in st.session_state:
-        st.session_state["llm_base_url"] = os.getenv("LLM_BASE_URL", "")
-    if "llm_model" not in st.session_state:
-        st.session_state["llm_model"] = os.getenv("LLM_MODEL", "")
-    if "llm_api_key" not in st.session_state:
-        st.session_state["llm_api_key"] = os.getenv("LLM_API_KEY", "")
-
-
-def _llm_base_url_error(base_url: str) -> Optional[str]:
-    """Return a user-facing error if Base URL format is invalid, else None."""
-    url = (base_url or "").strip()
-    if not url:
-        return "Base URL is required."
-    if url.rstrip("/").lower().endswith("/chat/completions"):
-        suggested = url.rstrip("/")[: -len("/chat/completions")].rstrip("/") or "https://host/v1"
-        return (
-            "Base URL should end with /v1, not /chat/completions. "
-            f"Use the API root instead, e.g. `{suggested}`"
-        )
-    return None
-
-
-def _render_llm_config_panel():
-    """Render the LLM configuration expander and return override dict (or None)."""
-    _init_llm_session_state()
-
-    with st.expander("⚙️ LLM Connection", expanded=False):
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            base_url = st.text_input(
-                "Base URL",
-                value=st.session_state["llm_base_url"],
-                key="llm_base_url_input",
-                help="OpenAI-compatible API root ending in /v1 (not /v1/chat/completions).",
-            )
-        with c2:
-            model = st.text_input(
-                "Model ID",
-                value=st.session_state["llm_model"],
-                key="llm_model_input",
-                help="Model identifier, e.g. openai/gpt-oss-120b",
-            )
-        api_key = st.text_input(
-            "API Key",
-            value=st.session_state["llm_api_key"],
-            type="password",
-            key="llm_api_key_input",
-            help="Bearer token for the LLM endpoint (leave empty if not required).",
-        )
-
-        st.session_state["llm_base_url"] = base_url
-        st.session_state["llm_model"] = model
-        st.session_state["llm_api_key"] = api_key
-
-        base_url_error = _llm_base_url_error(base_url)
-        if base_url_error:
-            st.warning(base_url_error)
-
-        test_col, status_col = st.columns([1, 3])
-        with test_col:
-            test_pressed = st.button("Test LLM", key="test_llm_btn")
-        if test_pressed:
-            with status_col:
-                if base_url_error:
-                    st.error(base_url_error)
-                elif not (model or "").strip():
-                    st.error("Model ID is required.")
-                else:
-                    with st.spinner("Checking..."):
-                        try:
-                            LLMClient, *_ = _get_prompt_merger_modules()
-                            client = LLMClient(
-                                base_url=base_url or None,
-                                model=model or None,
-                                api_key=api_key or None,
-                            )
-                            info = client.readiness()
-                            preview = (info.get("response_preview") or "").strip()
-                            preview_note = f", reply: `{preview[:40]}`" if preview else ""
-                            st.success(
-                                f"LLM OK — provider: **{info.get('provider')}**, "
-                                f"model: **{info.get('model')}**, "
-                                f"url: `{info.get('base_url', '')[:60]}`{preview_note}"
-                            )
-                        except ValueError as exc:
-                            st.error(str(exc))
-                        except Exception as exc:
-                            st.error(f"LLM check failed: {exc}")
-
-    return {"base_url": base_url or None, "model": model or None, "api_key": api_key or None}
-
-
-def render_prompt_merger_section(config: ConnectionConfig, prefix: str, agent_ids: list):
-    """Render the prompt merger UI: company selector + merge button + progress."""
-    st.markdown("---")
-    st.subheader("🔀 Merge Agent Prompts (V4 → V5)")
-    st.caption(
-        "Knowledge agents are merged from Tone, Guardrail, and Response using the on-prem LLM. "
-        "No-document agents are handled locally and are not sent to the LLM."
-    )
-
-    llm_override = _render_llm_config_panel()
-
-    if not agent_ids:
-        st.info("Select agents above to enable prompt merging.")
-        return
-
-    col1, col2 = st.columns([2, 3], vertical_alignment="bottom")
-    with col1:
-        company_name_options = _load_company_name_options()
-        company_name = st.selectbox(
-            "Company Name",
-            options=company_name_options,
-            index=0,
-            help="Injected into the template where [Company/Brand Name] appears.",
-            key="company_name_select",
-        )
-        st.session_state["company_name"] = company_name
-
-    with col2:
-        st.info(f"**{len(agent_ids)}** agents found. Only those with attached documents will be sent to the LLM.")
-
-    if st.button("🚀 Merge Agent Prompts", type="primary", use_container_width=False, key="merge_prompts_btn"):
-        base_url_error = _llm_base_url_error(llm_override.get("base_url") or "")
-        if base_url_error:
-            st.error(base_url_error)
-            return
-        if not (llm_override.get("model") or "").strip():
-            st.error("Model ID is required in LLM Connection settings.")
-            return
-
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        status_text.text("Extracting prompt parts from source DB...")
-        prompt_parts = _extract_prompt_parts(config, prefix, agent_ids)
-        template_text = _load_template_prompt()
-        v4_default_template, v5_default_instructions = _load_no_doc_prompt_defaults()
-        merge_requests, local_results = _build_prompt_merge_routes(
-            agent_ids,
-            prompt_parts,
-            v4_default_template,
-            v5_default_instructions,
-        )
-
-        status_text.text(
-            f"Sending {len(merge_requests)} knowledge agent(s) to prompt merger service; "
-            f"handling {len(local_results)} no-document agent(s) locally..."
-        )
-        progress_bar.progress(0.1)
-
-        data = {"results": []}
-        if merge_requests:
-            try:
-                data = _run_batch_merge_direct(
-                    merge_requests=merge_requests,
-                    company_name=company_name,
-                    template_text=template_text,
-                    llm_override=llm_override,
-                )
-            except Exception as exc:
-                st.error(f"Prompt merge failed: {exc}")
-                return
-
-        progress_bar.progress(1.0)
-        status_text.text("Prompt merging complete!")
-
-        merged = {}
-        results_by_bot = {}
-        all_results = [
-            {**r, "sent_to_llm": True}
-            for r in data.get("results", [])
-        ] + local_results
-        for r in all_results:
-            merged[r["bot_id"]] = r["merged_instruction"]
-            results_by_bot[r["bot_id"]] = r
-        st.session_state["merged_instructions"] = merged
-        st.session_state["merged_prompt_review"] = [
-            {
-                "bot_id": bot_id,
-                "agent_name": _text_or_empty(prompt_parts.get(bot_id, {}).get("agent_name")),
-                "tone": _text_or_empty(prompt_parts.get(bot_id, {}).get("tone")),
-                "guardrail": _text_or_empty(prompt_parts.get(bot_id, {}).get("guardrail")),
-                "response": _text_or_empty(prompt_parts.get(bot_id, {}).get("response")),
-                "has_knowledge": bool(prompt_parts.get(bot_id, {}).get("has_knowledge")),
-                "sent_to_llm": bool(results_by_bot.get(bot_id, {}).get("sent_to_llm")),
-                "template": template_text if prompt_parts.get(bot_id, {}).get("has_knowledge") else v5_default_instructions,
-                "merged_instruction": results_by_bot.get(bot_id, {}).get("merged_instruction", ""),
-                "status": results_by_bot.get(bot_id, {}).get("status", "missing"),
-                "error_message": results_by_bot.get(bot_id, {}).get("error_message"),
-            }
-            for bot_id in agent_ids
-        ]
-
-        success_statuses = {
-            "ok",
-            "template_only",
-            "v4_user_prompt",
-            "v5_default_response_instructions",
-        }
-        ok_count = sum(1 for r in all_results if r.get("status") in success_statuses)
-        fail_count = sum(1 for r in all_results if r.get("status") == "fallback")
-        total = len(all_results)
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total", total)
-        c2.metric("Succeeded", ok_count)
-        c3.metric("Fallback / Failed", fail_count)
-
-        statuses = {}
-        for r in all_results:
-            s = r.get("status", "unknown")
-            statuses[s] = statuses.get(s, 0) + 1
-        if statuses:
-            st.caption("Status breakdown: " + ", ".join(f"{k}: {v}" for k, v in statuses.items()))
-
-        st.success(
-            f"Merged instructions stored for **{len(merged)}** agent(s). "
-            "They will be used during extraction."
-        )
-
-    if st.session_state.get("merged_instructions"):
-        n = len(st.session_state["merged_instructions"])
-        st.success(f"✅ {n} merged instruction(s) ready in session. They will be injected during SQL generation.")
-        render_merged_prompt_review()
 
 
 def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list, doc_count: int):
@@ -1776,7 +1496,6 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 selected_doc_ids=st.session_state.get("selected_doc_ids"),
                 selected_embedding_ids=st.session_state.get("selected_embedding_ids"),
                 selected_agent_ids=st.session_state.get("selected_agent_ids"),
-                merged_instructions=st.session_state.get("merged_instructions"),
                 extract_conversions=extract_conversions,
                 conv_date_from=st.session_state.get("conv_date_from_parsed"),
                 conv_date_to=st.session_state.get("conv_date_to_parsed"),
@@ -1788,7 +1507,10 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         
         # Store results
         st.session_state[SessionKeys.EXTRACTED_DATA] = results
-        
+
+        # Record migration batch in target DB tracking tables
+        _record_migration_batch(user_emails, results, config)
+
         # Show results
         if results.get("errors"):
             for error in results["errors"]:
@@ -1978,8 +1700,6 @@ def main():
     # Agents selection (default all selected)
     selected_agent_ids = render_agents_selection(config, prefix, selected_user_ids)
 
-    # Prompt merger (optional step — merge V4 prompt parts into V5 template)
-    render_prompt_merger_section(config, prefix, selected_agent_ids or [])
 
     # Conversations selection (default all selected)
     selected_conversation_ids = render_conversations_selection(config, prefix, selected_user_ids)

@@ -1,158 +1,107 @@
 """
-localStorage helpers using streamlit-javascript for persistent browser storage.
+Persistent storage helpers.
+
+Uses st.session_state as the primary store. localStorage writes are fire-and-forget
+via hidden HTML/JS snippets (no st_javascript dependency needed).
+localStorage reads happen once at startup via query params or are skipped entirely
+since .env-based auto-loading makes them unnecessary for connection configs.
 """
 import json
 from typing import Any, Optional
 import streamlit as st
-from streamlit_javascript import st_javascript
+import streamlit.components.v1 as components
 
 from utils.config import STORAGE_PREFIX
 
+# Session-state key prefix for our cached localStorage mirrors
+_CACHE_PREFIX = "_ls_cache_"
+
+
+def _write_to_localstorage(full_key: str, json_value: str):
+    """Fire-and-forget write to localStorage via a hidden iframe."""
+    escaped = json_value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    html = f"""<script>
+    try {{ window.parent.localStorage.setItem('{full_key}', '{escaped}'); }}
+    catch(e) {{}}
+    </script>"""
+    components.html(html, height=0, width=0)
+
 
 def save_to_storage(key: str, value: Any) -> bool:
-    """
-    Save a value to browser localStorage.
-    
-    Args:
-        key: The storage key (will be prefixed with db_migrator_)
-        value: The value to store (will be JSON serialized)
-    
-    Returns:
-        True if successful
-    """
-    # Ensure key has prefix
+    """Save a value to session_state and browser localStorage."""
     full_key = key if key.startswith(STORAGE_PREFIX) else f"{STORAGE_PREFIX}{key}"
-    
+    cache_key = f"{_CACHE_PREFIX}{full_key}"
+    st.session_state[cache_key] = value
+
     try:
         json_value = json.dumps(value)
-        js_code = f"""
-            localStorage.setItem('{full_key}', '{json_value}');
-            return true;
-        """
-        result = st_javascript(js_code)
-        return result == True
-    except Exception as e:
-        st.error(f"Failed to save to localStorage: {e}")
+        _write_to_localstorage(full_key, json_value)
+        return True
+    except Exception:
         return False
 
 
 def load_from_storage(key: str, default: Any = None) -> Any:
-    """
-    Load a value from browser localStorage.
-    
-    Args:
-        key: The storage key (will be prefixed with db_migrator_)
-        default: Default value if key not found
-    
-    Returns:
-        The deserialized value or default
-    """
-    # Ensure key has prefix
+    """Load a value from session_state cache. Returns default if not cached."""
     full_key = key if key.startswith(STORAGE_PREFIX) else f"{STORAGE_PREFIX}{key}"
-    
-    try:
-        js_code = f"""
-            const value = localStorage.getItem('{full_key}');
-            return value;
-        """
-        result = st_javascript(js_code)
-        
-        if result is None or result == "null" or result == "":
-            return default
-        
-        # If result is already a Python type (not a string), return it directly
-        if isinstance(result, (int, float, bool, list, dict)):
-            return result
-        
-        return json.loads(result)
-    except (json.JSONDecodeError, TypeError):
-        return default
-    except Exception as e:
-        st.error(f"Failed to load from localStorage: {e}")
-        return default
+    cache_key = f"{_CACHE_PREFIX}{full_key}"
+
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    return default
 
 
 def remove_from_storage(key: str) -> bool:
-    """
-    Remove a value from browser localStorage.
-    
-    Args:
-        key: The storage key to remove
-    
-    Returns:
-        True if successful
-    """
+    """Remove a value from session_state and localStorage."""
     full_key = key if key.startswith(STORAGE_PREFIX) else f"{STORAGE_PREFIX}{key}"
-    
+    cache_key = f"{_CACHE_PREFIX}{full_key}"
+    st.session_state.pop(cache_key, None)
+
     try:
-        js_code = f"""
-            localStorage.removeItem('{full_key}');
-            return true;
-        """
-        result = st_javascript(js_code)
-        return result == True
-    except Exception as e:
-        st.error(f"Failed to remove from localStorage: {e}")
+        html = f"""<script>
+        try {{ window.parent.localStorage.removeItem('{full_key}'); }}
+        catch(e) {{}}
+        </script>"""
+        components.html(html, height=0, width=0)
+        return True
+    except Exception:
         return False
 
 
 def clear_all_storage() -> bool:
-    """
-    Clear all db_migrator_ prefixed keys from localStorage.
-    
-    Returns:
-        True if successful
-    """
+    """Clear all db_migrator_ prefixed keys from localStorage and session_state."""
+    keys_to_remove = [k for k in st.session_state if k.startswith(_CACHE_PREFIX)]
+    for k in keys_to_remove:
+        del st.session_state[k]
+
     try:
-        js_code = f"""
+        html = f"""<script>
+        try {{
             const keysToRemove = [];
-            for (let i = 0; i < localStorage.length; i++) {{
-                const key = localStorage.key(i);
-                if (key && key.startsWith('{STORAGE_PREFIX}')) {{
-                    keysToRemove.push(key);
-                }}
+            for (let i = 0; i < window.parent.localStorage.length; i++) {{
+                const key = window.parent.localStorage.key(i);
+                if (key && key.startsWith('{STORAGE_PREFIX}')) keysToRemove.push(key);
             }}
-            keysToRemove.forEach(key => localStorage.removeItem(key));
-            return keysToRemove.length;
-        """
-        result = st_javascript(js_code)
-        return result is not None
-    except Exception as e:
-        st.error(f"Failed to clear localStorage: {e}")
+            keysToRemove.forEach(key => window.parent.localStorage.removeItem(key));
+        }} catch(e) {{}}
+        </script>"""
+        components.html(html, height=0, width=0)
+        return True
+    except Exception:
         return False
 
 
 def get_all_storage_keys() -> list:
-    """
-    Get all db_migrator_ prefixed keys from localStorage.
-    
-    Returns:
-        List of keys
-    """
-    try:
-        js_code = f"""
-            const keys = [];
-            for (let i = 0; i < localStorage.length; i++) {{
-                const key = localStorage.key(i);
-                if (key && key.startsWith('{STORAGE_PREFIX}')) {{
-                    keys.push(key);
-                }}
-            }}
-            return JSON.stringify(keys);
-        """
-        result = st_javascript(js_code)
-        if result:
-            return json.loads(result)
-        return []
-    except Exception:
-        return []
+    """Get all cached storage keys."""
+    prefix = f"{_CACHE_PREFIX}{STORAGE_PREFIX}"
+    return [k.replace(_CACHE_PREFIX, "") for k in st.session_state if k.startswith(prefix)]
 
 
 # Convenience functions for common storage operations
 def save_connection(connection_type: str, connection_data: dict) -> bool:
     """Save source or target connection details."""
     key = f"{connection_type}_connection"
-    # Don't store password in localStorage for security
     safe_data = {k: v for k, v in connection_data.items() if k != "password"}
     return save_to_storage(key, safe_data)
 

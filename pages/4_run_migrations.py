@@ -24,6 +24,176 @@ st.title("🚀 Run Migration SQL Scripts")
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIGRATIONS_DIR = os.path.join(BASE_DIR, "output", "migrations")
 
+
+def _ensure_target_config():
+    """Auto-populate target_config from .env if not already in session state."""
+    if "target_config" not in st.session_state:
+        from utils.config import get_env_target_defaults
+        env_defaults = get_env_target_defaults()
+        if env_defaults.get("host") and env_defaults.get("database") and env_defaults.get("username") and env_defaults.get("password"):
+            config = ConnectionConfig(
+                host=env_defaults["host"],
+                port=int(env_defaults["port"]),
+                database=env_defaults["database"],
+                username=env_defaults["username"],
+                password=env_defaults["password"],
+            )
+            st.session_state["target_config"] = config
+            st.session_state["target_schema_mode"] = env_defaults.get("schema_mode", "schemas")
+
+
+_ensure_target_config()
+
+
+def _get_tracking_connection():
+    """Get a connection to the database that holds migration tracking tables."""
+    from utils.config import get_env_target_defaults
+    defaults = get_env_target_defaults()
+    config = ConnectionConfig(
+        host=defaults["host"],
+        port=int(defaults["port"]),
+        database=defaults["database"],
+        username=defaults["username"],
+        password=defaults["password"],
+    )
+    conn = get_connection(config)
+    conn.autocommit = True
+    return conn
+
+
+def _update_batch_step_results(batch_id: str, step_name: str, success: bool, error_msg: str = None):
+    """Update migration_user_results after a SQL step executes.
+
+    On success: appends step to steps_completed JSONB for all pending users.
+    On failure: marks all pending users as failed with the step name and error.
+    """
+    if not batch_id:
+        return
+    try:
+        conn = _get_tracking_connection()
+        cursor = conn.cursor()
+        # Normalize filename to a canonical step key (e.g. "01_users_20260720.sql" → "01_users")
+        step_key = step_name
+        for prefix in ["01_users", "02_folders", "03_documents", "04_chunks_embeddings",
+                       "05_conversations", "06_agents", "07_conversions"]:
+            if step_name.startswith(prefix):
+                step_key = prefix
+                break
+
+        if success:
+            cursor.execute("""
+                UPDATE migration.migration_user_results
+                SET steps_completed = COALESCE(steps_completed, '{}'::jsonb) || %s::jsonb
+                WHERE batch_id = %s::uuid AND result IN ('pending', 'reused_existing_user')
+            """, (f'{{"{step_key}": "success"}}', batch_id))
+            cursor.close()
+            conn.close()
+            if step_key == "01_users":
+                _verify_users_step(batch_id)
+            return
+        else:
+            cursor.execute("""
+                UPDATE migration.migration_user_results
+                SET result = 'failed',
+                    failed_step = %s,
+                    error_message = %s,
+                    completed_at = now(),
+                    steps_completed = COALESCE(steps_completed, '{}'::jsonb) || %s::jsonb
+                WHERE batch_id = %s::uuid AND result IN ('pending', 'reused_existing_user')
+            """, (step_key, error_msg[:500] if error_msg else None,
+                  f'{{"{step_key}": "failed"}}', batch_id))
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _verify_users_step(batch_id: str):
+    """After step 01_users, distinguish reused_existing_user from newly created.
+
+    A user is 'reused' if their V5 record existed before the batch started
+    (detected by comparing users.created_at with the batch started_at).
+    """
+    if not batch_id:
+        return
+    try:
+        conn = _get_tracking_connection()
+        cursor = conn.cursor()
+        # Get batch emails and batch start time
+        cursor.execute("""
+            SELECT r.email, b.started_at
+            FROM migration.migration_user_results r
+            JOIN migration.migration_batches b ON b.id = r.batch_id
+            WHERE r.batch_id = %s::uuid AND r.result = 'pending'
+        """, (batch_id,))
+        rows = cursor.fetchall()
+        if not rows:
+            cursor.close()
+            conn.close()
+            return
+
+        batch_started = rows[0][1]
+        batch_emails = [r[0] for r in rows]
+
+        # Check user_db for users created before the batch (= pre-existing / reused)
+        base_config = st.session_state.get("target_config")
+        if not base_config:
+            cursor.close()
+            conn.close()
+            return
+
+        user_conn = get_connection(ConnectionConfig(
+            host=base_config.host, port=base_config.port,
+            database="user_db", username=base_config.username,
+            password=base_config.password
+        ))
+        user_cursor = user_conn.cursor()
+        user_cursor.execute("""
+            SELECT email FROM public.users
+            WHERE email = ANY(%s) AND created_at < %s
+        """, (batch_emails, batch_started))
+        reused_emails = [r[0] for r in user_cursor.fetchall()]
+        user_cursor.close()
+        user_conn.close()
+
+        if reused_emails:
+            cursor.execute("""
+                UPDATE migration.migration_user_results
+                SET result = 'reused_existing_user',
+                    steps_completed = COALESCE(steps_completed, '{}'::jsonb) || '{"01_users": "reused"}'::jsonb,
+                    completed_at = now()
+                WHERE batch_id = %s::uuid AND email = ANY(%s) AND result = 'pending'
+            """, (batch_id, reused_emails))
+
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _finalize_batch(batch_id: str):
+    """Mark all remaining pending users as success and close the batch."""
+    if not batch_id:
+        return
+    try:
+        conn = _get_tracking_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE migration.migration_user_results
+            SET result = 'success', completed_at = now()
+            WHERE batch_id = %s::uuid AND result = 'pending'
+        """, (batch_id,))
+        cursor.execute("""
+            UPDATE migration.migration_batches
+            SET status = 'completed', completed_at = now()
+            WHERE id = %s::uuid
+        """, (batch_id,))
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
 # Database mapping for each migration file prefix
 DB_MAPPING = {
     "01_users_": "user_db",
@@ -35,15 +205,68 @@ DB_MAPPING = {
     "07_conversions_": "completion_db",
 }
 
-# Table mapping for rollback
+# Table mapping for rollback — each entry defines the mapping_table used in
+# migration.id_mappings and a list of delete operations (executed in order).
+# Each delete op specifies the table and the SQL WHERE clause referencing mappings.
 TABLE_MAPPING = {
-    "01_users_": {"tables": ["users"], "mapping_table": "users"},
-    "02_folders_": {"tables": ["folders"], "mapping_table": "folders"},
-    "03_documents_": {"tables": ["documents"], "mapping_table": "documents"},
-    "04_chunks_embeddings_": {"tables": ["chunks", "embeddings"], "mapping_table": "documents"},
-    "05_conversations_": {"tables": ["conversations", "messages", "message_content_blocks"], "mapping_table": "conversations"},
-    "06_agents_": {"tables": ["agents", "agent_settings", "knowledge_bases", "knowledge_base_assignments", "knowledge_base_items"], "mapping_table": "agents"},
-    "07_conversions_": {"tables": ["agent_conversions", "conversions"], "mapping_table": "conversions"},
+    "01_users_": {
+        "mapping_table": "users",
+        "tables": ["users"],
+        "deletes": [
+            ("users", "id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'users')"),
+        ],
+    },
+    "02_folders_": {
+        "mapping_table": "folders",
+        "tables": ["folders"],
+        "deletes": [
+            ("folders", "id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'folders')"),
+        ],
+    },
+    "03_documents_": {
+        "mapping_table": "documents",
+        "tables": ["documents"],
+        "deletes": [
+            ("documents", "id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'documents')"),
+        ],
+    },
+    "04_chunks_embeddings_": {
+        "mapping_table": "documents",
+        "tables": ["chunks", "embeddings"],
+        "deletes": [
+            ("embeddings", "document_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'documents')"),
+            ("chunks", "document_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'documents')"),
+        ],
+    },
+    "05_conversations_": {
+        "mapping_table": "conversations",
+        "tables": ["conversations", "messages", "message_content_blocks"],
+        "deletes": [
+            ("message_content_blocks", "message_id IN (SELECT id FROM messages WHERE conversation_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'conversations'))"),
+            ("messages", "conversation_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'conversations')"),
+            ("conversations", "id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'conversations')"),
+        ],
+    },
+    "06_agents_": {
+        "mapping_table": "agents",
+        "tables": ["agents", "agent_settings", "knowledge_bases", "knowledge_base_assignments", "knowledge_base_items", "legacy_bot_to_agent_mapping"],
+        "deletes": [
+            ("knowledge_base_items", "knowledge_base_id IN (SELECT id FROM knowledge_bases WHERE agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents'))"),
+            ("knowledge_base_assignments", "knowledge_base_id IN (SELECT id FROM knowledge_bases WHERE agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents'))"),
+            ("knowledge_bases", "agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
+            ("agent_settings", "agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
+            ("legacy_bot_to_agent_mapping", "agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
+            ("agents", "id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
+        ],
+    },
+    "07_conversions_": {
+        "mapping_table": "conversions",
+        "tables": ["agent_conversions", "conversions"],
+        "deletes": [
+            ("agent_conversions", "conversion_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'conversions')"),
+            ("conversions", "id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'conversions')"),
+        ],
+    },
 }
 
 
@@ -298,39 +521,14 @@ def rollback_migration(config: ConnectionConfig, filename: str, target_db: str) 
                 conn.close()
                 return (True, "ℹ️ No migrated records found to rollback", 0)
             
-            # Delete from tables in reverse order (children first)
-            for table in reversed(table_info["tables"]):
-                # Special handling for chunks/embeddings which use document mapping
-                if table in ["chunks", "embeddings"]:
-                    # Delete chunks/embeddings based on document_id from migration mappings
-                    if table == "chunks":
-                        cursor.execute(f"""
-                            DELETE FROM {table}
-                            WHERE document_id IN (
-                                SELECT new_id FROM migration.id_mappings 
-                                WHERE table_name = 'documents'
-                            )
-                        """)
-                    elif table == "embeddings":
-                        cursor.execute(f"""
-                            DELETE FROM {table}
-                            WHERE document_id IN (
-                                SELECT new_id FROM migration.id_mappings 
-                                WHERE table_name = 'documents'
-                            )
-                        """)
-                else:
-                    # Delete based on id from migration mappings
-                    cursor.execute(f"""
-                        DELETE FROM {table}
-                        WHERE id IN (
-                            SELECT new_id FROM migration.id_mappings 
-                            WHERE table_name = %s
-                        )
-                    """, (table_info["mapping_table"],))
-                
-                deleted = cursor.rowcount
-                total_deleted += deleted
+            # Delete using FK-aware queries (children before parents)
+            for table, where_clause in table_info["deletes"]:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE {where_clause}")
+                    deleted = cursor.rowcount
+                    total_deleted += deleted
+                except Exception:
+                    pass
             
             # Clear migration mappings
             cursor.execute("""
@@ -442,7 +640,6 @@ def render_migration_files():
             with col3:
                 # Run button
                 if st.button(f"▶️ Run", key=f"run_{filename}", type="primary"):
-                    # Create config for target database
                     base_config = st.session_state["target_config"]
                     db_config = ConnectionConfig(
                         host=base_config.host,
@@ -462,7 +659,10 @@ def render_migration_files():
                             "timestamp": datetime.now()
                         }
 
-                        # Verify destination tables on success
+                        # Track per-step result
+                        batch_id = st.session_state.get("_current_batch_id")
+                        _update_batch_step_results(batch_id, filename, success, message if not success else None)
+
                         if success:
                             with st.spinner("Verifying destination tables..."):
                                 base_config = st.session_state["target_config"]
@@ -471,6 +671,16 @@ def render_migration_files():
                                 )
 
                         st.session_state.migration_status[filename] = status_entry
+
+                        # Auto-finalize batch if all files executed successfully
+                        if success and batch_id:
+                            all_done = all(
+                                st.session_state.migration_status.get(f["filename"], {}).get("success")
+                                for f in migration_files
+                            )
+                            if all_done:
+                                _finalize_batch(batch_id)
+
                         st.rerun()
             
             with col4:
@@ -567,9 +777,11 @@ def render_migration_files():
     with col1:
         if st.button("▶️ Run All (In Order)", type="primary"):
             base_config = st.session_state["target_config"]
+            batch_id = st.session_state.get("_current_batch_id")
             
             progress_bar = st.progress(0)
             status_text = st.empty()
+            all_success = True
             
             for idx, file_info in enumerate(migration_files):
                 filename = file_info["filename"]
@@ -577,7 +789,6 @@ def render_migration_files():
                 
                 status_text.text(f"Executing {idx + 1}/{len(migration_files)}: {filename}")
                 
-                # Create config for target database
                 db_config = ConnectionConfig(
                     host=base_config.host,
                     port=base_config.port,
@@ -595,22 +806,24 @@ def render_migration_files():
                     "timestamp": datetime.now()
                 }
 
-                # Verify destination tables on success
+                _update_batch_step_results(batch_id, filename, success, message if not success else None)
+
                 if success:
                     status_text.text(f"Verifying {idx + 1}/{len(migration_files)}: {filename}")
                     status_entry["verification"] = verify_migration_result(base_config, filename)
 
                 st.session_state.migration_status[filename] = status_entry
-
-                # Update progress
                 progress_bar.progress((idx + 1) / len(migration_files))
 
-                # Stop on first error
                 if not success:
+                    all_success = False
                     st.error(f"Stopped at {filename}: {message}")
                     break
+
+            if all_success:
+                _finalize_batch(batch_id)
             
-            status_text.text("✅ Bulk execution complete!")
+            status_text.text("✅ Bulk execution complete!" if all_success else "⚠️ Execution stopped due to error.")
             st.rerun()
     
     with col2:

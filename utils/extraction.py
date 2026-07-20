@@ -366,16 +366,13 @@ class ExtractionEngine:
         docs_df: Optional[pd.DataFrame] = None,
         folders_df: Optional[pd.DataFrame] = None,
         embeddings_df: Optional[pd.DataFrame] = None,
-        merged_instructions: Optional[Dict[str, str]] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract agents belonging to specified users.
-        
-        Args:
-            user_ids: List of user IDs whose agents to extract
-            merged_instructions: Optional dict {bot_id: merged_instruction_text} from the
-                                 prompt merger service (passed through to SQL generation)
-            
+
+        Prompt parts (tone, guardrail, response) are automatically concatenated
+        into merged instructions during SQL generation.
+
         Returns:
             Tuple of (DataFrame, output_file_path)
         """
@@ -476,6 +473,7 @@ class ExtractionEngine:
         if self.generate_sql and len(df) > 0:
             sql_output_path = os.path.join(self.sql_output_dir, f"06_agents_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (table: playground_bot_generator_config)"
+            merged_instructions = self._build_merged_instructions(df)
             try:
                 from utils.sql_generator import generate_agents_migration_sql
                 generate_agents_migration_sql(
@@ -486,11 +484,50 @@ class ExtractionEngine:
                     merged_instructions=merged_instructions,
                 )
             except Exception as e:
-                # Log error but don't fail extraction
                 print(f"Warning: Failed to generate SQL for agents: {str(e)}")
 
         return df, output_path
     
+    @staticmethod
+    def _build_merged_instructions(agents_df: pd.DataFrame) -> Dict[str, str]:
+        """Concatenate tone/guardrail/response prompt parts per agent into a single instruction.
+
+        This replaces the former LLM-based prompt merger with deterministic
+        local concatenation.
+        """
+        import json as _json
+
+        def _extract_content(col_val) -> Optional[str]:
+            if col_val is None:
+                return None
+            if isinstance(col_val, str):
+                try:
+                    col_val = _json.loads(col_val)
+                except Exception:
+                    return col_val.strip() or None
+            if isinstance(col_val, dict):
+                return (col_val.get("content") or "").strip() or None
+            return None
+
+        merged: Dict[str, str] = {}
+        for _, row in agents_df.iterrows():
+            bot_id = str(row.get("bot_id", ""))
+            tone = _extract_content(row.get("character_prompts"))
+            guardrail = _extract_content(row.get("hack_prompt"))
+            response = _extract_content(row.get("relevant_answer_prompt"))
+
+            sections = []
+            if tone and tone.strip():
+                sections.append(f"[Tone]\n{tone.strip()}")
+            if guardrail and guardrail.strip():
+                sections.append(f"[Guardrail]\n{guardrail.strip()}")
+            if response and response.strip():
+                sections.append(f"[Response]\n{response.strip()}")
+
+            if sections:
+                merged[bot_id] = "\n\n".join(sections)
+        return merged
+
     @staticmethod
     def _normalise_folder_id(val) -> Optional[str]:
         """Normalise a V4 folder ID (int4, possibly float-loaded) to a plain integer string."""
@@ -976,7 +1013,6 @@ class ExtractionEngine:
         selected_doc_ids: Optional[List[str]] = None,
         selected_embedding_ids: Optional[List[str]] = None,
         selected_agent_ids: Optional[List[str]] = None,
-        merged_instructions: Optional[Dict[str, str]] = None,
         extract_conversions: bool = True,
         conv_date_from: Optional[datetime] = None,
         conv_date_to: Optional[datetime] = None,
@@ -1100,7 +1136,6 @@ class ExtractionEngine:
                 docs_df=docs_df,
                 folders_df=folders_df,
                 embeddings_df=embeddings_df,
-                merged_instructions=merged_instructions,
             )
             results["files"]["agents"] = agents_path
             results["summary"]["agents"] = len(agents_df)
