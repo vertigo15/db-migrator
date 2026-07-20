@@ -110,6 +110,14 @@ TABLE_DEFINITIONS: Dict[str, TableDefinition] = {
             LEFT JOIN public.playground_bot_generator_config a ON t.bot_id = a.bot_id
         """
     ),
+    # Verification-only: source-DB record of granted Langflow workflow ids.
+    # The Langflow flow definitions live in separate Langflow databases; this
+    # table lets analytics identify provisioned, used, unused, and orphaned ids
+    # without connecting to those databases.
+    "langflow_user_permissions": TableDefinition(
+        logical_name="langflow_user_permissions",
+        name_template="{prefix}_langflow_user_permissions",
+    ),
 }
 
 # Extraction order (respecting foreign keys)
