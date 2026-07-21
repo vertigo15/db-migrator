@@ -25,6 +25,7 @@ ENV/
 # Generated output (mounted as volumes)
 output/
 backups/
+.tmp_db_move/
 
 # IDE
 .idea/

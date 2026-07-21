@@ -9,12 +9,19 @@ Features:
 """
 import os
 import glob
+import json
 import streamlit as st
 import psycopg2
 from datetime import datetime
 
 from utils.db import ConnectionConfig, get_connection
-from utils.config import SessionKeys
+from utils.config import SessionKeys, get_env_connection_defaults
+from utils.sql_generator import NAMESPACE_UUID
+from utils.migration_tracking import (
+    finalize_distributed_run,
+    reconcile_rollback_status,
+    record_step_result,
+)
 
 # Page config
 st.set_page_config(page_title="Run Migrations", page_icon="🚀", layout="wide")
@@ -42,26 +49,41 @@ def _ensure_target_config():
             st.session_state["target_schema_mode"] = env_defaults.get("schema_mode", "schemas")
 
 
+def _ensure_source_config():
+    """Auto-populate source_config from .env for V4 audit mirroring."""
+    if "source_config" in st.session_state:
+        return
+    env_defaults = get_env_connection_defaults()
+    if (
+        env_defaults.get("host")
+        and env_defaults.get("database")
+        and env_defaults.get("username")
+        and env_defaults.get("password")
+    ):
+        st.session_state["source_config"] = ConnectionConfig(
+            host=env_defaults["host"],
+            port=int(env_defaults["port"]),
+            database=env_defaults["database"],
+            username=env_defaults["username"],
+            password=env_defaults["password"],
+        )
+
+
+def _source_tracking_config():
+    return st.session_state.get("source_config")
+
+
 _ensure_target_config()
+_ensure_source_config()
 
 
-def _get_tracking_connection():
-    """Get a connection to the database that holds migration tracking tables."""
-    from utils.config import get_env_target_defaults
-    defaults = get_env_target_defaults()
-    config = ConnectionConfig(
-        host=defaults["host"],
-        port=int(defaults["port"]),
-        database=defaults["database"],
-        username=defaults["username"],
-        password=defaults["password"],
-    )
-    conn = get_connection(config)
-    conn.autocommit = True
-    return conn
-
-
-def _update_batch_step_results(batch_id: str, step_name: str, success: bool, error_msg: str = None):
+def _update_batch_step_results(
+    batch_id: str,
+    step_name: str,
+    success: bool,
+    error_msg: str = None,
+    affected_count: int = None,
+):
     """Update migration_user_results after a SQL step executes.
 
     On success: appends step to steps_completed JSONB for all pending users.
@@ -69,129 +91,41 @@ def _update_batch_step_results(batch_id: str, step_name: str, success: bool, err
     """
     if not batch_id:
         return
-    try:
-        conn = _get_tracking_connection()
-        cursor = conn.cursor()
-        # Normalize filename to a canonical step key (e.g. "01_users_20260720.sql" → "01_users")
-        step_key = step_name
-        for prefix in ["01_users", "02_folders", "03_documents", "04_chunks_embeddings",
-                       "05_conversations", "06_agents", "07_conversions"]:
-            if step_name.startswith(prefix):
-                step_key = prefix
-                break
-
-        if success:
-            cursor.execute("""
-                UPDATE migration.migration_user_results
-                SET steps_completed = COALESCE(steps_completed, '{}'::jsonb) || %s::jsonb
-                WHERE batch_id = %s::uuid AND result IN ('pending', 'reused_existing_user')
-            """, (f'{{"{step_key}": "success"}}', batch_id))
-            cursor.close()
-            conn.close()
-            if step_key == "01_users":
-                _verify_users_step(batch_id)
-            return
-        else:
-            cursor.execute("""
-                UPDATE migration.migration_user_results
-                SET result = 'failed',
-                    failed_step = %s,
-                    error_message = %s,
-                    completed_at = now(),
-                    steps_completed = COALESCE(steps_completed, '{}'::jsonb) || %s::jsonb
-                WHERE batch_id = %s::uuid AND result IN ('pending', 'reused_existing_user')
-            """, (step_key, error_msg[:500] if error_msg else None,
-                  f'{{"{step_key}": "failed"}}', batch_id))
-        cursor.close()
-        conn.close()
-    except Exception:
-        pass
-
-
-def _verify_users_step(batch_id: str):
-    """After step 01_users, distinguish reused_existing_user from newly created.
-
-    A user is 'reused' if their V5 record existed before the batch started
-    (detected by comparing users.created_at with the batch started_at).
-    """
-    if not batch_id:
-        return
-    try:
-        conn = _get_tracking_connection()
-        cursor = conn.cursor()
-        # Get batch emails and batch start time
-        cursor.execute("""
-            SELECT r.email, b.started_at
-            FROM migration.migration_user_results r
-            JOIN migration.migration_batches b ON b.id = r.batch_id
-            WHERE r.batch_id = %s::uuid AND r.result = 'pending'
-        """, (batch_id,))
-        rows = cursor.fetchall()
-        if not rows:
-            cursor.close()
-            conn.close()
-            return
-
-        batch_started = rows[0][1]
-        batch_emails = [r[0] for r in rows]
-
-        # Check user_db for users created before the batch (= pre-existing / reused)
-        base_config = st.session_state.get("target_config")
-        if not base_config:
-            cursor.close()
-            conn.close()
-            return
-
-        user_conn = get_connection(ConnectionConfig(
-            host=base_config.host, port=base_config.port,
-            database="user_db", username=base_config.username,
-            password=base_config.password
-        ))
-        user_cursor = user_conn.cursor()
-        user_cursor.execute("""
-            SELECT email FROM public.users
-            WHERE email = ANY(%s) AND created_at < %s
-        """, (batch_emails, batch_started))
-        reused_emails = [r[0] for r in user_cursor.fetchall()]
-        user_cursor.close()
-        user_conn.close()
-
-        if reused_emails:
-            cursor.execute("""
-                UPDATE migration.migration_user_results
-                SET result = 'reused_existing_user',
-                    steps_completed = COALESCE(steps_completed, '{}'::jsonb) || '{"01_users": "reused"}'::jsonb,
-                    completed_at = now()
-                WHERE batch_id = %s::uuid AND email = ANY(%s) AND result = 'pending'
-            """, (batch_id, reused_emails))
-
-        cursor.close()
-        conn.close()
-    except Exception:
-        pass
+    step_key = step_name
+    target_database = "user_db"
+    for prefix in ["01_users", "02_folders", "03_documents", "04_chunks_embeddings",
+                   "05_conversations", "06_agents", "07_conversions"]:
+        if step_name.startswith(prefix):
+            step_key = prefix
+            target_database = DB_MAPPING[f"{prefix}_"]
+            break
+    base_config = st.session_state.get("target_config")
+    if base_config is None:
+        raise RuntimeError("Target connection is unavailable for migration tracking.")
+    record_step_result(
+        base_config,
+        batch_id,
+        step_key,
+        target_database,
+        success,
+        affected_count=affected_count,
+        error_message=error_msg[:500] if error_msg else None,
+        source_config=_source_tracking_config(),
+    )
 
 
 def _finalize_batch(batch_id: str):
     """Mark all remaining pending users as success and close the batch."""
     if not batch_id:
         return
-    try:
-        conn = _get_tracking_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE migration.migration_user_results
-            SET result = 'success', completed_at = now()
-            WHERE batch_id = %s::uuid AND result = 'pending'
-        """, (batch_id,))
-        cursor.execute("""
-            UPDATE migration.migration_batches
-            SET status = 'completed', completed_at = now()
-            WHERE id = %s::uuid
-        """, (batch_id,))
-        cursor.close()
-        conn.close()
-    except Exception:
-        pass
+    base_config = st.session_state.get("target_config")
+    if base_config is None:
+        raise RuntimeError("Target connection is unavailable for migration tracking.")
+    finalize_distributed_run(
+        base_config,
+        batch_id,
+        source_config=_source_tracking_config(),
+    )
 
 
 # Database mapping for each migration file prefix
@@ -204,6 +138,17 @@ DB_MAPPING = {
     "06_agents_": "completion_db",
     "07_conversions_": "completion_db",
 }
+
+ALL_STEPS = [
+    ("01_users_", "user_db", "Users"),
+    ("02_folders_", "document_db", "Document folders"),
+    ("03_documents_", "document_db", "Documents"),
+    ("04_chunks_embeddings_", "document_db", "Chunks & embeddings"),
+    ("05_conversations_", "completion_db", "Conversations"),
+    ("06_agents_", "completion_db", "Agents"),
+    ("07_conversions_", "completion_db", "Agent-conversation links"),
+]
+ROLLBACK_STEP_ORDER = list(reversed(ALL_STEPS))
 
 # Table mapping for rollback — each entry defines the mapping_table used in
 # migration.id_mappings and a list of delete operations (executed in order).
@@ -232,6 +177,7 @@ TABLE_MAPPING = {
     },
     "04_chunks_embeddings_": {
         "mapping_table": "documents",
+        "clear_mappings": False,
         "tables": ["chunks", "embeddings"],
         "deletes": [
             ("embeddings", "document_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'documents')"),
@@ -251,11 +197,11 @@ TABLE_MAPPING = {
         "mapping_table": "agents",
         "tables": ["agents", "agent_settings", "knowledge_bases", "knowledge_base_assignments", "knowledge_base_items", "legacy_bot_to_agent_mapping"],
         "deletes": [
-            ("knowledge_base_items", "knowledge_base_id IN (SELECT id FROM knowledge_bases WHERE agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents'))"),
-            ("knowledge_base_assignments", "knowledge_base_id IN (SELECT id FROM knowledge_bases WHERE agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents'))"),
-            ("knowledge_bases", "agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
+            ("knowledge_base_items", "knowledge_base_id IN (SELECT knowledge_base_id FROM knowledge_base_assignments WHERE assigned_to_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents'))"),
+            ("knowledge_base_assignments", "assigned_to_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
+            ("knowledge_bases", f"id IN (SELECT migration.deterministic_uuid_v4('{NAMESPACE_UUID}'::uuid, old_id || '-kb') FROM migration.id_mappings WHERE table_name = 'agents')"),
             ("agent_settings", "agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
-            ("legacy_bot_to_agent_mapping", "agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
+            ("legacy_bot_to_agent_mapping", "new_agent_id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
             ("agents", "id IN (SELECT new_id FROM migration.id_mappings WHERE table_name = 'agents')"),
         ],
     },
@@ -269,8 +215,67 @@ TABLE_MAPPING = {
     },
 }
 
+ROLLBACK_DEPENDENCIES = {
+    "01_users": {
+        "02_folders", "03_documents", "04_chunks_embeddings",
+        "05_conversations", "06_agents", "07_conversions",
+    },
+    "02_folders": {"03_documents", "04_chunks_embeddings", "06_agents"},
+    "03_documents": {"04_chunks_embeddings", "06_agents"},
+    "04_chunks_embeddings": set(),
+    "05_conversations": set(),
+    "06_agents": {"07_conversions"},
+    "07_conversions": set(),
+}
 
-def verify_migration_result(base_config: ConnectionConfig, filename: str) -> dict:
+
+def _rollback_order_blockers(
+    config: ConnectionConfig,
+    step_key: str,
+    migration_run_id: str,
+) -> list:
+    blockers = []
+    for dependency in ROLLBACK_DEPENDENCIES.get(step_key, set()):
+        database = DB_MAPPING[f"{dependency}_"]
+        dependency_config = ConnectionConfig(
+            host=config.host,
+            port=config.port,
+            database=database,
+            username=config.username,
+            password=config.password,
+        )
+        conn = None
+        try:
+            conn = get_connection(dependency_config)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM migration.migration_steps
+                    WHERE migration_run_id = %s::uuid AND step_key = %s
+                    """,
+                    (migration_run_id, dependency),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    blockers.append(f"{dependency}=tracking_missing")
+                elif row[0] not in (
+                    "pending", "skipped", "failed", "rolled_back"
+                ):
+                    blockers.append(f"{dependency}={row[0]}")
+        except Exception as exc:
+            blockers.append(f"{dependency}=tracking_unavailable({exc})")
+        finally:
+            if conn is not None and not conn.closed:
+                conn.close()
+    return sorted(blockers)
+
+
+def verify_migration_result(
+    base_config: ConnectionConfig,
+    filename: str,
+    migration_run_id: str = None,
+) -> dict:
     """
     After a successful migration, connect to the destination DB and return
     live row counts for every affected table plus the latest batch_log entry.
@@ -348,10 +353,22 @@ def verify_migration_result(base_config: ConnectionConfig, filename: str) -> dic
 
         # ── Total tracked IDs ─────────────────────────────────────────────
         try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM migration.id_mappings
-                WHERE table_name = %s
-            """, (table_info["mapping_table"],))
+            if migration_run_id:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM migration.id_mappings
+                    WHERE table_name = %s AND migration_run_id = %s::uuid
+                    """,
+                    (table_info["mapping_table"], migration_run_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM migration.id_mappings
+                    WHERE table_name = %s
+                    """,
+                    (table_info["mapping_table"],),
+                )
             result["migrated_ids"] = cursor.fetchone()[0]
         except Exception:
             try:
@@ -441,7 +458,106 @@ def get_migration_files():
     return migration_files
 
 
-def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
+def _verify_step_before_commit(
+    cursor,
+    filename: str,
+    migration_run_id: str,
+) -> tuple:
+    """Return a truthful affected count or raise before the step commits."""
+    step_key = next(
+        (
+            prefix.rstrip("_")
+            for prefix in TABLE_MAPPING
+            if filename.startswith(prefix)
+        ),
+        None,
+    )
+    if step_key is None:
+        raise RuntimeError(f"Unknown migration step for {filename}")
+    cursor.execute(
+        """
+        SELECT expected_count, verification_details
+        FROM migration.migration_steps
+        WHERE migration_run_id = %s::uuid AND step_key = %s
+        """,
+        (migration_run_id, step_key),
+    )
+    tracking = cursor.fetchone()
+    if tracking is None or tracking[0] is None:
+        raise RuntimeError(
+            f"Missing extraction expectation for {step_key}; refusing to commit"
+        )
+    expected_count = int(tracking[0])
+    expected_details = tracking[1] or {}
+
+    if step_key == "04_chunks_embeddings":
+        cursor.execute(
+            """
+            SELECT
+                COUNT(DISTINCT c.id),
+                COUNT(DISTINCT e.id)
+            FROM migration.id_mappings m
+            LEFT JOIN public.chunks c ON c.document_id = m.new_id
+            LEFT JOIN public.embeddings e
+                ON e.document_id = m.new_id AND e.chunk_id = c.id
+            WHERE m.table_name = 'documents'
+              AND m.migration_run_id = %s::uuid
+              AND m.record_action = 'created'
+            """,
+            (migration_run_id,),
+        )
+        chunk_count, embedding_count = (int(value) for value in cursor.fetchone())
+        expected_embeddings = int(
+            expected_details.get("expected_embeddings", expected_count)
+        )
+        if chunk_count != expected_count or embedding_count != expected_embeddings:
+            raise RuntimeError(
+                "Step verification failed: "
+                f"chunks {chunk_count}/{expected_count}, "
+                f"embeddings {embedding_count}/{expected_embeddings}"
+            )
+        actual_details = {
+            "actual_chunks": chunk_count,
+            "actual_embeddings": embedding_count,
+        }
+        affected_count = chunk_count
+    else:
+        mapping_table = TABLE_MAPPING[
+            next(prefix for prefix in TABLE_MAPPING if filename.startswith(prefix))
+        ]["mapping_table"]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM migration.id_mappings
+            WHERE table_name = %s AND migration_run_id = %s::uuid
+            """,
+            (mapping_table, migration_run_id),
+        )
+        affected_count = int(cursor.fetchone()[0])
+        if affected_count != expected_count:
+            raise RuntimeError(
+                f"Step verification failed for {step_key}: "
+                f"{affected_count}/{expected_count} run-scoped mappings"
+            )
+        actual_details = {"actual_mappings": affected_count}
+
+    cursor.execute(
+        """
+        UPDATE migration.migration_steps
+        SET verification_details =
+            COALESCE(verification_details, '{}'::jsonb) || %s::jsonb
+        WHERE migration_run_id = %s::uuid AND step_key = %s
+        """,
+        (json.dumps(actual_details), migration_run_id, step_key),
+    )
+    return affected_count, actual_details
+
+
+def execute_sql_file(
+    config: ConnectionConfig,
+    file_path: str,
+    migration_run_id: str = None,
+) -> tuple:
     """
     Execute a SQL file.
     
@@ -452,13 +568,20 @@ def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
         # Read SQL file as UTF-8 (required for Hebrew/multilingual content)
         with open(file_path, 'r', encoding='utf-8') as f:
             sql_content = f.read()
+        if migration_run_id and migration_run_id not in sql_content:
+            return (
+                False,
+                "❌ SQL file does not belong to the selected migration run",
+                0,
+            )
         
         # Connect and execute
         # Note: get_connection() already sets client_encoding=UTF8 globally.
         conn = get_connection(config)
-        # Use autocommit so DDL statements (CREATE EXTENSION, CREATE SCHEMA, etc.)
-        # in the migration file are not wrapped in a single implicit transaction.
-        conn.autocommit = True
+        # Execute each generated file atomically. DDL used by these files is
+        # transactional in PostgreSQL, so a failed statement must not leave a
+        # partially-applied migration step.
+        conn.autocommit = False
         cursor = conn.cursor()
         
         rows_affected = 0
@@ -466,7 +589,15 @@ def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
         try:
             # Execute the SQL
             cursor.execute(sql_content)
-            rows_affected = cursor.rowcount
+            if migration_run_id:
+                rows_affected, _ = _verify_step_before_commit(
+                    cursor,
+                    os.path.basename(file_path),
+                    migration_run_id,
+                )
+            else:
+                rows_affected = cursor.rowcount
+            conn.commit()
             
             cursor.close()
             conn.close()
@@ -474,6 +605,7 @@ def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
             return (True, f"✅ Successfully executed! Rows affected: {rows_affected}", rows_affected)
             
         except Exception as e:
+            conn.rollback()
             cursor.close()
             conn.close()
             return (False, f"❌ Execution failed: {str(e)}", 0)
@@ -482,7 +614,319 @@ def execute_sql_file(config: ConnectionConfig, file_path: str) -> tuple:
         return (False, f"❌ Failed to read file: {str(e)}", 0)
 
 
-def rollback_migration(config: ConnectionConfig, filename: str, target_db: str) -> tuple:
+def _cross_database_rollback_blockers(
+    config: ConnectionConfig,
+    mapping_table: str,
+    new_ids: list,
+) -> list:
+    """Return dependent rows that require reverse-order rollback first."""
+    if not new_ids:
+        return []
+
+    checks = []
+    if mapping_table == "users":
+        checks.extend([
+            ("document_db", "folders", "user_id"),
+            ("document_db", "documents", "user_id"),
+            ("completion_db", "agents", "user_id"),
+            ("completion_db", "conversations", "user_id"),
+            ("completion_db", "conversions", "user_id"),
+        ])
+    elif mapping_table == "documents":
+        checks.append(("completion_db", "knowledge_base_items", "item_id"))
+    elif mapping_table == "folders":
+        checks.extend([
+            ("completion_db", "knowledge_base_items", "item_id"),
+            ("completion_db", "agents", "folder_id"),
+        ])
+
+    blockers = []
+    for database, table, column in checks:
+        dep_config = ConnectionConfig(
+            host=config.host,
+            port=config.port,
+            database=database,
+            username=config.username,
+            password=config.password,
+        )
+        conn = get_connection(dep_config)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM public.{table} WHERE {column} = ANY(%s::uuid[])",
+                    (new_ids,),
+                )
+                count = cursor.fetchone()[0]
+                if count:
+                    blockers.append(f"{database}.{table}: {count}")
+        finally:
+            conn.close()
+    return blockers
+
+
+def _local_rollback_blockers(
+    cursor,
+    step_key: str,
+    mapped_ids: list,
+    migration_run_id: str,
+) -> list:
+    """Detect rows that rollback would unexpectedly cascade-delete or mutate."""
+    if not mapped_ids:
+        return []
+    checks = []
+    if step_key == "02_folders":
+        checks = [
+            (
+                "folders.child",
+                """
+                SELECT COUNT(*) FROM folders
+                WHERE parent_id = ANY(%s::uuid[])
+                  AND NOT (id = ANY(%s::uuid[]))
+                """,
+                (mapped_ids, mapped_ids),
+            ),
+            (
+                "documents.folder",
+                """
+                SELECT COUNT(*) FROM documents d
+                WHERE d.folder_id = ANY(%s::uuid[])
+                  AND NOT EXISTS (
+                      SELECT 1 FROM migration.id_mappings m
+                      WHERE m.table_name = 'documents'
+                        AND m.new_id = d.id
+                        AND m.migration_run_id = %s::uuid
+                        AND m.record_action = 'created'
+                  )
+                """,
+                (mapped_ids, migration_run_id),
+            ),
+            (
+                "upload_batch.target_folder",
+                "SELECT COUNT(*) FROM upload_batch WHERE target_folder_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+        ]
+    elif step_key == "03_documents":
+        checks = [
+            (
+                "upload_attempts.document",
+                "SELECT COUNT(*) FROM upload_attempts WHERE document_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+            (
+                "external_source_reference.document",
+                "SELECT COUNT(*) FROM external_source_reference WHERE document_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+            (
+                "chunks.document",
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+            (
+                "embeddings.document",
+                "SELECT COUNT(*) FROM embeddings WHERE document_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+        ]
+    elif step_key == "05_conversations":
+        checks = [
+            (
+                "canvases.conversation",
+                "SELECT COUNT(*) FROM canvases WHERE conversation_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+            (
+                "document_attachments.conversation",
+                "SELECT COUNT(*) FROM document_attachments WHERE conversation_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+            (
+                "message_reactions.message",
+                """
+                SELECT COUNT(*) FROM message_reactions
+                WHERE message_id IN (
+                    SELECT id FROM messages
+                    WHERE conversation_id = ANY(%s::uuid[])
+                )
+                """,
+                (mapped_ids,),
+            ),
+        ]
+    elif step_key == "06_agents":
+        checks = [
+            (
+                "agent_drafts.agent",
+                """
+                SELECT COUNT(*) FROM agent_drafts
+                WHERE original_agent_id = ANY(%s::uuid[])
+                   OR draft_agent_id = ANY(%s::uuid[])
+                """,
+                (mapped_ids, mapped_ids),
+            ),
+            (
+                "agent_skills.agent",
+                "SELECT COUNT(*) FROM agent_skills WHERE agent_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+            (
+                "agent_sub_agents.agent",
+                """
+                SELECT COUNT(*) FROM agent_sub_agents
+                WHERE brain_agent_id = ANY(%s::uuid[])
+                   OR sub_agent_id = ANY(%s::uuid[])
+                """,
+                (mapped_ids, mapped_ids),
+            ),
+            (
+                "agent_conversions.agent",
+                "SELECT COUNT(*) FROM agent_conversions WHERE agent_id = ANY(%s::uuid[])",
+                (mapped_ids,),
+            ),
+        ]
+
+    blockers = []
+    for label, query, params in checks:
+        relation = label.split(".", 1)[0]
+        cursor.execute("SELECT to_regclass(%s)", (f"public.{relation}",))
+        if cursor.fetchone()[0] is None:
+            continue
+        cursor.execute(query, params)
+        count = int(cursor.fetchone()[0])
+        if count:
+            blockers.append(f"{label}: {count}")
+    return blockers
+
+
+def _execute_scoped_rollback(
+    cursor,
+    step_key: str,
+    mapped_ids: list,
+    migration_run_id: str,
+) -> int:
+    """Execute explicit child-before-parent deletes for one tracked step."""
+    deleted = 0
+
+    def delete(query, params):
+        nonlocal deleted
+        cursor.execute(query, params)
+        deleted += max(cursor.rowcount, 0)
+
+    if step_key == "07_conversions":
+        delete(
+            "DELETE FROM agent_conversions WHERE conversion_id = ANY(%s::uuid[])",
+            (mapped_ids,),
+        )
+        delete("DELETE FROM conversions WHERE id = ANY(%s::uuid[])", (mapped_ids,))
+    elif step_key == "06_agents":
+        cursor.execute(
+            """
+            SELECT DISTINCT new_id
+            FROM migration.id_mappings
+            WHERE table_name = 'knowledge_bases'
+              AND migration_run_id = %s::uuid
+              AND record_action = 'created'
+            UNION
+            SELECT migration.deterministic_uuid_v4(
+                %s::uuid, old_id || '-kb'
+            )
+            FROM migration.id_mappings
+            WHERE table_name = 'agents'
+              AND migration_run_id = %s::uuid
+              AND record_action = 'created'
+            """,
+            (migration_run_id, NAMESPACE_UUID, migration_run_id),
+        )
+        kb_ids = [str(row[0]) for row in cursor.fetchall()]
+        if kb_ids:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM knowledge_base_assignments
+                WHERE knowledge_base_id = ANY(%s::uuid[])
+                  AND NOT (
+                      assigned_to_type = 'agent'
+                      AND assigned_to_id = ANY(%s::uuid[])
+                  )
+                """,
+                (kb_ids, mapped_ids),
+            )
+            shared = int(cursor.fetchone()[0])
+            if shared:
+                raise RuntimeError(
+                    f"Rollback blocked: {shared} shared KB assignment(s)"
+                )
+            delete(
+                "DELETE FROM knowledge_base_items WHERE knowledge_base_id = ANY(%s::uuid[])",
+                (kb_ids,),
+            )
+            delete(
+                "DELETE FROM knowledge_base_assignments WHERE knowledge_base_id = ANY(%s::uuid[])",
+                (kb_ids,),
+            )
+            delete(
+                "DELETE FROM knowledge_bases WHERE id = ANY(%s::uuid[])",
+                (kb_ids,),
+            )
+        delete("DELETE FROM agent_settings WHERE agent_id = ANY(%s::uuid[])", (mapped_ids,))
+        delete(
+            "DELETE FROM legacy_bot_to_agent_mapping WHERE new_agent_id = ANY(%s::uuid[])",
+            (mapped_ids,),
+        )
+        delete("DELETE FROM agents WHERE id = ANY(%s::uuid[])", (mapped_ids,))
+        cursor.execute(
+            """
+            DELETE FROM migration.id_mappings
+            WHERE migration_run_id = %s::uuid
+              AND table_name IN (
+                  'knowledge_base_items',
+                  'knowledge_base_assignments',
+                  'knowledge_bases'
+              )
+            """,
+            (migration_run_id,),
+        )
+    elif step_key == "05_conversations":
+        delete(
+            """
+            DELETE FROM message_content_blocks
+            WHERE message_id IN (
+                SELECT id FROM messages
+                WHERE conversation_id = ANY(%s::uuid[])
+            )
+            """,
+            (mapped_ids,),
+        )
+        delete(
+            "DELETE FROM messages WHERE conversation_id = ANY(%s::uuid[])",
+            (mapped_ids,),
+        )
+        delete("DELETE FROM conversations WHERE id = ANY(%s::uuid[])", (mapped_ids,))
+    elif step_key == "04_chunks_embeddings":
+        delete(
+            "DELETE FROM embeddings WHERE document_id = ANY(%s::uuid[])",
+            (mapped_ids,),
+        )
+        delete(
+            "DELETE FROM chunks WHERE document_id = ANY(%s::uuid[])",
+            (mapped_ids,),
+        )
+    elif step_key == "03_documents":
+        delete("DELETE FROM documents WHERE id = ANY(%s::uuid[])", (mapped_ids,))
+    elif step_key == "02_folders":
+        delete("DELETE FROM folders WHERE id = ANY(%s::uuid[])", (mapped_ids,))
+    elif step_key == "01_users":
+        delete("DELETE FROM users WHERE id = ANY(%s::uuid[])", (mapped_ids,))
+    else:
+        raise RuntimeError(f"Unsupported rollback step: {step_key}")
+    return deleted
+
+
+def rollback_migration(
+    config: ConnectionConfig,
+    filename: str,
+    target_db: str,
+    migration_run_id: str,
+) -> tuple:
     """
     Rollback a migration by deleting migrated data and clearing mapping table.
     
@@ -498,6 +942,24 @@ def rollback_migration(config: ConnectionConfig, filename: str, target_db: str) 
     
     if not table_info:
         return (False, "❌ Unknown migration type", 0)
+    if not migration_run_id:
+        return (False, "❌ Select a tracked migration run before rollback", 0)
+
+    step_key = next(
+        prefix.rstrip("_")
+        for prefix in TABLE_MAPPING
+        if filename.startswith(prefix)
+    )
+    order_blockers = _rollback_order_blockers(
+        config, step_key, migration_run_id
+    )
+    if order_blockers:
+        return (
+            False,
+            "❌ Rollback order violation; rollback these later steps first: "
+            + ", ".join(order_blockers),
+            0,
+        )
     
     try:
         conn = get_connection(config)
@@ -507,46 +969,136 @@ def rollback_migration(config: ConnectionConfig, filename: str, target_db: str) 
         total_deleted = 0
         
         try:
-            # Get count of migrated records from mapping table
-            cursor.execute(f"""
-                SELECT COUNT(*) 
-                FROM migration.id_mappings 
-                WHERE table_name = %s
-            """, (table_info["mapping_table"],))
-            
-            mapped_count = cursor.fetchone()[0]
-            
-            if mapped_count == 0:
+            cursor.execute(
+                """
+                SELECT status
+                FROM migration.migration_steps
+                WHERE migration_run_id = %s::uuid AND step_key = %s
+                """,
+                (migration_run_id, step_key),
+            )
+            step_status = cursor.fetchone()
+            if step_status is None:
+                raise RuntimeError(
+                    f"Missing tracking row for rollback step {step_key}"
+                )
+            if step_status[0] == "rolled_back":
+                conn.rollback()
                 cursor.close()
                 conn.close()
-                return (True, "ℹ️ No migrated records found to rollback", 0)
-            
-            # Delete using FK-aware queries (children before parents)
-            for table, where_clause in table_info["deletes"]:
-                try:
-                    cursor.execute(f"DELETE FROM {table} WHERE {where_clause}")
-                    deleted = cursor.rowcount
-                    total_deleted += deleted
-                except Exception:
-                    pass
-            
-            # Clear migration mappings
+                return (True, "ℹ️ Step was already rolled back.", 0)
+            if step_status[0] in ("pending", "skipped"):
+                raise RuntimeError(
+                    f"Step {step_key} has status {step_status[0]} and cannot be rolled back"
+                )
+
+            # Snapshot only records created by this run. Reused entities are
+            # intentionally excluded from all target-table DELETE statements.
             cursor.execute("""
-                DELETE FROM migration.id_mappings 
+                SELECT new_id
+                FROM migration.id_mappings
                 WHERE table_name = %s
-            """, (table_info["mapping_table"],))
-            
-            # Clear batch log
+                  AND migration_run_id = %s::uuid
+                  AND record_action = 'created'
+            """, (table_info["mapping_table"], migration_run_id))
+            mapped_ids = [str(row[0]) for row in cursor.fetchall()]
+            mapped_count = len(mapped_ids)
             cursor.execute("""
-                DELETE FROM migration.batch_log 
+                SELECT COUNT(*)
+                FROM migration.id_mappings
                 WHERE table_name = %s
-            """, (table_info["mapping_table"],))
+                  AND migration_run_id = %s::uuid
+            """, (table_info["mapping_table"], migration_run_id))
+            all_mapping_count = cursor.fetchone()[0]
+            
+            blockers = (
+                _cross_database_rollback_blockers(
+                    config, table_info["mapping_table"], mapped_ids
+                )
+                if table_info.get("clear_mappings", True)
+                else []
+            )
+            if blockers:
+                conn.rollback()
+                cursor.close()
+                conn.close()
+                return (
+                    False,
+                    "❌ Rollback blocked by dependent rows; rollback later steps first: "
+                    + ", ".join(blockers),
+                    0,
+                )
+
+            local_blockers = _local_rollback_blockers(
+                cursor,
+                step_key,
+                mapped_ids,
+                migration_run_id,
+            )
+            if local_blockers:
+                raise RuntimeError(
+                    "Rollback would affect unexpected dependent rows: "
+                    + ", ".join(local_blockers)
+                )
+
+            total_deleted = _execute_scoped_rollback(
+                cursor,
+                step_key,
+                mapped_ids,
+                migration_run_id,
+            )
+
+            parent_table = {
+                "users": "users",
+                "folders": "folders",
+                "documents": "documents",
+                "conversations": "conversations",
+                "agents": "agents",
+                "conversions": "conversions",
+            }.get(table_info["mapping_table"])
+            if parent_table and table_info.get("clear_mappings", True):
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM public.{parent_table} WHERE id = ANY(%s::uuid[])",
+                    (mapped_ids,),
+                )
+                if cursor.fetchone()[0]:
+                    raise RuntimeError(
+                        f"Rollback verification failed: {parent_table} rows survived"
+                    )
+
+            # Step 04 owns no document mappings, so it must never clear them.
+            if table_info.get("clear_mappings", True):
+                cursor.execute("""
+                    DELETE FROM migration.id_mappings
+                    WHERE table_name = %s
+                      AND migration_run_id = %s::uuid
+                """, (table_info["mapping_table"], migration_run_id))
+
+            cursor.execute("""
+                UPDATE migration.migration_steps
+                SET status = 'rolled_back', completed_at = now()
+                WHERE migration_run_id = %s::uuid AND step_key = %s
+            """, (migration_run_id, step_key))
+            cursor.execute("""
+                UPDATE migration.migration_runs
+                SET status = 'rollback_pending'
+                WHERE id = %s::uuid
+            """, (migration_run_id,))
             
             conn.commit()
             cursor.close()
             conn.close()
             
-            return (True, f"✅ Rollback successful! Deleted {total_deleted} records and {mapped_count} mappings", total_deleted)
+            return (
+                True,
+                (
+                    f"✅ Batch-scoped rollback successful! Deleted {total_deleted} "
+                    f"records created by run {migration_run_id}."
+                    if all_mapping_count
+                    else "ℹ️ No run-owned mappings existed; the step was marked rolled back."
+                ),
+                total_deleted,
+            )
             
         except Exception as e:
             conn.rollback()
@@ -556,6 +1108,107 @@ def rollback_migration(config: ConnectionConfig, filename: str, target_db: str) 
             
     except Exception as e:
         return (False, f"❌ Failed to connect: {str(e)}", 0)
+
+
+def rollback_all_migrations(
+    base_config: ConnectionConfig,
+    migration_files: list,
+    migration_run_id: str,
+    source_config: ConnectionConfig = None,
+    progress_callback=None,
+) -> tuple:
+    """Rollback every produced step in strict reverse dependency order."""
+    if not migration_run_id:
+        return False, [], "No tracked migration run selected"
+
+    files_by_prefix = {}
+    for file_info in migration_files:
+        for prefix, _, _ in ALL_STEPS:
+            if file_info["filename"].startswith(prefix):
+                files_by_prefix[prefix] = file_info
+                break
+
+    results = []
+    total_steps = len(ROLLBACK_STEP_ORDER)
+    for index, (prefix, database, label) in enumerate(ROLLBACK_STEP_ORDER):
+        file_info = files_by_prefix.get(prefix)
+        if file_info is None:
+            continue
+        config = ConnectionConfig(
+            host=base_config.host,
+            port=base_config.port,
+            database=database,
+            username=base_config.username,
+            password=base_config.password,
+        )
+        conn = get_connection(config)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM migration.migration_steps
+                    WHERE migration_run_id = %s::uuid AND step_key = %s
+                    """,
+                    (migration_run_id, prefix.rstrip("_")),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return (
+                        False,
+                        results,
+                        f"Missing tracking row for {prefix.rstrip('_')}",
+                    )
+                status = row[0]
+        finally:
+            conn.close()
+
+        if status in ("rolled_back", "skipped"):
+            continue
+        if status == "pending":
+            return (
+                False,
+                results,
+                f"Step {prefix.rstrip('_')} is pending; rollback refuses to guess "
+                "whether untracked SQL was executed.",
+            )
+
+        if progress_callback:
+            progress_callback(index, total_steps, label)
+        success, message, rows = rollback_migration(
+            config,
+            file_info["filename"],
+            database,
+            migration_run_id,
+        )
+        result = {
+            "filename": file_info["filename"],
+            "database": database,
+            "success": success,
+            "message": message,
+            "rows": rows,
+        }
+        results.append(result)
+        overall = reconcile_rollback_status(
+            base_config,
+            migration_run_id,
+            source_config=source_config,
+        )
+        if not success:
+            return False, results, message
+
+    overall = reconcile_rollback_status(
+        base_config,
+        migration_run_id,
+        source_config=source_config,
+    )
+    if overall != "rolled_back":
+        return (
+            False,
+            results,
+            f"Rollback stopped in state {overall}; inspect pending/failed steps.",
+        )
+    return True, results, "All produced steps rolled back successfully"
 
 
 def render_migration_files():
@@ -579,6 +1232,12 @@ def render_migration_files():
         st.info("📭 No migration SQL files found in `output/migrations/`")
         st.markdown("Run the **Select Data** extraction first to generate migration files.")
         return
+    if not st.session_state.get("_current_batch_id"):
+        st.error(
+            "No migration run is selected. Return to Select Data and generate "
+            "a tracked extraction before executing SQL files."
+        )
+        return
     
     st.markdown(f"**Found {len(migration_files)} migration file(s)**")
     st.markdown("---")
@@ -588,15 +1247,6 @@ def render_migration_files():
         st.session_state.migration_status = {}
     
     # Show all expected steps in order, greying out missing ones
-    ALL_STEPS = [
-        ("01_users_", "user_db", "Users"),
-        ("02_folders_", "document_db", "Document folders"),
-        ("03_documents_", "document_db", "Documents"),
-        ("04_chunks_embeddings_", "document_db", "Chunks & embeddings"),
-        ("05_conversations_", "completion_db", "Conversations"),
-        ("06_agents_", "completion_db", "Agents"),
-        ("07_conversions_", "completion_db", "Agent-conversation links"),
-    ]
     files_by_prefix = {}
     for file_info in migration_files:
         for prefix, _, _ in ALL_STEPS:
@@ -650,7 +1300,11 @@ def render_migration_files():
                     )
                     
                     with st.spinner(f"Executing {filename} on {target_db}..."):
-                        success, message, rows = execute_sql_file(db_config, file_info["path"])
+                        success, message, rows = execute_sql_file(
+                            db_config,
+                            file_info["path"],
+                            st.session_state.get("_current_batch_id"),
+                        )
                         
                         status_entry = {
                             "success": success,
@@ -661,13 +1315,21 @@ def render_migration_files():
 
                         # Track per-step result
                         batch_id = st.session_state.get("_current_batch_id")
-                        _update_batch_step_results(batch_id, filename, success, message if not success else None)
+                        _update_batch_step_results(
+                            batch_id,
+                            filename,
+                            success,
+                            message if not success else None,
+                            rows,
+                        )
 
                         if success:
                             with st.spinner("Verifying destination tables..."):
                                 base_config = st.session_state["target_config"]
                                 status_entry["verification"] = verify_migration_result(
-                                    base_config, filename
+                                    base_config,
+                                    filename,
+                                    batch_id,
                                 )
 
                         st.session_state.migration_status[filename] = status_entry
@@ -686,11 +1348,11 @@ def render_migration_files():
             with col4:
                 # Rollback button with popover confirmation
                 with st.popover("🔙 Rollback", use_container_width=True):
-                    st.warning("⚠️ **Warning: This will delete all migrated data!**")
+                    st.warning("⚠️ This deletes only rows created by the selected run.")
                     st.markdown(f"""This will:
-- Delete all records from the target tables
-- Clear migration mappings
-- Clear batch logs
+- Delete records marked `created` for this run
+- Preserve reused users and all pre-existing V5 data
+- Preserve document mappings during Step 04 rollback
 
 **Target DB:** {target_db}
 **File:** {filename}""")
@@ -708,7 +1370,18 @@ def render_migration_files():
                         
                         # Execute rollback
                         with st.spinner(f"Rolling back {filename} on {target_db}..."):
-                            success, message, rows = rollback_migration(db_config, filename, target_db)
+                            success, message, rows = rollback_migration(
+                                db_config,
+                                filename,
+                                target_db,
+                                st.session_state.get("_current_batch_id"),
+                            )
+                            if success:
+                                reconcile_rollback_status(
+                                    base_config,
+                                    st.session_state.get("_current_batch_id"),
+                                    source_config=_source_tracking_config(),
+                                )
                             
                             # Update status to show rollback
                             st.session_state.migration_status[filename] = {
@@ -772,7 +1445,7 @@ def render_migration_files():
     
     # Bulk actions
     st.markdown("### 🎛️ Bulk Actions")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         if st.button("▶️ Run All (In Order)", type="primary"):
@@ -797,7 +1470,11 @@ def render_migration_files():
                     password=base_config.password
                 )
                 
-                success, message, rows = execute_sql_file(db_config, file_info["path"])
+                success, message, rows = execute_sql_file(
+                    db_config,
+                    file_info["path"],
+                    batch_id,
+                )
 
                 status_entry = {
                     "success": success,
@@ -806,11 +1483,21 @@ def render_migration_files():
                     "timestamp": datetime.now()
                 }
 
-                _update_batch_step_results(batch_id, filename, success, message if not success else None)
+                _update_batch_step_results(
+                    batch_id,
+                    filename,
+                    success,
+                    message if not success else None,
+                    rows,
+                )
 
                 if success:
                     status_text.text(f"Verifying {idx + 1}/{len(migration_files)}: {filename}")
-                    status_entry["verification"] = verify_migration_result(base_config, filename)
+                    status_entry["verification"] = verify_migration_result(
+                        base_config,
+                        filename,
+                        batch_id,
+                    )
 
                 st.session_state.migration_status[filename] = status_entry
                 progress_bar.progress((idx + 1) / len(migration_files))
@@ -827,6 +1514,56 @@ def render_migration_files():
             st.rerun()
     
     with col2:
+        with st.popover("🔙 Rollback All (Reverse Order)", use_container_width=True):
+            st.warning(
+                "This removes only rows created by the selected run. "
+                "Reused users and pre-existing V5 data are preserved."
+            )
+            st.code(
+                "07 → 06 → 05 → 04 → 03 → 02 → 01",
+                language=None,
+            )
+            confirm_run = st.text_input(
+                "Type the migration run ID to confirm",
+                key="rollback_all_confirmation",
+            )
+            batch_id = st.session_state.get("_current_batch_id")
+            if st.button(
+                "Confirm Rollback All",
+                type="primary",
+                disabled=confirm_run != batch_id,
+            ):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def update_rollback_progress(index, total, label):
+                    status_text.text(
+                        f"Rolling back {index + 1}/{total}: {label}"
+                    )
+                    progress_bar.progress((index + 1) / total)
+
+                success, rollback_results, message = rollback_all_migrations(
+                    st.session_state["target_config"],
+                    migration_files,
+                    batch_id,
+                    source_config=_source_tracking_config(),
+                    progress_callback=update_rollback_progress,
+                )
+                for result in rollback_results:
+                    st.session_state.migration_status[result["filename"]] = {
+                        "success": None,
+                        "message": result["message"],
+                        "rows_affected": result["rows"],
+                        "timestamp": datetime.now(),
+                        "rollback": True,
+                    }
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
+                st.rerun()
+
+    with col3:
         if st.button("🗑️ Clear Status"):
             st.session_state.migration_status = {}
             st.rerun()

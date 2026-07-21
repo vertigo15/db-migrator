@@ -9,6 +9,11 @@ import pandas as pd
 
 from utils.db import ConnectionConfig, execute_query, get_connection
 from utils.config import get_env_target_defaults
+from utils.migration_tracking import (
+    TARGET_DATABASES,
+    config_for_database,
+    ensure_tracking_schema,
+)
 
 st.set_page_config(page_title="Migration History", page_icon="📋", layout="wide")
 
@@ -30,50 +35,10 @@ def _get_target_config() -> ConnectionConfig:
 
 def _ensure_tracking_tables(config: ConnectionConfig):
     """Create migration tracking tables if they don't exist."""
-    ddl = """
-    CREATE SCHEMA IF NOT EXISTS migration;
-
-    CREATE TABLE IF NOT EXISTS migration.migration_batches (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        completed_at TIMESTAMPTZ,
-        status VARCHAR(20) NOT NULL DEFAULT 'running',
-        total_users INTEGER NOT NULL DEFAULT 0,
-        source_info JSONB,
-        notes TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS migration.migration_user_results (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        batch_id UUID NOT NULL REFERENCES migration.migration_batches(id) ON DELETE CASCADE,
-        email VARCHAR(255) NOT NULL,
-        legacy_user_id VARCHAR(255),
-        v5_user_id UUID,
-        result VARCHAR(50) NOT NULL DEFAULT 'pending',
-        failed_step VARCHAR(100),
-        error_message TEXT,
-        steps_completed JSONB DEFAULT '{}'::jsonb,
-        started_at TIMESTAMPTZ DEFAULT now(),
-        completed_at TIMESTAMPTZ
-    );
-
-    ALTER TABLE migration.migration_user_results
-        ADD COLUMN IF NOT EXISTS steps_completed JSONB DEFAULT '{}'::jsonb;
-
-    CREATE INDEX IF NOT EXISTS idx_user_results_batch
-        ON migration.migration_user_results(batch_id);
-    CREATE INDEX IF NOT EXISTS idx_user_results_email
-        ON migration.migration_user_results(email);
-    CREATE INDEX IF NOT EXISTS idx_user_results_result
-        ON migration.migration_user_results(result);
-    """
     try:
-        conn = get_connection(config)
-        conn.autocommit = True
-        cursor = conn.cursor()
-        cursor.execute(ddl)
-        cursor.close()
-        conn.close()
+        ensure_tracking_schema(
+            config_for_database(config, "user_db"), coordinator=True
+        )
     except Exception:
         pass
 
@@ -99,6 +64,7 @@ def _load_user_results(config: ConnectionConfig, batch_id: str = None) -> pd.Dat
     if batch_id:
         query = """
             SELECT r.email, r.result, r.failed_step, r.error_message,
+                   r.legacy_user_id, r.v5_user_id, r.user_action,
                    r.steps_completed, r.started_at, r.completed_at
             FROM migration.migration_user_results r
             WHERE r.batch_id = %s
@@ -111,6 +77,7 @@ def _load_user_results(config: ConnectionConfig, batch_id: str = None) -> pd.Dat
     else:
         query = """
             SELECT r.email, r.result, r.failed_step, r.error_message,
+                   r.legacy_user_id, r.v5_user_id, r.user_action,
                    r.steps_completed, r.started_at, r.completed_at,
                    b.started_at AS batch_started, b.id AS batch_id
             FROM migration.migration_user_results r
@@ -146,6 +113,40 @@ def _load_summary(config: ConnectionConfig) -> dict:
         return {}
 
 
+def _load_distributed_steps(
+    config: ConnectionConfig,
+    migration_run_id: str,
+) -> pd.DataFrame:
+    frames = []
+    for database in TARGET_DATABASES:
+        database_config = config_for_database(config, database)
+        try:
+            frame = execute_query(
+                database_config,
+                """
+                SELECT step_key, target_database, status, expected_count,
+                       affected_count,
+                       CASE
+                           WHEN expected_count IS NULL THEN 'missing expectation'
+                           WHEN affected_count IS NULL THEN 'not executed'
+                           WHEN expected_count = affected_count THEN 'verified'
+                           ELSE 'mismatch'
+                       END AS verification,
+                       verification_details, error_message,
+                       started_at, completed_at
+                FROM migration.migration_steps
+                WHERE migration_run_id = %s::uuid
+                ORDER BY step_key
+                """,
+                (migration_run_id,),
+            )
+            if not frame.empty:
+                frames.append(frame)
+        except Exception:
+            continue
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def _expand_steps_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Expand steps_completed JSONB into individual columns."""
     if df.empty or "steps_completed" not in df.columns:
@@ -163,7 +164,7 @@ def main():
     st.title("📋 Migration History")
     st.caption("View migration batches and per-user results with per-step tracking.")
 
-    config = _get_target_config()
+    config = config_for_database(_get_target_config(), "user_db")
 
     if not config.host:
         st.warning("Target database not configured. Go to the Connect page first.")
@@ -226,6 +227,10 @@ def main():
         results_df = _load_user_results(config)
     else:
         results_df = _load_user_results(config, selected_batch)
+        step_results = _load_distributed_steps(config, str(selected_batch))
+        if not step_results.empty:
+            st.subheader("Per-database Step Facts")
+            st.dataframe(step_results, hide_index=True, use_container_width=True)
 
     if results_df.empty:
         st.info("No user results for this selection.")

@@ -127,6 +127,8 @@ CREATE TABLE IF NOT EXISTS public.chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON public.chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_document_processing_id
+    ON public.chunks(document_processing_id);
 
 -- ── embeddings ──────────────────────────────────────────────
 -- V5 uses untyped vector + per-row dimension column with

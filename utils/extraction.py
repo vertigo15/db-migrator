@@ -3,6 +3,7 @@ Extraction engine for extracting data from source database.
 """
 import os
 import json
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Callable
 import pandas as pd
@@ -21,7 +22,135 @@ from utils.sql_generator import (
     generate_chunks_embeddings_migration_sql,
     generate_conversations_logs_migration_sql,
     generate_conversions_migration_sql,
+    deterministic_uuid_v4_py,
+    USER_NAMESPACE_UUID,
 )
+
+
+def normalize_email(value: object) -> str:
+    """Return the canonical email key used for source/target matching."""
+    return str(value or "").strip().lower()
+
+
+def resolve_existing_user_overrides(
+    source_config: ConnectionConfig,
+    target_user_config: ConnectionConfig,
+    prefix: str,
+    user_emails: List[str],
+    manual_overrides: Optional[Dict[str, str]] = None,
+) -> Dict:
+    """Resolve selected V4 users to existing V5 users, failing on ambiguity."""
+    normalized = [normalize_email(email) for email in user_emails if normalize_email(email)]
+    if not normalized:
+        raise ValueError("No valid selected user emails were supplied.")
+
+    users_table = get_table_name("users", prefix)
+    placeholders = ", ".join(["%s"] * len(normalized))
+    source_df = execute_query(
+        source_config,
+        f"""
+        SELECT id::text AS legacy_user_id, email
+        FROM public.{users_table}
+        WHERE lower(trim(email)) IN ({placeholders})
+        """,
+        tuple(normalized),
+    )
+    if source_df.empty:
+        raise ValueError("No selected users were found in the V4 source.")
+
+    source_df["normalized_email"] = source_df["email"].apply(normalize_email)
+    source_duplicates = source_df[
+        source_df.duplicated("normalized_email", keep=False)
+    ]["normalized_email"].unique().tolist()
+    if source_duplicates:
+        raise ValueError(
+            "Ambiguous V4 email matches: " + ", ".join(sorted(source_duplicates))
+        )
+
+    target_df = execute_query(
+        target_user_config,
+        f"""
+        SELECT id::text AS v5_user_id, email, organization_id::text
+        FROM public.users
+        WHERE lower(trim(email)) IN ({placeholders})
+        """,
+        tuple(normalized),
+    )
+    if not target_df.empty:
+        target_df["normalized_email"] = target_df["email"].apply(normalize_email)
+        target_duplicates = target_df[
+            target_df.duplicated("normalized_email", keep=False)
+        ]["normalized_email"].unique().tolist()
+        if target_duplicates:
+            raise ValueError(
+                "Ambiguous V5 email matches: " + ", ".join(sorted(target_duplicates))
+            )
+
+    target_by_email = {
+        row["normalized_email"]: row for _, row in target_df.iterrows()
+    } if not target_df.empty else {}
+    manual = manual_overrides or {}
+    resolved: Dict[str, str] = {}
+    users: List[Dict[str, str]] = []
+    warnings: List[str] = []
+
+    for _, source_row in source_df.iterrows():
+        legacy_id = str(source_row["legacy_user_id"])
+        email = str(source_row["email"]).strip()
+        target_row = target_by_email.get(source_row["normalized_email"])
+        automatic_id = str(target_row["v5_user_id"]) if target_row is not None else None
+        manual_id = manual.get(legacy_id)
+        if manual_id and automatic_id and str(manual_id) != automatic_id:
+            raise ValueError(
+                f"Manual override for {email} conflicts with its normalized-email V5 match."
+            )
+
+        v5_user_id = str(manual_id or automatic_id or deterministic_uuid_v4_py(
+            USER_NAMESPACE_UUID, legacy_id
+        ))
+        action = "reused" if manual_id or automatic_id else "created"
+        if action == "reused":
+            resolved[legacy_id] = v5_user_id
+        if target_row is not None and target_row.get("organization_id"):
+            warnings.append(
+                f"{email} already belongs to V5 organization "
+                f"{target_row['organization_id']}; its organization will not be changed."
+            )
+        users.append({
+            "email": email,
+            "legacy_user_id": legacy_id,
+            "v5_user_id": v5_user_id,
+            "action": action,
+        })
+
+    unmatched_manual = set(manual) - {u["legacy_user_id"] for u in users}
+    if unmatched_manual:
+        raise ValueError(
+            "Manual overrides reference unselected V4 users: "
+            + ", ".join(sorted(unmatched_manual))
+        )
+
+    return {"overrides": resolved, "users": users, "warnings": warnings}
+
+
+def validate_target_organization(
+    target_admin_config: ConnectionConfig,
+    organization_id: str,
+) -> None:
+    """Fail unless the selected organization exists and is active."""
+    org_df = execute_query(
+        target_admin_config,
+        """
+        SELECT id
+        FROM public.organizations
+        WHERE id = %s::uuid AND is_active = true
+        """,
+        (organization_id,),
+    )
+    if org_df.empty:
+        raise ValueError(
+            f"Organization {organization_id} does not exist or is not active in admin_db."
+        )
 
 
 class ExtractionEngine:
@@ -41,7 +170,9 @@ class ExtractionEngine:
         embedding_model: str = 'text-embedding-ada-002',
         skip_empty_embeddings: bool = False,
         target_embedding_dim: Optional[int] = None,
-        user_id_overrides: Optional[Dict[str, str]] = None
+        user_id_overrides: Optional[Dict[str, str]] = None,
+        migration_run_id: Optional[str] = None,
+        cross_owner_policy: str = "block",
     ):
         """
         Initialize extraction engine.
@@ -71,6 +202,10 @@ class ExtractionEngine:
         self.skip_empty_embeddings = skip_empty_embeddings
         self.target_embedding_dim = target_embedding_dim
         self.user_id_overrides = user_id_overrides or {}
+        self.migration_run_id = migration_run_id or str(uuid.uuid4())
+        if cross_owner_policy not in {"block", "reassign"}:
+            raise ValueError("cross_owner_policy must be 'block' or 'reassign'")
+        self.cross_owner_policy = cross_owner_policy
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Ensure output directories exist
@@ -83,6 +218,54 @@ class ExtractionEngine:
         """Report progress if callback is set."""
         if self.progress_callback:
             self.progress_callback(table_name, current, total)
+
+    @staticmethod
+    def evaluate_document_readiness(
+        documents_df: pd.DataFrame,
+        embeddings_df: pd.DataFrame,
+    ) -> Dict[str, List[str]]:
+        """Classify planned documents from chunks/embeddings actually selected."""
+        all_doc_ids = (
+            {str(value) for value in documents_df.get("doc_id", [])}
+            if not documents_df.empty
+            else set()
+        )
+        chunk_counts: Dict[str, int] = {}
+        embedding_counts: Dict[str, int] = {}
+        if not embeddings_df.empty:
+            for _, row in embeddings_df.iterrows():
+                metadata = row.get("metadata")
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (ValueError, TypeError):
+                        metadata = {}
+                if not isinstance(metadata, dict):
+                    continue
+                doc_id = metadata.get("doc_id")
+                if not doc_id or metadata.get("type", "chunk-data") != "chunk-data":
+                    continue
+                doc_id = str(doc_id)
+                chunk_counts[doc_id] = chunk_counts.get(doc_id, 0) + 1
+                embedding = row.get("embeddings")
+                has_embedding = embedding is not None
+                if isinstance(embedding, float) and pd.isna(embedding):
+                    has_embedding = False
+                if isinstance(embedding, str) and not embedding.strip():
+                    has_embedding = False
+                if has_embedding:
+                    embedding_counts[doc_id] = embedding_counts.get(doc_id, 0) + 1
+
+        ready = {
+            doc_id
+            for doc_id in all_doc_ids
+            if chunk_counts.get(doc_id, 0) > 0
+            and chunk_counts[doc_id] == embedding_counts.get(doc_id, 0)
+        }
+        return {
+            "ready_document_ids": sorted(ready),
+            "documents_requiring_reprocessing": sorted(all_doc_ids - ready),
+        }
 
     def _get_users_group_column(self, users_table: str) -> Optional[str]:
         """Detect group-id column name in users table across environments."""
@@ -152,11 +335,11 @@ class ExtractionEngine:
                     output_file=sql_output_path,
                     source_info=source_info,
                     org_id=self.organization_id,
-                    user_id_overrides=self.user_id_overrides
+                    user_id_overrides=self.user_id_overrides,
+                    migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
-                # Log error but don't fail extraction
-                print(f"Warning: Failed to generate SQL for users: {str(e)}")
+                raise RuntimeError(f"Failed to generate users SQL: {e}") from e
         
         return df, output_path
     
@@ -182,6 +365,7 @@ class ExtractionEngine:
             WHERE owner_id IN ({placeholders})
         """
         df = execute_query(self.config, query, tuple(user_ids))
+        df = self._resolve_folder_ancestor_closure(df, user_ids)
         
         output_path = os.path.join(self.output_dir, f"folders_{self.timestamp}.csv")
         if self.export_csv:
@@ -196,11 +380,11 @@ class ExtractionEngine:
                     folders_df=df,
                     output_file=sql_output_path,
                     source_info=source_info,
-                    user_id_overrides=self.user_id_overrides
+                    user_id_overrides=self.user_id_overrides,
+                    migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
-                # Log error but don't fail extraction
-                print(f"Warning: Failed to generate SQL for folders: {str(e)}")
+                raise RuntimeError(f"Failed to generate folders SQL: {e}") from e
         
         return df, output_path
     
@@ -282,13 +466,11 @@ class ExtractionEngine:
                     documents_df=df,
                     output_file=sql_output_path,
                     source_info=source_info,
-                    user_id_overrides=self.user_id_overrides
+                    user_id_overrides=self.user_id_overrides,
+                    migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
-                # Log error but don't fail extraction
-                import sys, traceback
-                print(f"Warning: Failed to generate SQL for documents: {str(e)}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
+                raise RuntimeError(f"Failed to generate documents SQL: {e}") from e
         
         return df, output_path
     
@@ -310,7 +492,7 @@ class ExtractionEngine:
         query = f"""
             SELECT id, external_id, collection, document, metadata, embeddings
             FROM public.{table_name}
-            WHERE 1=1
+            WHERE metadata->>'type' = 'chunk-data'
         """
         params = []
         if selected_embedding_ids is not None:
@@ -351,11 +533,13 @@ class ExtractionEngine:
                     source_info=source_info,
                     default_embedding_model=self.embedding_model,
                     skip_empty_embeddings=self.skip_empty_embeddings,
-                    target_embedding_dim=self.target_embedding_dim
+                    target_embedding_dim=self.target_embedding_dim,
+                    migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
-                # Log error but don't fail extraction
-                print(f"Warning: Failed to generate SQL for chunks/embeddings: {str(e)}")
+                raise RuntimeError(
+                    f"Failed to generate chunks/embeddings SQL: {e}"
+                ) from e
         
         return df, output_path
     
@@ -422,6 +606,7 @@ class ExtractionEngine:
                 docs_df=docs_df,
                 embeddings_df=embeddings_df,
                 folders_df=folders_df,
+                selected_user_ids=user_ids,
             )
             # Regenerate dependent SQL files if anything was topped up
             if self.generate_sql:
@@ -432,10 +617,13 @@ class ExtractionEngine:
                             folders_df=folders_df,
                             output_file=folders_sql,
                             source_info=source_info_base,
-                            user_id_overrides=self.user_id_overrides
+                            user_id_overrides=self.user_id_overrides,
+                            migration_run_id=self.migration_run_id,
                         )
                     except Exception as e:
-                        print(f"Warning: Failed to regenerate folders SQL after topup: {e}")
+                        raise RuntimeError(
+                            f"Failed to regenerate folders SQL after topup: {e}"
+                        ) from e
 
                 if topup_report.get('added_doc_ids'):
                     from utils.sql_generator import generate_documents_migration_sql, generate_chunks_embeddings_migration_sql
@@ -448,9 +636,12 @@ class ExtractionEngine:
                             user_id_overrides=self.user_id_overrides,
                             doc_source_labels=topup_report.get('doc_source_labels', {}),
                             embeddings_df=embeddings_df,
+                            migration_run_id=self.migration_run_id,
                         )
                     except Exception as e:
-                        print(f"Warning: Failed to regenerate documents SQL after topup: {e}")
+                        raise RuntimeError(
+                            f"Failed to regenerate documents SQL after topup: {e}"
+                        ) from e
 
                     if len(embeddings_df) > 0:
                         emb_sql = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
@@ -461,10 +652,13 @@ class ExtractionEngine:
                                 source_info=f"{self.config.host}:{self.config.port}/{self.config.database} (table: {get_table_name('embeddings', self.prefix)})",
                                 default_embedding_model=self.embedding_model,
                                 skip_empty_embeddings=self.skip_empty_embeddings,
-                                target_embedding_dim=self.target_embedding_dim
+                                target_embedding_dim=self.target_embedding_dim,
+                                migration_run_id=self.migration_run_id,
                             )
                         except Exception as e:
-                            print(f"Warning: Failed to regenerate embeddings SQL after topup: {e}")
+                            raise RuntimeError(
+                                f"Failed to regenerate embeddings SQL after topup: {e}"
+                            ) from e
 
         # Expose topup_report for run_full_extraction to collect
         self._last_topup_report = topup_report
@@ -482,9 +676,10 @@ class ExtractionEngine:
                     source_info=source_info,
                     user_id_overrides=self.user_id_overrides,
                     merged_instructions=merged_instructions,
+                    migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
-                print(f"Warning: Failed to generate SQL for agents: {str(e)}")
+                raise RuntimeError(f"Failed to generate agents SQL: {e}") from e
 
         return df, output_path
     
@@ -543,6 +738,121 @@ class ExtractionEngine:
             v = str(val).strip()
             return v if v else None
 
+    def _resolve_folder_ancestor_closure(
+        self,
+        folders_df: pd.DataFrame,
+        selected_user_ids: List[str],
+    ) -> pd.DataFrame:
+        """Include every source ancestor and reject orphaned or cyclic hierarchies."""
+        if folders_df.empty:
+            self._folder_hierarchy_report = {
+                "added_ancestor_ids": [],
+                "reassigned_ancestor_ids": [],
+                "stale_parent_ids": [],
+                "detached_folder_ids": [],
+            }
+            return folders_df
+
+        folders_table = get_table_name("folders", self.prefix)
+        result = folders_df.copy()
+        selected_owners = {str(value) for value in selected_user_ids}
+        added: List[str] = []
+        reassigned: List[str] = []
+        stale_parents: List[str] = []
+        detached_folders: List[str] = []
+
+        while True:
+            known = {
+                self._normalise_folder_id(value)
+                for value in result["id"].tolist()
+            }
+            known.discard(None)
+            requested_by: Dict[str, set] = {}
+            for _, row in result.iterrows():
+                parent_id = self._normalise_folder_id(row.get("parent_id"))
+                if parent_id and parent_id not in known:
+                    requested_by.setdefault(parent_id, set()).add(
+                        str(row.get("owner_id"))
+                    )
+            if not requested_by:
+                break
+
+            missing_ids = sorted(requested_by)
+            placeholders = ", ".join(["%s"] * len(missing_ids))
+            ancestors = execute_query(
+                self.config,
+                f"""
+                    SELECT id, folder_name, owner_id, parent_id, created_at, folder_type
+                    FROM public.{folders_table}
+                    WHERE id IN ({placeholders})
+                """,
+                tuple(missing_ids),
+            )
+            fetched = {
+                self._normalise_folder_id(value)
+                for value in ancestors.get("id", [])
+            }
+            fetched.discard(None)
+            unresolved = set(missing_ids) - fetched
+            if unresolved:
+                stale_parents.extend(sorted(unresolved))
+                for index, row in result.iterrows():
+                    parent_id = self._normalise_folder_id(row.get("parent_id"))
+                    if parent_id in unresolved:
+                        result.at[index, "parent_id"] = None
+                        folder_id = self._normalise_folder_id(row.get("id"))
+                        if folder_id:
+                            detached_folders.append(folder_id)
+
+            for index, row in ancestors.iterrows():
+                folder_id = self._normalise_folder_id(row.get("id"))
+                owner_id = str(row.get("owner_id"))
+                if owner_id in selected_owners:
+                    continue
+                if self.cross_owner_policy == "block":
+                    raise ValueError(
+                        f"Folder ancestor {folder_id} belongs to unselected user "
+                        f"{owner_id}. Include that owner or choose reassign."
+                    )
+                candidate_owners = requested_by.get(folder_id, set()) & selected_owners
+                if not candidate_owners and len(selected_owners) == 1:
+                    candidate_owners = set(selected_owners)
+                if len(candidate_owners) != 1:
+                    raise ValueError(
+                        f"Cannot unambiguously reassign folder ancestor {folder_id}; "
+                        "include its owner in the migration."
+                    )
+                ancestors.at[index, "owner_id"] = next(iter(candidate_owners))
+                reassigned.append(folder_id)
+
+            added.extend(sorted(fetched))
+            result = pd.concat([result, ancestors], ignore_index=True)
+            result = result.drop_duplicates(subset=["id"], keep="first")
+
+        parents = {
+            self._normalise_folder_id(row.get("id")):
+            self._normalise_folder_id(row.get("parent_id"))
+            for _, row in result.iterrows()
+        }
+        for folder_id in parents:
+            seen = set()
+            current = folder_id
+            while current is not None:
+                if current in seen:
+                    raise ValueError(
+                        f"Folder hierarchy cycle detected at source folder {current}"
+                    )
+                seen.add(current)
+                current = parents.get(current)
+
+        self._folder_hierarchy_report = {
+            "added_ancestor_ids": sorted(set(added)),
+            "reassigned_ancestor_ids": sorted(set(reassigned)),
+            "stale_parent_ids": sorted(set(stale_parents)),
+            "detached_folder_ids": sorted(set(detached_folders)),
+        }
+        return result
+
     # ---------------------------------------------------------------------- #
     # Helper: collect doc/folder IDs referenced by every agent in a DataFrame #
     # ---------------------------------------------------------------------- #
@@ -587,11 +897,35 @@ class ExtractionEngine:
                             for f in cleaned.split(',') if f.strip()
                         ]
                         folder_ids = [f for f in folder_ids if f]
-
             agent_doc_map[bot_id] = doc_ids
             agent_folder_map[bot_id] = folder_ids
 
         return agent_doc_map, agent_folder_map
+
+    @classmethod
+    def _sanitize_agent_refs(
+        cls,
+        agents_df: pd.DataFrame,
+        removed_doc_ids: set,
+        removed_folder_ids: set,
+    ) -> pd.DataFrame:
+        """Remove unresolved references before Step 06 SQL is generated."""
+        sanitized = agents_df.copy()
+        doc_map, folder_map = cls._collect_agent_refs(sanitized)
+        for index, row in sanitized.iterrows():
+            bot_id = str(row.get("bot_id") or "").strip()
+            sanitized.at[index, "docs_chosen"] = [
+                doc_id for doc_id in doc_map.get(bot_id, [])
+                if doc_id not in removed_doc_ids
+            ]
+            sanitized.at[index, "chosen_docs_folders"] = [
+                folder_id for folder_id in folder_map.get(bot_id, [])
+                if folder_id not in removed_folder_ids
+            ]
+            direct_folder = cls._normalise_folder_id(row.get("folder_id"))
+            if direct_folder in removed_folder_ids:
+                sanitized.at[index, "folder_id"] = None
+        return sanitized
 
     def analyze_agent_dependencies(
         self,
@@ -621,6 +955,14 @@ class ExtractionEngine:
 
         all_agent_doc_ids: set = {d for docs in agent_doc_map.values() for d in docs}
         all_agent_folder_ids: set = {f for fids in agent_folder_map.values() for f in fids}
+        all_agent_folder_ids.update(
+            folder_id
+            for folder_id in (
+                self._normalise_folder_id(value)
+                for value in agents_df.get("folder_id", pd.Series(dtype=object))
+            )
+            if folder_id
+        )
 
         existing_doc_ids = set(docs_df['doc_id'].astype(str).tolist()) if len(docs_df) > 0 else set()
         existing_folder_ids = (
@@ -726,6 +1068,14 @@ class ExtractionEngine:
         agent_doc_map, agent_folder_map = self._collect_agent_refs(agents_df)
         agent_doc_ids: set = {d for docs in agent_doc_map.values() for d in docs}
         agent_folder_ids: set = {f for fids in agent_folder_map.values() for f in fids}
+        agent_folder_ids.update(
+            folder_id
+            for folder_id in (
+                self._normalise_folder_id(value)
+                for value in agents_df.get("folder_id", pd.Series(dtype=object))
+            )
+            if folder_id
+        )
 
         # Build reverse map: doc_id -> first bot_id that references it (for SQL label)
         doc_to_agent: Dict[str, str] = {}
@@ -733,16 +1083,44 @@ class ExtractionEngine:
             for d in doc_ids:
                 if d not in doc_to_agent:
                     doc_to_agent[d] = bot_id
+        agent_owners = {
+            str(row.get("bot_id")): str(row.get("user_id"))
+            for _, row in agents_df.iterrows()
+            if row.get("bot_id") and row.get("user_id")
+        }
+        folder_to_agent: Dict[str, str] = {}
+        for bot_id, folder_ids in agent_folder_map.items():
+            for folder_id in folder_ids:
+                folder_to_agent.setdefault(folder_id, bot_id)
+        for _, row in agents_df.iterrows():
+            direct_folder = self._normalise_folder_id(row.get("folder_id"))
+            if direct_folder:
+                folder_to_agent.setdefault(direct_folder, str(row.get("bot_id")))
 
         # ------------------------------------------------------------------ #
         # 2. Topup: missing documents                                          #
         # ------------------------------------------------------------------ #
         existing_doc_ids = set(docs_df["doc_id"].astype(str).tolist()) if len(docs_df) > 0 else set()
         missing_doc_ids = agent_doc_ids - existing_doc_ids
+        selected_set = {str(user_id) for user_id in (selected_user_ids or [])}
 
         added_doc_ids: List[str] = []
         stale_doc_ids: List[str] = []
+        out_of_scope_owner_doc_ids: List[str] = []
         doc_source_labels: Dict[str, str] = {}
+
+        if selected_set and len(docs_df) > 0:
+            for index, doc_row in docs_df.iterrows():
+                doc_id = str(doc_row.get("doc_id"))
+                if doc_id in agent_doc_ids and str(doc_row.get("owner_id")) not in selected_set:
+                    out_of_scope_owner_doc_ids.append(doc_id)
+                    if self.cross_owner_policy == "reassign":
+                        owner = agent_owners.get(doc_to_agent.get(doc_id, ""))
+                        if not owner:
+                            raise ValueError(
+                                f"Cannot determine reassignment owner for document {doc_id}"
+                            )
+                        docs_df.at[index, "owner_id"] = owner
 
         if missing_doc_ids:
             print(f"[topup] Fetching {len(missing_doc_ids)} agent-referenced document(s) not in selection...")
@@ -760,6 +1138,24 @@ class ExtractionEngine:
 
             found_ids = set(new_docs_df["doc_id"].astype(str).tolist()) if len(new_docs_df) > 0 else set()
             stale_doc_ids = list(missing_doc_ids - found_ids)
+            if selected_set and len(new_docs_df) > 0:
+                out_of_scope_owner_doc_ids.extend(
+                    str(row["doc_id"])
+                    for _, row in new_docs_df.iterrows()
+                    if str(row.get("owner_id")) not in selected_set
+                )
+                out_of_scope_owner_doc_ids = sorted(set(out_of_scope_owner_doc_ids))
+                if self.cross_owner_policy == "reassign" and out_of_scope_owner_doc_ids:
+                    for index, doc_row in new_docs_df.iterrows():
+                        doc_id = str(doc_row["doc_id"])
+                        if doc_id not in out_of_scope_owner_doc_ids:
+                            continue
+                        owner = agent_owners.get(doc_to_agent.get(doc_id, ""))
+                        if not owner:
+                            raise ValueError(
+                                f"Cannot determine reassignment owner for document {doc_id}"
+                            )
+                        new_docs_df.at[index, "owner_id"] = owner
 
             if found_ids:
                 stale_doc_ids = list(missing_doc_ids - found_ids)
@@ -807,6 +1203,21 @@ class ExtractionEngine:
         stale_folder_ids: List[str] = []
         out_of_scope_owner_folder_ids: List[str] = []
         all_new_folder_rows: List[pd.DataFrame] = []
+        if selected_set and len(folders_df) > 0:
+            for index, folder_row in folders_df.iterrows():
+                folder_id = self._normalise_folder_id(folder_row.get("id"))
+                if (
+                    folder_id in agent_folder_ids
+                    and str(folder_row.get("owner_id")) not in selected_set
+                ):
+                    out_of_scope_owner_folder_ids.append(folder_id)
+                    if self.cross_owner_policy == "reassign":
+                        owner = agent_owners.get(folder_to_agent.get(folder_id, ""))
+                        if not owner:
+                            raise ValueError(
+                                f"Cannot determine reassignment owner for folder {folder_id}"
+                            )
+                        folders_df.at[index, "owner_id"] = owner
 
         if missing_folder_ids:
             print(f"[topup] Fetching {len(missing_folder_ids)} agent-referenced folder(s) not in selection "
@@ -856,6 +1267,21 @@ class ExtractionEngine:
                 new_folders_df = pd.concat(all_new_folder_rows, ignore_index=True)
                 # Drop duplicates in case ancestors appeared in multiple batches
                 new_folders_df = new_folders_df.drop_duplicates(subset=["id"])
+                if self.cross_owner_policy == "reassign" and out_of_scope_owner_folder_ids:
+                    for index, folder_row in new_folders_df.iterrows():
+                        folder_id = self._normalise_folder_id(folder_row["id"])
+                        if folder_id not in out_of_scope_owner_folder_ids:
+                            continue
+                        agent_id = folder_to_agent.get(folder_id)
+                        owner = agent_owners.get(agent_id) if agent_id else None
+                        if not owner and len(selected_set) == 1:
+                            owner = next(iter(selected_set))
+                        if not owner:
+                            raise ValueError(
+                                f"Cannot unambiguously reassign folder {folder_id}; "
+                                "include its owner in the batch instead."
+                            )
+                        new_folders_df.at[index, "owner_id"] = owner
                 added_folder_ids = new_folders_df["id"].apply(self._normalise_folder_id).dropna().tolist()
                 folders_df = pd.concat([folders_df, new_folders_df], ignore_index=True)
                 print(f"[topup] Added {len(added_folder_ids)} folder(s) (including ancestors).")
@@ -865,14 +1291,61 @@ class ExtractionEngine:
             elif missing_folder_ids:
                 stale_folder_ids = list(missing_folder_ids)
 
+        cross_owner_doc_set = set(out_of_scope_owner_doc_ids)
+        cross_owner_folder_set = set(out_of_scope_owner_folder_ids)
+        if self.cross_owner_policy == "block" and (
+            cross_owner_doc_set or cross_owner_folder_set
+        ):
+            raise ValueError(
+                "Agent dependencies reference content owned by users outside the "
+                "selected batch. Include those owners or explicitly choose the "
+                "drop policy. Documents: "
+                f"{sorted(cross_owner_doc_set)[:10]}; folders: "
+                f"{sorted(cross_owner_folder_set)[:10]}"
+            )
+
+        removed_doc_ids = set(stale_doc_ids)
+        removed_folder_ids = set(stale_folder_ids)
+        sanitized_agents = self._sanitize_agent_refs(
+            agents_df, removed_doc_ids, removed_folder_ids
+        )
+        for column in ("docs_chosen", "chosen_docs_folders", "folder_id"):
+            agents_df[column] = sanitized_agents[column]
+
         report: Dict = {
             'added_doc_ids': added_doc_ids,
             'stale_doc_ids': stale_doc_ids,
             'added_folder_ids': added_folder_ids,
             'stale_folder_ids': stale_folder_ids,
             'out_of_scope_owner_folder_ids': out_of_scope_owner_folder_ids,
+            'out_of_scope_owner_doc_ids': out_of_scope_owner_doc_ids,
+            'reassigned_doc_ids': (
+                sorted(cross_owner_doc_set)
+                if self.cross_owner_policy == "reassign"
+                else []
+            ),
+            'reassigned_folder_ids': (
+                sorted(cross_owner_folder_set)
+                if self.cross_owner_policy == "reassign"
+                else []
+            ),
+            'removed_doc_ids': sorted(removed_doc_ids),
+            'removed_folder_ids': sorted(removed_folder_ids),
             'doc_source_labels': doc_source_labels,
+            'total_document_rows': len(docs_df),
+            'total_folder_rows': len(folders_df),
+            'total_chunk_rows': len(embeddings_df),
+            'total_embedding_rows': int(
+                embeddings_df["embeddings"].apply(
+                    lambda value: value is not None
+                    and not (isinstance(value, float) and pd.isna(value))
+                    and not (isinstance(value, str) and not value.strip())
+                ).sum()
+            ) if "embeddings" in embeddings_df.columns else 0,
         }
+        report["document_readiness"] = self.evaluate_document_readiness(
+            docs_df, embeddings_df
+        )
         return docs_df, embeddings_df, folders_df, report
 
     def extract_logs(
@@ -947,11 +1420,13 @@ class ExtractionEngine:
                     logs_df=df,
                     output_file=sql_output_path,
                     source_info=source_info,
-                    user_id_overrides=self.user_id_overrides
+                    user_id_overrides=self.user_id_overrides,
+                    migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
-                # Log error but don't fail extraction
-                print(f"Warning: Failed to generate SQL for conversations/messages: {str(e)}")
+                raise RuntimeError(
+                    f"Failed to generate conversations SQL: {e}"
+                ) from e
         
         return df, output_path
     
@@ -998,9 +1473,12 @@ class ExtractionEngine:
                     output_file=sql_output_path,
                     source_info=source_info,
                     user_id_overrides=self.user_id_overrides,
+                    migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
-                print(f"Warning: Failed to generate SQL for conversions: {str(e)}")
+                raise RuntimeError(
+                    f"Failed to generate conversions SQL: {e}"
+                ) from e
 
         return df, output_path
 
@@ -1069,6 +1547,9 @@ class ExtractionEngine:
             folders_df, folders_path = self.extract_folders(user_ids)
             results["files"]["folders"] = folders_path
             results["summary"]["folders"] = len(folders_df)
+            results["folder_hierarchy_report"] = getattr(
+                self, "_folder_hierarchy_report", {}
+            )
             
             # Track SQL generation
             if self.generate_sql and len(folders_df) > 0:
@@ -1101,6 +1582,13 @@ class ExtractionEngine:
                 embeddings_df, embeddings_path = self.extract_embeddings(doc_ids, selected_embedding_ids)
                 results["files"]["embeddings"] = embeddings_path
                 results["summary"]["embeddings"] = len(embeddings_df)
+                results["summary"]["embedding_vectors"] = int(
+                    embeddings_df["embeddings"].apply(
+                        lambda value: value is not None
+                        and not (isinstance(value, float) and pd.isna(value))
+                        and not (isinstance(value, str) and not value.strip())
+                    ).sum()
+                ) if "embeddings" in embeddings_df.columns else 0
 
                 # Track SQL generation (chunks + embeddings combined)
                 if self.generate_sql and len(embeddings_df) > 0:
@@ -1120,12 +1608,20 @@ class ExtractionEngine:
                             source_info=_src,
                             user_id_overrides=self.user_id_overrides,
                             embeddings_df=embeddings_df,
+                            migration_run_id=self.migration_run_id,
                         )
                     except Exception as e:
-                        print(f"Warning: Failed to regenerate documents SQL with translation info: {e}")
+                        raise RuntimeError(
+                            f"Failed to regenerate documents SQL with translation info: {e}"
+                        ) from e
             else:
                 results["summary"]["embeddings"] = 0
+                results["summary"]["embedding_vectors"] = 0
                 embeddings_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
+
+            results["document_readiness"] = self.evaluate_document_readiness(
+                docs_df, embeddings_df
+            )
             
             # 6. Extract agents — pass current docs/folders/embeddings so topup
             #    runs inside extract_agents() and SQL files are regenerated atomically.
@@ -1152,6 +1648,15 @@ class ExtractionEngine:
             topup_report = getattr(self, '_last_topup_report', None)
             if topup_report:
                 results['topup_report'] = topup_report
+                results["summary"]["folders"] = topup_report["total_folder_rows"]
+                results["summary"]["documents"] = topup_report["total_document_rows"]
+                results["summary"]["embeddings"] = topup_report["total_chunk_rows"]
+                results["summary"]["embedding_vectors"] = topup_report[
+                    "total_embedding_rows"
+                ]
+                results["document_readiness"] = topup_report.get(
+                    "document_readiness", results["document_readiness"]
+                )
                 source_info_base = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
 
                 if topup_report.get('added_folder_ids'):
@@ -1177,6 +1682,20 @@ class ExtractionEngine:
             )
             results["files"]["logs"] = logs_path
             results["summary"]["logs"] = len(logs_df)
+            valid_chat_ids = set()
+            invalid_chat_rows = 0
+            for value in logs_df.get("chat_id", []):
+                if value is None or (
+                    isinstance(value, float) and pd.isna(value)
+                ):
+                    invalid_chat_rows += 1
+                    continue
+                try:
+                    valid_chat_ids.add(str(uuid.UUID(str(value).strip())))
+                except (ValueError, TypeError, AttributeError):
+                    invalid_chat_rows += 1
+            results["summary"]["conversations"] = len(valid_chat_ids)
+            results["summary"]["invalid_chat_rows"] = invalid_chat_rows
             
             # Track SQL generation (conversations + messages + content_blocks)
             if self.generate_sql and len(logs_df) > 0:
@@ -1207,6 +1726,13 @@ class ExtractionEngine:
 
         except Exception as e:
             results["errors"].append(f"Extraction failed: {str(e)}")
+            if self.generate_sql:
+                for filename in os.listdir(self.sql_output_dir):
+                    if self.timestamp in filename and filename.endswith(".sql"):
+                        try:
+                            os.remove(os.path.join(self.sql_output_dir, filename))
+                        except OSError:
+                            pass
         
         return results
 

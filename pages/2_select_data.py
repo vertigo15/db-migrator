@@ -10,6 +10,7 @@ Features:
 """
 import os
 import json
+import uuid
 from datetime import datetime, date, timedelta
 from typing import Optional
 import streamlit as st
@@ -26,7 +27,16 @@ from utils.extraction import (
     ExtractionEngine,
     get_document_count_preview,
     get_related_counts,
-    estimate_embeddings_size
+    estimate_embeddings_size,
+    resolve_existing_user_overrides,
+    validate_target_organization,
+)
+from utils.migration_tracking import (
+    create_distributed_run,
+    mark_unproduced_steps_skipped,
+    record_step_expectations,
+    update_local_run,
+    update_source_run,
 )
 
 # Page config
@@ -36,83 +46,7 @@ st.title("📋 Select Data to Migrate")
 # Output directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(BASE_DIR, "output", "extract")
-
-
-def _record_migration_batch(user_emails: list, results: dict, source_config: ConnectionConfig):
-    """Write a migration batch record and per-user results to target DB tracking tables."""
-    from utils.db import get_connection
-    target_defaults = get_env_target_defaults()
-    try:
-        target_config = ConnectionConfig(
-            host=target_defaults["host"],
-            port=int(target_defaults["port"]),
-            database=target_defaults["database"],
-            username=target_defaults["username"],
-            password=target_defaults["password"],
-        )
-        conn = get_connection(target_config)
-        conn.autocommit = True
-        cursor = conn.cursor()
-
-        # Ensure tables exist
-        cursor.execute("""
-            CREATE SCHEMA IF NOT EXISTS migration;
-            CREATE TABLE IF NOT EXISTS migration.migration_batches (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                completed_at TIMESTAMPTZ,
-                status VARCHAR(20) NOT NULL DEFAULT 'running',
-                total_users INTEGER NOT NULL DEFAULT 0,
-                source_info JSONB,
-                notes TEXT
-            );
-            CREATE TABLE IF NOT EXISTS migration.migration_user_results (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                batch_id UUID NOT NULL REFERENCES migration.migration_batches(id) ON DELETE CASCADE,
-                email VARCHAR(255) NOT NULL,
-                legacy_user_id VARCHAR(255),
-                v5_user_id UUID,
-                result VARCHAR(50) NOT NULL DEFAULT 'pending',
-                failed_step VARCHAR(100),
-                error_message TEXT,
-                steps_completed JSONB DEFAULT '{}'::jsonb,
-                started_at TIMESTAMPTZ DEFAULT now(),
-                completed_at TIMESTAMPTZ
-            );
-            ALTER TABLE migration.migration_user_results
-                ADD COLUMN IF NOT EXISTS steps_completed JSONB DEFAULT '{}'::jsonb;
-        """)
-
-        source_info = json.dumps({
-            "host": source_config.host,
-            "port": source_config.port,
-            "database": source_config.database,
-        })
-
-        has_errors = bool(results.get("errors"))
-        status = "extraction_failed" if has_errors else "extracted"
-
-        cursor.execute("""
-            INSERT INTO migration.migration_batches (started_at, status, total_users, source_info)
-            VALUES (now(), %s, %s, %s::jsonb)
-            RETURNING id
-        """, (status, len(user_emails), source_info))
-        batch_id = cursor.fetchone()[0]
-
-        for email in user_emails:
-            cursor.execute("""
-                INSERT INTO migration.migration_user_results
-                    (batch_id, email, result, started_at)
-                VALUES (%s, %s, 'pending', now())
-            """, (batch_id, email))
-
-        cursor.close()
-        conn.close()
-
-        st.session_state["_current_batch_id"] = str(batch_id)
-        st.session_state["_current_batch_emails"] = user_emails
-    except Exception:
-        pass
+DEPENDENCY_PREVIEW_LIMIT = 5000
 
 
 def _get_already_migrated_emails() -> set:
@@ -176,6 +110,15 @@ def _make_target_config(database: str):
     target: ConnectionConfig = st.session_state.get("target_config")
     if target is None:
         td = st.session_state.get(SessionKeys.TARGET_CONNECTION, {})
+        if not td.get("host") or not td.get("password"):
+            defaults = get_env_target_defaults()
+            td = {
+                "host": defaults.get("host"),
+                "port": defaults.get("port"),
+                "database": defaults.get("database"),
+                "username": defaults.get("username"),
+                "password": defaults.get("password"),
+            }
         if not td.get("host") or not td.get("password"):
             return None
         try:
@@ -733,7 +676,7 @@ def _extract_doc_id_from_metadata(value):
     return None
 
 def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: list):
-    """Render selectable embeddings list (default all selected)."""
+    """Preview chunk dependencies without turning the preview cap into a data cap."""
     st.markdown("---")
     st.subheader("🧮 Select Embeddings")
     if not doc_ids:
@@ -742,11 +685,30 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
         return []
     embeddings_table = get_table_name("embeddings", prefix)
     placeholders = ", ".join(["%s"] * len(doc_ids))
+    count_query = f"""
+        SELECT
+            COUNT(*) FILTER (WHERE metadata->>'type' = 'chunk-data') AS valid_count,
+            COUNT(*) FILTER (
+                WHERE metadata->>'type' = 'chunk-data' AND embeddings IS NULL
+            ) AS empty_count,
+            COUNT(DISTINCT metadata->>'doc_id') FILTER (
+                WHERE metadata->>'type' = 'chunk-data'
+            ) AS document_count
+        FROM public.{embeddings_table}
+        WHERE metadata->>'doc_id' IN ({placeholders})
+    """
+    counts = execute_query(config, count_query, tuple(doc_ids))
+    valid_count = int(counts.iloc[0]["valid_count"] or 0) if not counts.empty else 0
+    empty_count = int(counts.iloc[0]["empty_count"] or 0) if not counts.empty else 0
+    covered_documents = int(counts.iloc[0]["document_count"] or 0) if not counts.empty else 0
+
     query = f"""
         SELECT id, external_id, collection, metadata
         FROM public.{embeddings_table}
         WHERE metadata->>'doc_id' IN ({placeholders})
-        LIMIT 5000
+          AND metadata->>'type' = 'chunk-data'
+        ORDER BY id
+        LIMIT {DEPENDENCY_PREVIEW_LIMIT}
     """
     _ek = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(d) for d in doc_ids))}"
     if st.session_state.get("_p2_emb_df_key") == _ek:
@@ -760,6 +722,15 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
         st.info("No embeddings found for selected documents.")
         st.session_state["selected_embedding_ids"] = []
         return []
+    st.caption(
+        f"{valid_count:,} valid chunk row(s) across {covered_documents:,} document(s); "
+        f"{empty_count:,} row(s) have no vector."
+    )
+    if valid_count > DEPENDENCY_PREVIEW_LIMIT:
+        st.info(
+            f"Showing the first {DEPENDENCY_PREVIEW_LIMIT:,} rows only. "
+            f"Complete extraction still migrates all {valid_count:,} rows."
+        )
     emb_df["doc_id"] = emb_df["metadata"].apply(_extract_doc_id_from_metadata)
     search = st.text_input("🔍 Search embeddings", placeholder="Search by id/external_id/collection/doc_id...", key="emb_search")
     filtered_df = emb_df.copy()
@@ -771,7 +742,12 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
             | filtered_df["doc_id"].astype(str).str.contains(search, case=False, na=False)
         )
         filtered_df = filtered_df[mask]
-    select_all_embeddings = st.checkbox("Select all embeddings in current list", value=True, key="select_all_embeddings")
+    select_all_embeddings = st.checkbox(
+        "Migrate all chunk rows for the selected documents",
+        value=True,
+        key="select_all_embeddings",
+        help="Recommended. The table below is only a bounded preview.",
+    )
     previous = st.session_state.get("selected_embedding_ids")
     if select_all_embeddings:
         filtered_df["selected"] = True
@@ -782,9 +758,21 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
             filtered_df["selected"] = True
     filtered_df = filtered_df[["selected", "id", "external_id", "collection", "doc_id"]]
     edited_df = st.data_editor(filtered_df, hide_index=True, use_container_width=True, height=320, key="embeddings_editor")
-    selected_embedding_ids = edited_df[edited_df["selected"] == True]["id"].astype(str).tolist()
+    selected_embedding_ids = (
+        None
+        if select_all_embeddings
+        else edited_df[edited_df["selected"] == True]["id"].astype(str).tolist()
+    )
     st.session_state["selected_embedding_ids"] = selected_embedding_ids
-    st.metric("Selected Embeddings", len(selected_embedding_ids))
+    st.metric(
+        "Selected Embeddings",
+        valid_count if selected_embedding_ids is None else len(selected_embedding_ids),
+    )
+    if selected_embedding_ids is not None:
+        st.warning(
+            "Custom row selection intentionally creates partial document data. "
+            "Those documents will remain pending for V5 reprocessing."
+        )
     return selected_embedding_ids
 
 def render_conversations_selection(config: ConnectionConfig, prefix: str, user_ids: list):
@@ -977,7 +965,7 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
 
 
 def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: list):
-    """Render selectable agents list (default all selected)."""
+    """Preview agents without allowing the preview limit to cap extraction."""
     st.markdown("---")
     st.subheader("🤖 Select Agents")
     if not user_ids:
@@ -986,9 +974,23 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         return []
     agents_table = get_table_name("agents", prefix)
     placeholders = ", ".join(["%s"] * len(user_ids))
+    count_query = f"""
+        SELECT
+            COUNT(*) AS total_count,
+            COUNT(*) FILTER (
+                WHERE COALESCE(toolkit_settings->>'is_active', 'Yes') = 'Yes'
+            ) AS active_count
+        FROM public.{agents_table}
+        WHERE user_id IN ({placeholders})
+          AND deleted_at IS NULL
+    """
+    counts = execute_query(config, count_query, tuple(user_ids))
+    total_count = int(counts.iloc[0]["total_count"] or 0) if not counts.empty else 0
+    active_count = int(counts.iloc[0]["active_count"] or 0) if not counts.empty else 0
     query = f"""
         SELECT bot_id, user_id, folder_id, created_at,
                COALESCE(NULLIF(bot_data->>'bot_name', ''), NULLIF(bot_data->>'botName', ''), '') AS agent_name,
+               COALESCE(toolkit_settings->>'is_active', 'Yes') = 'Yes' AS is_active,
                COALESCE(array_length(docs_chosen, 1), 0) AS docs,
                COALESCE(array_length(chosen_docs_folders, 1), 0) AS folders,
                array_to_string(docs_chosen, ', ') AS doc_ids,
@@ -998,8 +1000,9 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
                character_prompts->'agentFlow'->'flows'->0->>'id' AS flow_id
         FROM public.{agents_table}
         WHERE user_id IN ({placeholders})
+          AND deleted_at IS NULL
         ORDER BY created_at DESC
-        LIMIT 5000
+        LIMIT {DEPENDENCY_PREVIEW_LIMIT}
     """
     _ak = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}"
     if st.session_state.get("_p2_agents_df_key") == _ak:
@@ -1016,7 +1019,16 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         st.session_state["selected_agent_ids"] = []
         return []
     _wf_total = int(agents_df["uses_workflow"].sum()) if "uses_workflow" in agents_df.columns else 0
-    st.caption(f"🔀 {_wf_total} of {len(agents_df)} agents reference a Langflow workflow.")
+    st.caption(
+        f"{total_count:,} agent(s): {active_count:,} active and "
+        f"{total_count - active_count:,} inactive. "
+        f"{_wf_total} in the preview reference a Langflow workflow."
+    )
+    if total_count > DEPENDENCY_PREVIEW_LIMIT:
+        st.info(
+            f"Showing the first {DEPENDENCY_PREVIEW_LIMIT:,} agents only. "
+            f"Complete extraction still migrates all {total_count:,} agents."
+        )
     search = st.text_input("🔍 Search agents", placeholder="Search by name/bot_id/user_id/folder_id...", key="agent_search")
     only_workflow = st.checkbox("🔀 Show only Langflow-workflow agents", value=False, key="agent_workflow_only")
     filtered_df = agents_df.copy()
@@ -1031,7 +1043,12 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         filtered_df = filtered_df[mask]
     if only_workflow:
         filtered_df = filtered_df[filtered_df["uses_workflow"] == True]
-    select_all_agents = st.checkbox("Select all agents in current list", value=True, key="select_all_agents")
+    select_all_agents = st.checkbox(
+        "Migrate all agents for the selected users",
+        value=True,
+        key="select_all_agents",
+        help="Recommended. The table below is only a bounded preview.",
+    )
     previous = st.session_state.get("selected_agent_ids")
     if select_all_agents:
         filtered_df["selected"] = True
@@ -1040,7 +1057,7 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
             filtered_df["selected"] = filtered_df["bot_id"].isin(previous)
         else:
             filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "agent_name", "uses_workflow", "flow_id", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
+    filtered_df = filtered_df[["selected", "agent_name", "is_active", "uses_workflow", "flow_id", "bot_id", "user_id", "folder_id", "docs", "doc_ids", "folders", "created_at"]]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,
@@ -1049,6 +1066,11 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         column_config={
             "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
             "agent_name": st.column_config.TextColumn("Agent Name", help="Agent display name (bot_data.bot_name)"),
+            "is_active": st.column_config.CheckboxColumn(
+                "Active in V4",
+                disabled=True,
+                help="Inactive agents are migrated faithfully but may be hidden by the V5 UI.",
+            ),
             "uses_workflow": st.column_config.CheckboxColumn(
                 "🔀 Workflow",
                 disabled=True,
@@ -1056,12 +1078,19 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
             ),
             "flow_id": st.column_config.TextColumn("Flow ID", help="Referenced Langflow flow id (first, if multiple)"),
         },
-        disabled=["agent_name", "uses_workflow", "flow_id"],
+        disabled=["agent_name", "is_active", "uses_workflow", "flow_id"],
         key="agents_editor",
     )
-    selected_agent_ids = edited_df[edited_df["selected"] == True]["bot_id"].astype(str).tolist()
+    selected_agent_ids = (
+        None
+        if select_all_agents
+        else edited_df[edited_df["selected"] == True]["bot_id"].astype(str).tolist()
+    )
     st.session_state["selected_agent_ids"] = selected_agent_ids
-    st.metric("Selected Agents", len(selected_agent_ids))
+    st.metric(
+        "Selected Agents",
+        total_count if selected_agent_ids is None else len(selected_agent_ids),
+    )
     return selected_agent_ids
 
 
@@ -1430,9 +1459,12 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 "Target dim",
                 min_value=0,
                 max_value=4096,
-                value=1024,
+                value=0,
                 step=1,
-                help="Target embedding dimension. Source 1536 will be truncated to this value. Set to 0 to keep original dimension."
+                help=(
+                    "0 preserves each source vector's dimension (recommended). "
+                    "A smaller value is allowed only when every removed component is zero."
+                ),
             )
             if target_embedding_dim == 0:
                 target_embedding_dim = None
@@ -1468,17 +1500,73 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                             user_id_overrides[_v4] = _v5
             if user_id_overrides:
                 st.info(f"🔀 {len(user_id_overrides)} user ID override(s) configured.")
+        cross_owner_policy = st.selectbox(
+            "Cross-owner agent dependencies",
+            options=["block", "reassign"],
+            format_func=lambda value: (
+                "Block extraction (recommended)"
+                if value == "block"
+                else "Copy and reassign to the referencing agent owner"
+            ),
+            help=(
+                "Agent links to documents or folders owned by an unselected user "
+                "are blocked by default. Reassign is an explicit copy/ownership "
+                "decision; the source database is never changed."
+            ),
+        )
     else:
         org_id = get_env_org_id()
         embedding_model = get_env_embedding_model()
         skip_empty_embeddings = False
         target_embedding_dim = None
         user_id_overrides = {}
+        cross_owner_policy = "block"
     
     if st.button("🚀 Start Extraction", type="primary", use_container_width=True):
         if generate_sql and not org_id:
             st.error("Please select an organization before starting extraction.")
             st.stop()
+
+        migration_run_id = None
+        if generate_sql:
+            target_user_config = _make_target_config("user_db")
+            target_admin_config = _make_target_config("admin_db")
+            if target_user_config is None or target_admin_config is None:
+                st.error(
+                    "A target connection is required to resolve existing users "
+                    "and validate the selected organization."
+                )
+                st.stop()
+            try:
+                validate_target_organization(target_admin_config, org_id)
+                resolution = resolve_existing_user_overrides(
+                    source_config=config,
+                    target_user_config=target_user_config,
+                    prefix=prefix,
+                    user_emails=user_emails,
+                    manual_overrides=user_id_overrides,
+                )
+                user_id_overrides = resolution["overrides"]
+                migration_run_id = str(uuid.uuid4())
+                create_distributed_run(
+                    target_user_config,
+                    migration_run_id,
+                    resolution["users"],
+                    {
+                        "host": config.host,
+                        "port": config.port,
+                        "database": config.database,
+                        "prefix": prefix,
+                    },
+                    source_config=config,
+                )
+                st.session_state["_current_batch_id"] = migration_run_id
+                st.session_state["_current_batch_emails"] = user_emails
+                for warning in resolution["warnings"]:
+                    st.warning(warning)
+            except Exception as exc:
+                st.error(f"Migration preflight failed: {exc}")
+                st.stop()
         # Create progress containers
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -1499,7 +1587,9 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             embedding_model=embedding_model if generate_sql else 'text-embedding-ada-002',
             skip_empty_embeddings=skip_empty_embeddings if generate_sql else False,
             target_embedding_dim=target_embedding_dim if generate_sql else None,
-            user_id_overrides=user_id_overrides if generate_sql else {}
+            user_id_overrides=user_id_overrides if generate_sql else {},
+            migration_run_id=migration_run_id,
+            cross_owner_policy=cross_owner_policy,
         )
         
         # Run extraction
@@ -1524,8 +1614,92 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         # Store results
         st.session_state[SessionKeys.EXTRACTED_DATA] = results
 
-        # Record migration batch in target DB tracking tables
-        _record_migration_batch(user_emails, results, config)
+        if generate_sql and migration_run_id:
+            generated_step_keys = {
+                prefix
+                for prefix in (
+                    "01_users",
+                    "02_folders",
+                    "03_documents",
+                    "04_chunks_embeddings",
+                    "05_conversations",
+                    "06_agents",
+                    "07_conversions",
+                )
+                if any(
+                    os.path.basename(path).startswith(prefix)
+                    for path in results.get("sql_files", {}).values()
+                )
+            }
+            try:
+                summary = results.get("summary", {})
+                expectation_counts = {
+                    "01_users": summary.get("users", 0),
+                    "02_folders": summary.get("folders", 0),
+                    "03_documents": summary.get("documents", 0),
+                    "04_chunks_embeddings": summary.get("embeddings", 0),
+                    "05_conversations": summary.get("conversations", 0),
+                    "06_agents": summary.get("agents", 0),
+                    "07_conversions": summary.get("translate", 0),
+                }
+                expectations = {
+                    step_key: {
+                        "expected_count": expectation_counts[step_key],
+                        "details": (
+                            {
+                                "expected_chunks": summary.get("embeddings", 0),
+                                "expected_embeddings": summary.get(
+                                    "embedding_vectors", 0
+                                ),
+                            }
+                            if step_key == "04_chunks_embeddings"
+                            else {}
+                        ),
+                    }
+                    for step_key in generated_step_keys
+                }
+                record_step_expectations(
+                    target_user_config,
+                    migration_run_id,
+                    expectations,
+                    source_config=config,
+                )
+                mark_unproduced_steps_skipped(
+                    target_user_config,
+                    migration_run_id,
+                    generated_step_keys,
+                    source_config=config,
+                )
+            except Exception as exc:
+                results.setdefault("errors", []).append(
+                    f"Could not mark skipped migration steps: {exc}"
+                )
+            run_status = "failed" if results.get("errors") else "running"
+            run_error = "; ".join(results.get("errors", [])) or None
+            for target_database in ("user_db", "document_db", "completion_db"):
+                try:
+                    update_local_run(
+                        target_user_config,
+                        target_database,
+                        migration_run_id,
+                        run_status,
+                        run_error,
+                    )
+                except Exception as exc:
+                    results.setdefault("errors", []).append(
+                        f"Could not update {target_database} run tracking: {exc}"
+                    )
+            try:
+                update_source_run(
+                    config,
+                    migration_run_id,
+                    run_status,
+                    run_error,
+                )
+            except Exception as exc:
+                results.setdefault("errors", []).append(
+                    f"Could not update V4 source run tracking: {exc}"
+                )
 
         # Show results
         if results.get("errors"):
@@ -1534,6 +1708,39 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         else:
             st.success(f"✅ Extraction complete! Timestamp: {results['timestamp']}")
 
+        invalid_chat_rows = results.get("summary", {}).get(
+            "invalid_chat_rows", 0
+        )
+        if invalid_chat_rows:
+            st.warning(
+                f"{invalid_chat_rows} conversation log row(s) had a null, "
+                "blank, or invalid chat UUID and were skipped."
+            )
+
+        readiness = results.get("document_readiness", {})
+        needs_reprocessing = readiness.get(
+            "documents_requiring_reprocessing", []
+        )
+        if needs_reprocessing:
+            st.warning(
+                f"{len(needs_reprocessing)} document(s) have no complete "
+                "chunk/embedding set. They will remain not ready for optional "
+                "V5 reprocessing."
+            )
+            with st.expander("Documents requiring V5 reprocessing"):
+                st.code("\n".join(needs_reprocessing))
+
+        folder_report = results.get("folder_hierarchy_report", {})
+        detached_folders = folder_report.get("detached_folder_ids", [])
+        stale_parents = folder_report.get("stale_parent_ids", [])
+        if detached_folders:
+            st.warning(
+                f"{len(detached_folders)} folder(s) referenced missing V4 "
+                "parents and were safely migrated as root folders."
+            )
+            with st.expander("Detached folder hierarchy details"):
+                st.write({"folders": detached_folders, "missing_parents": stale_parents})
+
         # ── Agent-document topup report ──────────────────────────────────────
         topup = results.get("topup_report")
         if topup:
@@ -1541,7 +1748,10 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             stale_docs    = topup.get("stale_doc_ids", [])
             added_folders = topup.get("added_folder_ids", [])
             stale_folders = topup.get("stale_folder_ids", [])
+            oos_docs      = topup.get("out_of_scope_owner_doc_ids", [])
             oos_folders   = topup.get("out_of_scope_owner_folder_ids", [])
+            reassigned_docs = topup.get("reassigned_doc_ids", [])
+            reassigned_folders = topup.get("reassigned_folder_ids", [])
 
             st.subheader("🤖 Agent Document Coverage")
 
@@ -1581,19 +1791,24 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                         hide_index=True, use_container_width=True
                     )
 
-            if oos_folders:
+            if oos_docs or oos_folders:
                 with st.expander(
-                    f"⚠️ {len(oos_folders)} auto-added folder(s) owned by users outside the migration scope"
+                    "Cross-owner dependencies explicitly reassigned"
                 ):
                     st.warning(
-                        "These folders were fetched because agents reference them, but their owner is not "
-                        "among the selected users. They will be inserted into `document_db` without a "
-                        "matching user record — verify this is acceptable before executing the SQL."
+                        "The operator selected copy/reassign. These target copies "
+                        "will be owned by the referencing agent owner; V4 is unchanged."
                     )
-                    st.dataframe(
-                        pd.DataFrame({"Folder id (out-of-scope owner)": oos_folders}),
-                        hide_index=True, use_container_width=True
-                    )
+                    if reassigned_docs:
+                        st.dataframe(
+                            pd.DataFrame({"Reassigned doc_id": reassigned_docs}),
+                            hide_index=True, use_container_width=True
+                        )
+                    if reassigned_folders:
+                        st.dataframe(
+                            pd.DataFrame({"Reassigned folder_id": reassigned_folders}),
+                            hide_index=True, use_container_width=True
+                        )
 
         # ── Extraction summary table ─────────────────────────────────────────
         # Show summary

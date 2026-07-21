@@ -5,6 +5,7 @@ Integrated with the extraction engine to create SQL files alongside CSV exports.
 import os
 import json
 import re
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import pandas as pd
@@ -24,6 +25,16 @@ USER_NAMESPACE_UUID        = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'   # Users (s
 DOC_NAMESPACE_UUID         = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step 03)
 NAMESPACE_UUID             = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'   # Folders, agents, chunks, embeddings
 CONVERSIONS_NAMESPACE_UUID = 'c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f'   # Conversions (step 07)
+
+
+def deterministic_uuid_v4_py(namespace: str, value: str) -> uuid.UUID:
+    """Python equivalent of migration.deterministic_uuid_v4()."""
+    generated = str(uuid.uuid5(uuid.UUID(namespace), str(value)))
+    return uuid.UUID(generated[:14] + "4" + generated[15:])
+
+
+def _migration_run_sql(migration_run_id: Optional[str]) -> str:
+    return f"'{migration_run_id}'::uuid" if migration_run_id else "NULL::uuid"
 
 
 def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None) -> str:
@@ -229,11 +240,46 @@ CREATE TABLE IF NOT EXISTS migration.id_mappings (
     old_id VARCHAR(255) NOT NULL,
     new_id UUID NOT NULL,
     migration_batch VARCHAR(50),
+    migration_run_id UUID,
+    record_action VARCHAR(20) NOT NULL DEFAULT 'created',
     migrated_at TIMESTAMP DEFAULT now(),
     notes TEXT,
     CONSTRAINT uq_table_old_id UNIQUE (table_name, old_id),
     CONSTRAINT uq_table_new_id UNIQUE (table_name, new_id)
 );
+
+ALTER TABLE migration.id_mappings
+    ADD COLUMN IF NOT EXISTS migration_run_id UUID;
+ALTER TABLE migration.id_mappings
+    ADD COLUMN IF NOT EXISTS record_action VARCHAR(20) NOT NULL DEFAULT 'created';
+
+CREATE TABLE IF NOT EXISTS migration.migration_runs (
+    id UUID PRIMARY KEY,
+    status VARCHAR(30) NOT NULL DEFAULT 'running',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    total_users INTEGER NOT NULL DEFAULT 0,
+    source_info JSONB,
+    error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS migration.migration_steps (
+    migration_run_id UUID NOT NULL
+        REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(50) NOT NULL,
+    target_database VARCHAR(100) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'pending',
+    expected_count INTEGER,
+    affected_count INTEGER,
+    verification_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY (migration_run_id, step_key)
+);
+
+ALTER TABLE migration.migration_steps
+    ADD COLUMN IF NOT EXISTS verification_details JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- Create indexes for fast lookups
 CREATE INDEX IF NOT EXISTS idx_mappings_table_old_id 
@@ -242,6 +288,8 @@ CREATE INDEX IF NOT EXISTS idx_mappings_table_new_id
     ON migration.id_mappings(table_name, new_id);
 CREATE INDEX IF NOT EXISTS idx_mappings_batch 
     ON migration.id_mappings(migration_batch);
+CREATE INDEX IF NOT EXISTS idx_mappings_run_action
+    ON migration.id_mappings(migration_run_id, record_action);
 
 -- Create batch tracking table
 CREATE TABLE IF NOT EXISTS migration.batch_log (
@@ -407,7 +455,8 @@ END $$;
 def generate_user_insert(
     row: pd.Series,
     org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single user.
@@ -444,9 +493,13 @@ DO $$
 BEGIN
     -- User already exists in V5; skip INSERT.
     -- Register mapping in migration.id_mappings for audit and downstream tracking.
-    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action, notes
+    )
     VALUES ('users', {escape_sql_string(old_id)}, '{v5_uuid}'::uuid,
-            'user_overrides', 'Pre-existing V5 user — override supplied at migration time')
+            '{migration_run_id or "user_overrides"}', {_migration_run_sql(migration_run_id)},
+            'reused', 'Pre-existing V5 user — resolved before migration')
     ON CONFLICT (table_name, old_id) DO NOTHING;
     RAISE NOTICE 'Skipped INSERT for user % — already exists in V5 as %',
                  {escape_sql_string(email)}, '{v5_uuid}';
@@ -555,6 +608,8 @@ DECLARE
     v_email VARCHAR := {escape_sql_string(email)};
     v_new_id UUID;
     v_existing_id UUID;
+    v_match_count INTEGER;
+    v_action VARCHAR := 'created';
 BEGIN
     -- 1. Skip if already migrated in a previous run
     IF migration.is_migrated('users', v_old_id) THEN
@@ -563,12 +618,27 @@ BEGIN
     END IF;
 
     -- 2. Check if this email already exists in V5 (created outside migration)
-    SELECT id INTO v_existing_id FROM public.users WHERE email = v_email LIMIT 1;
+    SELECT count(*)
+    INTO v_match_count
+    FROM public.users
+    WHERE lower(trim(email)) = lower(trim(v_email));
+    IF v_match_count > 1 THEN
+        RAISE EXCEPTION 'Ambiguous normalized email match for user %', v_email;
+    END IF;
+    IF v_match_count = 1 THEN
+        SELECT id INTO v_existing_id
+        FROM public.users
+        WHERE lower(trim(email)) = lower(trim(v_email));
+    END IF;
     IF v_existing_id IS NOT NULL THEN
         -- Link only — do NOT modify existing user data
-        INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        )
         VALUES ('users', v_old_id, v_existing_id, 'batch_{{{{TIMESTAMP}}}}',
-                'Linked to pre-existing V5 user (email match, no data overwrite)')
+                {_migration_run_sql(migration_run_id)}, 'reused',
+                'Linked to pre-existing V5 user (normalized email match, no data overwrite)')
         ON CONFLICT (table_name, old_id) DO NOTHING;
         RAISE NOTICE 'User % already exists in V5 (id: %), linked without modification', v_email, v_existing_id;
         RETURN;
@@ -626,13 +696,21 @@ BEGIN
             IF v_new_id IS NULL THEN
                 RAISE EXCEPTION 'Cannot insert user % — unresolvable unique violation', v_email;
             END IF;
+            v_action := 'reused';
             RAISE NOTICE 'User % appeared concurrently in V5, linking to %', v_email, v_new_id;
         END;
     END;
 
     -- 4. Store ID mapping
-    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
-    VALUES ('users', v_old_id, v_new_id, 'batch_{{{{TIMESTAMP}}}}', 'Migrated from V4 users table')
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action, notes
+    )
+    VALUES (
+        'users', v_old_id, v_new_id, 'batch_{{{{TIMESTAMP}}}}',
+        {_migration_run_sql(migration_run_id)}, v_action,
+        'Migrated from V4 users table'
+    )
     ON CONFLICT (table_name, old_id) DO NOTHING;
 
     RAISE NOTICE 'Migrated user %: % → %', v_email, v_old_id, v_new_id;
@@ -647,7 +725,8 @@ def generate_users_migration_sql(
     output_file: str,
     source_info: str,
     org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for users table.
@@ -700,7 +779,9 @@ ON CONFLICT (batch_id) DO NOTHING;
         # Write individual INSERT statements with batch_id substitution
         expected_old_ids = []
         for _, row in users_df.iterrows():
-            sql = generate_user_insert(row, org_id, user_id_overrides)
+            sql = generate_user_insert(
+                row, org_id, user_id_overrides, migration_run_id
+            )
             if sql:
                 sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
                 sql_file.write(sql)
@@ -768,7 +849,8 @@ WHERE batch_id = '{batch_id}';
 def generate_folder_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single folder.
@@ -829,12 +911,24 @@ DECLARE
     v_old_folder_id VARCHAR := {escape_sql_string(old_id)};
     v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
     v_folder_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, v_old_folder_id);
+    v_parent_id uuid := {parent_id_sql};
     v_user_id uuid := {resolve_user_id_sql(owner_id, user_id_overrides)};
 BEGIN
     -- Check if folder already migrated using mapping table (FAST)
     IF migration.is_migrated('folders', v_old_folder_id) THEN
         RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
         RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.folders WHERE id = v_folder_id) THEN
+        RAISE EXCEPTION
+            'Folder UUID collision for legacy id % (target id % is not mapped from it)',
+            v_old_folder_id, v_folder_id;
+    END IF;
+    IF v_parent_id IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM public.folders WHERE id = v_parent_id) THEN
+        RAISE EXCEPTION
+            'Folder % references parent % that was not migrated first',
+            v_old_folder_id, v_parent_id;
     END IF;
     
     -- Insert folder
@@ -851,7 +945,7 @@ BEGIN
     ) VALUES (
         v_folder_id,
         {escape_sql_string(folder_name)},
-        {parent_id_sql},
+        v_parent_id,
         '{folder_type}'::public.folders_folder_type_enum,
         'upload'::public.folders_source_type_enum,
         v_user_id,
@@ -866,12 +960,16 @@ BEGIN
         table_name,
         old_id,
         new_id,
-        migration_batch
+        migration_batch,
+        migration_run_id,
+        record_action
     ) VALUES (
         'folders',
         v_old_folder_id,
         v_folder_id,
-        'batch_{{{{TIMESTAMP}}}}'
+        'batch_{{{{TIMESTAMP}}}}',
+        {_migration_run_sql(migration_run_id)},
+        'created'
     );
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
@@ -881,12 +979,79 @@ END $$;
     return sql
 
 
+def _topologically_sort_folders(folders_df: pd.DataFrame) -> pd.DataFrame:
+    """Return folders in parent-before-child order and reject bad graphs."""
+    def normalize(value):
+        if _is_scalar_na(value):
+            return None
+        try:
+            return str(int(float(str(value).strip())))
+        except (ValueError, TypeError):
+            cleaned = str(value).strip()
+            return cleaned or None
+
+    rows = {}
+    parents = {}
+    children = {}
+    for index, row in folders_df.iterrows():
+        folder_id = normalize(row.get("id"))
+        if not folder_id:
+            continue
+        if folder_id in rows:
+            raise ValueError(f"Duplicate source folder id: {folder_id}")
+        parent_id = normalize(row.get("parent_id"))
+        rows[folder_id] = index
+        parents[folder_id] = parent_id
+        children.setdefault(folder_id, [])
+
+    missing = {
+        parent_id
+        for parent_id in parents.values()
+        if parent_id is not None and parent_id not in rows
+    }
+    if missing:
+        raise ValueError(
+            "Folder hierarchy is missing parent rows: "
+            + ", ".join(sorted(missing))
+        )
+
+    indegree = {folder_id: 0 for folder_id in rows}
+    for folder_id, parent_id in parents.items():
+        if parent_id is not None:
+            indegree[folder_id] += 1
+            children[parent_id].append(folder_id)
+
+    ready = sorted(
+        folder_id for folder_id, degree in indegree.items() if degree == 0
+    )
+    ordered = []
+    while ready:
+        folder_id = ready.pop(0)
+        ordered.append(folder_id)
+        for child_id in sorted(children[folder_id]):
+            indegree[child_id] -= 1
+            if indegree[child_id] == 0:
+                ready.append(child_id)
+                ready.sort()
+
+    if len(ordered) != len(rows):
+        cyclic = sorted(
+            folder_id for folder_id, degree in indegree.items() if degree > 0
+        )
+        raise ValueError(
+            "Folder hierarchy contains a cycle involving: "
+            + ", ".join(cyclic)
+        )
+    return folders_df.loc[[rows[folder_id] for folder_id in ordered]].copy()
+
+
 def generate_folders_migration_sql(
     folders_df: pd.DataFrame,
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for folders table.
@@ -909,10 +1074,7 @@ def generate_folders_migration_sql(
     # Generate batch ID
     batch_id = f"folders_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Sort folders: parents (NULL parent_id) first, then by parent_id, then by id
-    folders_sorted = folders_df.copy()
-    folders_sorted['parent_id_sort'] = folders_sorted['parent_id'].fillna('')
-    folders_sorted = folders_sorted.sort_values(['parent_id_sort', 'id'])
+    folders_sorted = _topologically_sort_folders(folders_df)
     
     record_count = 0
     skipped_count = 0
@@ -943,7 +1105,9 @@ ON CONFLICT (batch_id) DO NOTHING;
         
         # Write individual INSERT statements (sorted order)
         for _, row in folders_sorted.iterrows():
-            sql = generate_folder_insert(row, namespace_uuid, user_id_overrides)
+            sql = generate_folder_insert(
+                row, namespace_uuid, user_id_overrides, migration_run_id
+            )
             if sql:
                 # Replace batch placeholder with actual batch_id
                 sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
@@ -1003,6 +1167,7 @@ def generate_document_insert(
     user_id_overrides: Optional[Dict[str, str]] = None,
     source_label: Optional[str] = None,
     translate_to_english: bool = False,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single document plus its document_processing record.
@@ -1155,6 +1320,11 @@ BEGIN
         RAISE NOTICE 'Document % already migrated', v_old_doc_id;
         RETURN;
     END IF;
+    IF EXISTS (SELECT 1 FROM public.documents WHERE id = v_new_doc_id) THEN
+        RAISE EXCEPTION
+            'Document UUID collision for legacy id % (target id % is not mapped from it)',
+            v_old_doc_id, v_new_doc_id;
+    END IF;
     
     -- Lookup folder via mapping table if folder specified (same DB - document_db)
     IF v_old_folder_id IS NOT NULL THEN
@@ -1201,7 +1371,8 @@ BEGIN
     )
     ON CONFLICT (id) DO NOTHING;
 
-    -- Insert document_processing record (status COMPLETED, is_ready true)
+    -- Step 03 never claims readiness. Step 04 reconciles this after chunks and
+    -- embeddings have actually been inserted.
     -- parsing_technique_id: subquery picks first available technique
     -- translate_to_english: derived from whether source chunks contained translated content
     INSERT INTO public.document_processing (
@@ -1223,11 +1394,11 @@ BEGIN
         (SELECT id FROM public.parsing_techniques ORDER BY created_at LIMIT 1),
         512,
         50,
-        'COMPLETED'::public.document_processing_status_enum,
+        'PENDING'::public.document_processing_status_enum,
         true,
         {str(translate_to_english).lower()},
         '00000000-0000-0000-0000-000000000001'::uuid,
-        true,
+        false,
         false,
         NULL
     )
@@ -1238,12 +1409,16 @@ BEGIN
         table_name,
         old_id,
         new_id,
-        migration_batch
+        migration_batch,
+        migration_run_id,
+        record_action
     ) VALUES (
         'documents',
         v_old_doc_id,
         v_new_doc_id,
-        'batch_{{{{TIMESTAMP}}}}'
+        'batch_{{{{TIMESTAMP}}}}',
+        {_migration_run_sql(migration_run_id)},
+        'created'
     );
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
@@ -1261,6 +1436,7 @@ def generate_documents_migration_sql(
     user_id_overrides: Optional[Dict[str, str]] = None,
     doc_source_labels: Optional[Dict[str, str]] = None,
     embeddings_df: Optional[pd.DataFrame] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for documents table.
@@ -1351,6 +1527,7 @@ ON CONFLICT (batch_id) DO NOTHING;
                     row, namespace_uuid, user_id_overrides,
                     source_label=_source_label,
                     translate_to_english=_translate,
+                    migration_run_id=migration_run_id,
                 )
                 if sql:
                     # Replace batch placeholder with actual batch_id
@@ -1396,12 +1573,12 @@ def truncate_embedding_vector(
     
     Used when the source embeddings were produced by a smaller model (e.g. E5-large
     at 1024 dims) and zero-padded to a larger size (e.g. 1536) for storage.
-    Truncation strips the trailing zero-padded dimensions.
+    Truncation is allowed only when the removed dimensions are zero-padded.
     
     Args:
         embeddings_value: pgvector-format string, e.g. "[0.1,0.2,...,0.0]"
         target_dim: Target dimension count (default 1024)
-        warn_nonzero_tail: If True, print a warning when truncated dims are non-zero
+        warn_nonzero_tail: Retained for API compatibility. Non-zero tails always fail.
         
     Returns:
         Truncated pgvector-format string with target_dim dimensions
@@ -1424,18 +1601,14 @@ def truncate_embedding_vector(
     if source_dim <= target_dim:
         return embeddings_value
     
-    # Warn if truncated tail contains non-zero values
-    if warn_nonzero_tail:
-        tail = parts[target_dim:]
-        nonzero_count = sum(1 for v in tail if abs(float(v)) > 1e-9)
-        if nonzero_count > 0:
-            import sys
-            print(
-                f"WARNING: Truncating embedding from {source_dim} to {target_dim} dims, "
-                f"but {nonzero_count}/{len(tail)} truncated values are non-zero. "
-                f"This may indicate the vector was NOT zero-padded.",
-                file=sys.stderr
-            )
+    tail = parts[target_dim:]
+    nonzero_count = sum(1 for value in tail if abs(float(value)) > 1e-9)
+    if nonzero_count:
+        raise ValueError(
+            f"Refusing destructive embedding truncation from {source_dim} to "
+            f"{target_dim}: {nonzero_count}/{len(tail)} removed values are non-zero. "
+            "Preserve the source dimension by setting target dimension to 0."
+        )
     
     # Truncate and re-serialize
     truncated = parts[:target_dim]
@@ -1744,7 +1917,8 @@ def generate_chunks_embeddings_migration_sql(
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     default_embedding_model: str = 'text-embedding-ada-002',
     skip_empty_embeddings: bool = False,
-    target_embedding_dim: Optional[int] = None
+    target_embedding_dim: Optional[int] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for chunks and embeddings tables.
@@ -1888,6 +2062,62 @@ END $$;
             else:
                 skipped_count += 1
         
+        # Reconcile processing state only after every chunk/embedding statement
+        # above completed. A document is ready only if it has at least one chunk
+        # and every migrated chunk has an embedding.
+        sql_file.write(f"""
+UPDATE public.document_processing dp
+SET status = 'COMPLETED'::public.document_processing_status_enum,
+    is_ready = true
+FROM migration.id_mappings m
+WHERE m.table_name = 'documents'
+  AND m.migration_run_id IS NOT DISTINCT FROM {_migration_run_sql(migration_run_id)}
+  AND m.record_action = 'created'
+  AND dp.document_id = m.new_id
+  AND EXISTS (
+      SELECT 1 FROM public.chunks c WHERE c.document_id = dp.document_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM public.chunks c
+      WHERE c.document_id = dp.document_id
+        AND NOT EXISTS (
+            SELECT 1 FROM public.embeddings e WHERE e.chunk_id = c.id
+        )
+  );
+
+DO $readiness_reconcile$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM public.document_processing dp
+        JOIN migration.id_mappings m
+          ON m.table_name = 'documents'
+         AND m.new_id = dp.document_id
+         AND m.migration_run_id IS NOT DISTINCT FROM {_migration_run_sql(migration_run_id)}
+         AND m.record_action = 'created'
+        WHERE dp.is_ready = true
+          AND (
+              NOT EXISTS (
+                  SELECT 1 FROM public.chunks c
+                  WHERE c.document_id = dp.document_id
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM public.chunks c
+                  WHERE c.document_id = dp.document_id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM public.embeddings e WHERE e.chunk_id = c.id
+                    )
+              )
+          )
+    ) THEN
+        RAISE EXCEPTION
+            'Readiness reconciliation failed: a ready document lacks chunks or embeddings';
+    END IF;
+END $readiness_reconcile$;
+""")
+
         # Write footer
         sql_file.write(f'\n-- Total chunks processed: {chunk_count}\n')
         sql_file.write(f'-- Total embeddings processed: {embedding_count}\n')
@@ -2002,7 +2232,8 @@ def generate_conversations_logs_migration_sql(
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     max_records_per_insert: int = 50,
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for jeen_dev_logs.
@@ -2026,11 +2257,37 @@ def generate_conversations_logs_migration_sql(
     # Clean up old conversations migration files
     cleanup_old_migration_files(output_file, '05_conversations_')
     
-    # Filter: only rows with user_id and chat_id
+    source_row_count = len(logs_df)
+
+    def normalize_chat_uuid(value):
+        if _is_scalar_na(value):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return str(uuid.UUID(text))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    normalized_chat_ids = logs_df["chat_id"].apply(normalize_chat_uuid)
     logs_df = logs_df[
-        logs_df['user_id'].notna() & 
-        logs_df['chat_id'].notna()
+        logs_df["user_id"].notna() & normalized_chat_ids.notna()
     ].copy()
+    logs_df["chat_id"] = normalized_chat_ids[normalized_chat_ids.notna()]
+    skipped_invalid_chat_id = source_row_count - len(logs_df)
+
+    shared_chat_ids = (
+        logs_df.groupby("chat_id")["user_id"].nunique()
+        if not logs_df.empty
+        else pd.Series(dtype=int)
+    )
+    shared_chat_ids = shared_chat_ids[shared_chat_ids > 1]
+    if not shared_chat_ids.empty:
+        raise ValueError(
+            "Conversation IDs are shared by multiple selected users: "
+            + ", ".join(shared_chat_ids.index.astype(str).tolist()[:10])
+        )
     
     if len(logs_df) == 0:
         return {
@@ -2038,7 +2295,8 @@ def generate_conversations_logs_migration_sql(
             'users_processed': 0,
             'conversations_processed': 0,
             'messages_processed': 0,
-            'blocks_processed': 0
+            'blocks_processed': 0,
+            'skipped_invalid_chat_id': skipped_invalid_chat_id,
         }
     
     # Add question_number if not present (for ordering)
@@ -2178,6 +2436,24 @@ END $$;
                     )
                 
                 conv_values_joined = ',\n'.join(conv_values)
+                for conv in conv_batch:
+                    sql_file.write(f"""
+DO $conversation_collision$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM conversations
+        WHERE id = '{conv['chat_id']}'::uuid
+    ) AND NOT EXISTS (
+        SELECT 1 FROM migration.id_mappings
+        WHERE table_name = 'conversations'
+          AND old_id = {escape_sql_string(conv['chat_id'])}
+          AND new_id = '{conv['chat_id']}'::uuid
+    ) THEN
+        RAISE EXCEPTION
+            'Conversation UUID collision for legacy conversation {conv['chat_id']}';
+    END IF;
+END $conversation_collision$;
+""")
                 sql_file.write(f"""-- Conversations INSERT
 INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 SELECT * FROM (
@@ -2190,9 +2466,11 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                 # Track conversations in id_mappings for rollback
                 for conv in conv_batch:
                     sql_file.write(
-                        f"INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes) "
+                        f"INSERT INTO migration.id_mappings "
+                        f"(table_name, old_id, new_id, migration_batch, migration_run_id, record_action, notes) "
                         f"VALUES ('conversations', {escape_sql_string(conv['chat_id'])}, '{conv['chat_id']}'::uuid, "
-                        f"'conversations_batch', 'Migrated conversation') "
+                        f"'{migration_run_id or 'conversations_batch'}', {_migration_run_sql(migration_run_id)}, "
+                        f"'created', 'Migrated conversation') "
                         f"ON CONFLICT (table_name, old_id) DO NOTHING;\n"
                     )
                 sql_file.write("\n")
@@ -2357,6 +2635,7 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
 -- Conversations processed: {conversations_processed}
 -- Messages processed: {messages_processed}
 -- Content blocks processed: {blocks_processed}
+-- Rows skipped for null/blank/invalid chat_id: {skipped_invalid_chat_id}
 -- ============================================================
 """)
     
@@ -2365,7 +2644,8 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
         'users_processed': users_processed,
         'conversations_processed': conversations_processed,
         'messages_processed': messages_processed,
-        'blocks_processed': blocks_processed
+        'blocks_processed': blocks_processed,
+        'skipped_invalid_chat_id': skipped_invalid_chat_id,
     }
 
 
@@ -2394,7 +2674,8 @@ def generate_agent_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     user_id_overrides: Optional[Dict[str, str]] = None,
-    merged_instructions: Optional[Dict[str, str]] = None
+    merged_instructions: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statements for a single agent (agents + agent_settings + knowledge_bases).
@@ -2645,6 +2926,17 @@ def generate_agent_insert(
         re_rank_score_kb = str(re_rank_score) if re_rank_score is not None else 'NULL'
 
         kb_inserts += f"""
+    IF EXISTS (SELECT 1 FROM knowledge_bases WHERE id = v_kb_id)
+       AND NOT EXISTS (
+           SELECT 1 FROM migration.id_mappings
+           WHERE table_name = 'knowledge_bases'
+             AND old_id = {escape_sql_string(bot_id)}
+             AND new_id = v_kb_id
+       ) THEN
+        RAISE EXCEPTION 'Knowledge-base UUID collision for legacy bot %',
+            {escape_sql_string(bot_id)};
+    END IF;
+
     -- Create knowledge base for this agent
     INSERT INTO knowledge_bases (
         id, name, description, similarity_top_k, re_rank_score,
@@ -2668,6 +2960,25 @@ def generate_agent_insert(
         SELECT 1 FROM knowledge_bases WHERE id = v_kb_id
     );
 
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_bases', {escape_sql_string(bot_id)}, v_kb_id,
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+
+    IF EXISTS (
+        SELECT 1 FROM knowledge_base_assignments
+        WHERE assigned_to_id = v_agent_id AND assigned_to_type = 'agent'
+          AND id <> v_kb_assignment_id
+    ) THEN
+        RAISE EXCEPTION 'Agent % already has an unrelated knowledge-base assignment',
+            v_agent_id;
+    END IF;
+
     -- Assign knowledge base to agent
     INSERT INTO knowledge_base_assignments (
         id, knowledge_base_id, assigned_to_id, assigned_to_type, is_active, created_at
@@ -2681,13 +2992,38 @@ def generate_agent_insert(
         now()
     WHERE NOT EXISTS (
         SELECT 1 FROM knowledge_base_assignments
-        WHERE assigned_to_id = v_agent_id AND assigned_to_type = 'agent'
+        WHERE id = v_kb_assignment_id
     );
+
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_base_assignments', {escape_sql_string(bot_id)}, v_kb_assignment_id,
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
 """
 
         for doc_id in docs_chosen:
+            item_old_id = f"{bot_id}-document-{doc_id}"
             kb_inserts += f"""
     -- KB item (document): {doc_id}
+    IF EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}'
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM migration.id_mappings
+        WHERE table_name = 'knowledge_base_items'
+          AND old_id = {escape_sql_string(item_old_id)}
+    ) THEN
+        RAISE EXCEPTION 'Knowledge-base item UUID collision for %',
+            {escape_sql_string(item_old_id)};
+    END IF;
+
     INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
     SELECT
         migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}'),
@@ -2700,11 +3036,40 @@ def generate_agent_insert(
         SELECT 1 FROM knowledge_base_items
         WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}')
     );
+
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_base_items',
+        {escape_sql_string(item_old_id)},
+        migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}'
+        ),
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
 """
 
         for fid in folders_chosen:
+            item_old_id = f"{bot_id}-folder-{fid}"
             kb_inserts += f"""
     -- KB item (folder): {fid}
+    IF EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}'
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM migration.id_mappings
+        WHERE table_name = 'knowledge_base_items'
+          AND old_id = {escape_sql_string(item_old_id)}
+    ) THEN
+        RAISE EXCEPTION 'Knowledge-base item UUID collision for %',
+            {escape_sql_string(item_old_id)};
+    END IF;
+
     INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
     SELECT
         migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}'),
@@ -2717,6 +3082,31 @@ def generate_agent_insert(
         SELECT 1 FROM knowledge_base_items
         WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}')
     );
+
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_base_items',
+        {escape_sql_string(item_old_id)},
+        migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}'
+        ),
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+
+        kb_inserts += """
+    UPDATE knowledge_bases
+    SET total_document_count = (
+        SELECT COUNT(*)
+        FROM knowledge_base_items
+        WHERE knowledge_base_id = v_kb_id AND is_active
+    ),
+        updated_at = now()
+    WHERE id = v_kb_id;
 """
     
     # Build the DO block — include KB variables only when there are docs/folders
@@ -2734,6 +3124,18 @@ DECLARE
     v_settings_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-settings');
     v_user_id uuid := {resolve_user_id_sql(str(user_id), user_id_overrides)};{kb_declare}
 BEGIN
+    IF EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id)
+       AND NOT EXISTS (
+           SELECT 1 FROM migration.id_mappings
+           WHERE table_name = 'agents'
+             AND old_id = {escape_sql_string(bot_id)}
+             AND new_id = v_agent_id
+       ) THEN
+        RAISE EXCEPTION
+            'Agent UUID collision for legacy bot % (target id % is not mapped from it)',
+            {escape_sql_string(bot_id)}, v_agent_id;
+    END IF;
+
     -- Insert agent if not exists
     IF NOT EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id) THEN
         INSERT INTO agents (
@@ -2789,8 +3191,12 @@ BEGIN
     END IF;
 {kb_inserts}
     -- Track in migration.id_mappings
-    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
-    VALUES ('agents', '{bot_id}', v_agent_id, 'agents_migration',
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action, notes
+    )
+    VALUES ('agents', '{bot_id}', v_agent_id, '{migration_run_id or "agents_migration"}',
+            {_migration_run_sql(migration_run_id)}, 'created',
             'Type: {agent_type}. KB items: {len(docs_chosen) + len(folders_chosen)}')
     ON CONFLICT (table_name, old_id) DO NOTHING;
     
@@ -2811,7 +3217,8 @@ def generate_agents_migration_sql(
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     user_id_overrides: Optional[Dict[str, str]] = None,
-    merged_instructions: Optional[Dict[str, str]] = None
+    merged_instructions: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for agents from playground_bot_generator_config.
@@ -2904,7 +3311,13 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
         
         # Generate per-agent INSERT blocks
         for _, row in agents_df.iterrows():
-            sql = generate_agent_insert(row, namespace_uuid, user_id_overrides, merged_instructions)
+            sql = generate_agent_insert(
+                row,
+                namespace_uuid,
+                user_id_overrides,
+                merged_instructions,
+                migration_run_id,
+            )
             if sql:
                 sql_file.write(sql)
                 sql_file.write('\n')
@@ -2995,6 +3408,7 @@ def generate_conversions_migration_sql(
     namespace_uuid: str = CONVERSIONS_NAMESPACE_UUID,
     max_records_per_insert: int = 100,
     user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration for jeen_dev_translate -> conversions table.
@@ -3096,6 +3510,18 @@ DECLARE
     v_user_id uuid := {user_id_sql};
     v_agent_id uuid := migration.deterministic_uuid_v4('{NAMESPACE_UUID}'::uuid, '{bot_id}-agent');
 BEGIN
+    IF EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id)
+       AND NOT EXISTS (
+           SELECT 1 FROM migration.id_mappings
+           WHERE table_name = 'conversions'
+             AND old_id = {escape_sql_string(conv_id_input)}
+             AND new_id = v_conversion_id
+       ) THEN
+        RAISE EXCEPTION
+            'Conversion UUID collision for legacy conversion %',
+            {escape_sql_string(conv_id_input)};
+    END IF;
+
     -- 1. Insert conversion entity
     IF NOT EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id) THEN
         INSERT INTO conversions (
@@ -3122,8 +3548,15 @@ BEGIN
     END IF;
 
     -- 3. Track in id_mappings for rollback
-    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
-    VALUES ('conversions', {escape_sql_string(conv_id_input)}, v_conversion_id, 'conversions_batch', 'Migrated conversion')
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action, notes
+    )
+    VALUES (
+        'conversions', {escape_sql_string(conv_id_input)}, v_conversion_id,
+        '{migration_run_id or "conversions_batch"}',
+        {_migration_run_sql(migration_run_id)}, 'created', 'Migrated conversion'
+    )
     ON CONFLICT (table_name, old_id) DO NOTHING;
 END $$;
 """)

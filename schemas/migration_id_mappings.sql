@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS migration.id_mappings (
     old_id VARCHAR(255) NOT NULL,
     new_id UUID NOT NULL,
     migration_batch VARCHAR(50),
+    migration_run_id UUID,
+    record_action VARCHAR(20) NOT NULL DEFAULT 'created',
     migrated_at TIMESTAMP DEFAULT now(),
     notes TEXT,
     
@@ -25,6 +27,11 @@ CREATE TABLE IF NOT EXISTS migration.id_mappings (
     CONSTRAINT uq_table_old_id UNIQUE (table_name, old_id),
     CONSTRAINT uq_table_new_id UNIQUE (table_name, new_id)
 );
+
+ALTER TABLE migration.id_mappings
+    ADD COLUMN IF NOT EXISTS migration_run_id UUID;
+ALTER TABLE migration.id_mappings
+    ADD COLUMN IF NOT EXISTS record_action VARCHAR(20) NOT NULL DEFAULT 'created';
 
 -- Indexes for fast lookups
 CREATE INDEX IF NOT EXISTS idx_mappings_table_old_id 
@@ -38,6 +45,36 @@ CREATE INDEX IF NOT EXISTS idx_mappings_batch
 
 CREATE INDEX IF NOT EXISTS idx_mappings_migrated_at 
     ON migration.id_mappings(migrated_at);
+CREATE INDEX IF NOT EXISTS idx_mappings_run_action
+    ON migration.id_mappings(migration_run_id, record_action);
+
+CREATE TABLE IF NOT EXISTS migration.migration_runs (
+    id UUID PRIMARY KEY,
+    status VARCHAR(30) NOT NULL DEFAULT 'running',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    total_users INTEGER NOT NULL DEFAULT 0,
+    source_info JSONB,
+    error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS migration.migration_steps (
+    migration_run_id UUID NOT NULL
+        REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(50) NOT NULL,
+    target_database VARCHAR(100) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'pending',
+    expected_count INTEGER,
+    affected_count INTEGER,
+    verification_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY (migration_run_id, step_key)
+);
+
+ALTER TABLE migration.migration_steps
+    ADD COLUMN IF NOT EXISTS verification_details JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- Migration batch tracking
 CREATE TABLE IF NOT EXISTS migration.batch_log (
@@ -68,13 +105,20 @@ CREATE TABLE IF NOT EXISTS migration.migration_user_results (
     email VARCHAR(255) NOT NULL,
     legacy_user_id VARCHAR(255),
     v5_user_id UUID,
+    user_action VARCHAR(20) NOT NULL DEFAULT 'created',
     result VARCHAR(50) NOT NULL DEFAULT 'pending',
     failed_step VARCHAR(100),
     error_message TEXT,
     steps_completed JSONB DEFAULT '{}'::jsonb,
     started_at TIMESTAMPTZ DEFAULT now(),
-    completed_at TIMESTAMPTZ
+    completed_at TIMESTAMPTZ,
+    CONSTRAINT uq_migration_user_result UNIQUE (batch_id, email)
 );
+
+ALTER TABLE migration.migration_user_results
+    ADD COLUMN IF NOT EXISTS user_action VARCHAR(20) NOT NULL DEFAULT 'created';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_migration_user_result_batch_email
+    ON migration.migration_user_results(batch_id, email);
 
 CREATE INDEX IF NOT EXISTS idx_user_results_batch
     ON migration.migration_user_results(batch_id);
