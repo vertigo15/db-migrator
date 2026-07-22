@@ -705,39 +705,44 @@ class ExtractionEngine:
     
     @staticmethod
     def _build_merged_instructions(agents_df: pd.DataFrame) -> Dict[str, str]:
-        """Concatenate tone/guardrail/response prompt parts per agent into a single instruction.
+        """Concatenate active prompt parts per agent into a single instruction.
 
-        This replaces the former LLM-based prompt merger with deterministic
-        local concatenation.
+        Only prompt features whose ``is_selected`` flag is ``True`` are
+        included.  When multiple features are active they are concatenated
+        with section headers ([Tone], [Guardrail], [Response]).
         """
         import json as _json
 
-        def _extract_content(col_val) -> Optional[str]:
+        def _parse_prompt(col_val):
+            """Return (is_selected: bool, content: str|None) for a JSONB prompt column."""
             if col_val is None:
-                return None
+                return False, None
             if isinstance(col_val, str):
                 try:
                     col_val = _json.loads(col_val)
                 except Exception:
-                    return col_val.strip() or None
+                    return False, col_val.strip() or None
             if isinstance(col_val, dict):
-                return (col_val.get("content") or "").strip() or None
-            return None
+                selected = str(col_val.get("is_selected", False)).lower() == "true"
+                content = (col_val.get("content") or "").strip() or None
+                return selected, content
+            return False, None
 
         merged: Dict[str, str] = {}
         for _, row in agents_df.iterrows():
             bot_id = str(row.get("bot_id", ""))
-            tone = _extract_content(row.get("character_prompts"))
-            guardrail = _extract_content(row.get("hack_prompt"))
-            response = _extract_content(row.get("relevant_answer_prompt"))
+
+            tone_sel, tone = _parse_prompt(row.get("character_prompts"))
+            guard_sel, guardrail = _parse_prompt(row.get("hack_prompt"))
+            resp_sel, response = _parse_prompt(row.get("relevant_answer_prompt"))
 
             sections = []
-            if tone and tone.strip():
-                sections.append(f"[Tone]\n{tone.strip()}")
-            if guardrail and guardrail.strip():
-                sections.append(f"[Guardrail]\n{guardrail.strip()}")
-            if response and response.strip():
-                sections.append(f"[Response]\n{response.strip()}")
+            if tone_sel and tone:
+                sections.append(f"[Tone]\n{tone}")
+            if guard_sel and guardrail:
+                sections.append(f"[Guardrail]\n{guardrail}")
+            if resp_sel and response:
+                sections.append(f"[Response]\n{response}")
 
             if sections:
                 merged[bot_id] = "\n\n".join(sections)

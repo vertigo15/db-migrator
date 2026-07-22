@@ -2718,6 +2718,13 @@ def _safe_get(d: Optional[dict], key: str, default=None):
     return d.get(key, default)
 
 
+def _is_prompt_active(prompt_data: Optional[dict]) -> bool:
+    """Return True if a V4 JSONB prompt column has ``is_selected`` set to True."""
+    if prompt_data is None:
+        return False
+    return str(prompt_data.get("is_selected", False)).lower() == "true"
+
+
 def generate_agent_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
@@ -2800,20 +2807,28 @@ def generate_agent_insert(
     elif toolkit_settings and _safe_get(toolkit_settings, 'is_active') is not None:
         is_active = _safe_get(toolkit_settings, 'is_active') == 'Yes'
     
-    # Model (fallback chain)
+    # Model — pick from the first *active* prompt (is_selected=True),
+    # falling back to any prompt that has a model value.
     model = None
-    for prompt_data in [character_prompts, hack_prompt, analysis_prompt, relevant_answer_prompt]:
+    active_prompts = [p for p in [character_prompts, hack_prompt, analysis_prompt, relevant_answer_prompt]
+                      if _is_prompt_active(p)]
+    all_prompts = active_prompts or [character_prompts, hack_prompt, analysis_prompt, relevant_answer_prompt]
+    for prompt_data in all_prompts:
         m = clean_string(_safe_get(prompt_data, 'model'))
         if m:
             model = m[:128]
             break
     
-    # Instructions — prefer merged (concatenated tone+guardrail+response) if available
+    # Instructions — prefer merged (concatenated active prompts) if available.
+    # The merged dict already filters by is_selected.  The fallback only uses
+    # character_prompts when it is actually active.
     _merged = merged_instructions.get(bot_id) if merged_instructions else None
     if _merged:
         instructions = _merged
-    else:
+    elif _is_prompt_active(character_prompts):
         instructions = clean_string(_safe_get(character_prompts, 'content'))
+    else:
+        instructions = None
     
     # Enabled tools — toolkit_settings.data contains capability flags.
     # Known keys: chat, canvas, code, graph (all boolean).
