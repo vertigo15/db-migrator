@@ -493,32 +493,75 @@ def _verify_step_before_commit(
     if step_key == "04_chunks_embeddings":
         cursor.execute(
             """
+            WITH run_docs AS (
+                SELECT m.new_id AS document_id, dp.id AS processing_id
+                FROM migration.id_mappings m
+                LEFT JOIN public.document_processing dp
+                  ON dp.document_id = m.new_id
+                 AND dp.deleted_at IS NULL
+                WHERE m.table_name = 'documents'
+                  AND m.migration_run_id = %s::uuid
+                  AND m.record_action = 'created'
+            )
             SELECT
-                COUNT(DISTINCT c.id),
-                COUNT(DISTINCT e.id)
-            FROM migration.id_mappings m
-            LEFT JOIN public.chunks c ON c.document_id = m.new_id
-            LEFT JOIN public.embeddings e
-                ON e.document_id = m.new_id AND e.chunk_id = c.id
-            WHERE m.table_name = 'documents'
-              AND m.migration_run_id = %s::uuid
-              AND m.record_action = 'created'
+                (
+                    SELECT COUNT(DISTINCT c.id)
+                    FROM run_docs d
+                    JOIN public.chunks c
+                      ON c.document_id = d.document_id
+                     AND c.document_processing_id = d.processing_id
+                ),
+                (
+                    SELECT COUNT(DISTINCT e.id)
+                    FROM run_docs d
+                    JOIN public.chunks c
+                      ON c.document_id = d.document_id
+                     AND c.document_processing_id = d.processing_id
+                    JOIN public.embeddings e
+                      ON e.document_id = d.document_id
+                     AND e.chunk_id = c.id
+                ),
+                (
+                    SELECT COUNT(DISTINCT c.id)
+                    FROM run_docs d
+                    JOIN public.chunks c ON c.document_id = d.document_id
+                    WHERE c.document_processing_id IS DISTINCT FROM d.processing_id
+                ),
+                (
+                    SELECT COUNT(*)
+                    FROM run_docs
+                    WHERE processing_id IS NULL
+                )
             """,
             (migration_run_id,),
         )
-        chunk_count, embedding_count = (int(value) for value in cursor.fetchone())
+        (
+            chunk_count,
+            embedding_count,
+            invalid_processing_links,
+            missing_processing_rows,
+        ) = (int(value) for value in cursor.fetchone())
         expected_embeddings = int(
             expected_details.get("expected_embeddings", expected_count)
         )
-        if chunk_count != expected_count or embedding_count != expected_embeddings:
+        if (
+            chunk_count != expected_count
+            or embedding_count != expected_embeddings
+            or invalid_processing_links
+            or missing_processing_rows
+        ):
             raise RuntimeError(
                 "Step verification failed: "
                 f"chunks {chunk_count}/{expected_count}, "
-                f"embeddings {embedding_count}/{expected_embeddings}"
+                f"embeddings {embedding_count}/{expected_embeddings}, "
+                f"invalid processing links {invalid_processing_links}, "
+                f"documents missing processing rows {missing_processing_rows}"
             )
         actual_details = {
             "actual_chunks": chunk_count,
             "actual_embeddings": embedding_count,
+            "invalid_processing_links": invalid_processing_links,
+            "missing_processing_rows": missing_processing_rows,
         }
         affected_count = chunk_count
     else:

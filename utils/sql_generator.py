@@ -1786,6 +1786,7 @@ DECLARE
     v_chunk_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}');
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
+    v_document_processing_id uuid;
 BEGIN
     -- Lookup document_id from migration mapping table (FAST)
     v_document_id := migration.get_new_id('documents', v_old_doc_id);
@@ -1801,6 +1802,22 @@ BEGIN
         RAISE NOTICE 'Skipping chunk % - document % has stale mapping (not in documents table)', '{legacy_id}', v_old_doc_id;
         RETURN;
     END IF;
+
+    -- The chunks API scopes rows by both document_id and
+    -- document_processing_id. Resolve the actual processing row instead of
+    -- independently recomputing its UUID.
+    SELECT id INTO v_document_processing_id
+    FROM document_processing
+    WHERE document_id = v_document_id
+      AND deleted_at IS NULL
+    ORDER BY created_at DESC NULLS LAST, id
+    LIMIT 1;
+
+    IF v_document_processing_id IS NULL THEN
+        RAISE EXCEPTION
+            'Cannot migrate chunk %: document % has no active document_processing row',
+            '{legacy_id}', v_document_id;
+    END IF;
     
     -- Insert chunk if not exists
     IF NOT EXISTS (
@@ -1810,6 +1827,7 @@ BEGIN
         INSERT INTO chunks (
             id,
             document_id,
+            document_processing_id,
             chunk_index,
             content,
             content_hash,
@@ -1823,6 +1841,7 @@ BEGIN
         ) VALUES (
             v_chunk_id,
             v_document_id,
+            v_document_processing_id,
             {chunk_index},
             {escape_sql_string_with_dollar_quotes(original_content, 'ORIG')},
             {content_hash},
@@ -1834,6 +1853,27 @@ BEGIN
             {created_at_sql},
             {escape_sql_string_with_dollar_quotes(translated_content, 'TRANS') if translated_content else 'NULL'}
         );
+    ELSE
+        -- Repair idempotent reruns of SQL generated before
+        -- document_processing_id was populated, but reject real collisions.
+        UPDATE chunks
+        SET document_processing_id = v_document_processing_id
+        WHERE id = v_chunk_id
+          AND document_id = v_document_id
+          AND document_processing_id IS NULL;
+
+        IF EXISTS (
+            SELECT 1 FROM chunks
+            WHERE id = v_chunk_id
+              AND (
+                  document_id <> v_document_id
+                  OR document_processing_id IS DISTINCT FROM v_document_processing_id
+              )
+        ) THEN
+            RAISE EXCEPTION
+                'Chunk UUID collision or processing mismatch for legacy chunk %',
+                '{legacy_id}';
+        END IF;
     END IF;
 END ${outer_tag}$;
 """
@@ -2075,12 +2115,16 @@ WHERE m.table_name = 'documents'
   AND m.record_action = 'created'
   AND dp.document_id = m.new_id
   AND EXISTS (
-      SELECT 1 FROM public.chunks c WHERE c.document_id = dp.document_id
+      SELECT 1
+      FROM public.chunks c
+      WHERE c.document_id = dp.document_id
+        AND c.document_processing_id = dp.id
   )
   AND NOT EXISTS (
       SELECT 1
       FROM public.chunks c
       WHERE c.document_id = dp.document_id
+        AND c.document_processing_id = dp.id
         AND NOT EXISTS (
             SELECT 1 FROM public.embeddings e WHERE e.chunk_id = c.id
         )
@@ -2101,13 +2145,17 @@ BEGIN
               NOT EXISTS (
                   SELECT 1 FROM public.chunks c
                   WHERE c.document_id = dp.document_id
+                    AND c.document_processing_id = dp.id
               )
               OR EXISTS (
                   SELECT 1
                   FROM public.chunks c
                   WHERE c.document_id = dp.document_id
-                    AND NOT EXISTS (
+                    AND (
+                        c.document_processing_id IS DISTINCT FROM dp.id
+                        OR NOT EXISTS (
                         SELECT 1 FROM public.embeddings e WHERE e.chunk_id = c.id
+                        )
                     )
               )
           )

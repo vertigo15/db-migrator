@@ -741,8 +741,8 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
     st.subheader("🧮 Select Embeddings")
     if not doc_ids:
         st.info("No selected documents, so no embeddings to select.")
-        st.session_state["selected_embedding_ids"] = []
-        return []
+        st.session_state["selected_embedding_ids"] = None
+        return None
     embeddings_table = get_table_name("embeddings", prefix)
     placeholders = ", ".join(["%s"] * len(doc_ids))
     count_query = f"""
@@ -780,8 +780,8 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
         st.session_state["_p2_emb_df"] = emb_df.copy()
     if emb_df.empty:
         st.info("No embeddings found for selected documents.")
-        st.session_state["selected_embedding_ids"] = []
-        return []
+        st.session_state["selected_embedding_ids"] = None
+        return None
     st.caption(
         f"{valid_count:,} valid chunk row(s) across {covered_documents:,} document(s); "
         f"{empty_count:,} row(s) have no vector."
@@ -802,38 +802,22 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
             | filtered_df["doc_id"].astype(str).str.contains(search, case=False, na=False)
         )
         filtered_df = filtered_df[mask]
-    select_all_embeddings = st.checkbox(
-        "Migrate all chunk rows for the selected documents",
-        value=True,
-        key="select_all_embeddings",
-        help="Recommended. The table below is only a bounded preview.",
+    st.caption(
+        "This table is preview-only. Migration always includes every chunk row "
+        "for the selected documents."
     )
-    previous = st.session_state.get("selected_embedding_ids")
-    if select_all_embeddings:
-        filtered_df["selected"] = True
-    else:
-        if isinstance(previous, list):
-            filtered_df["selected"] = filtered_df["id"].isin(previous)
-        else:
-            filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "id", "external_id", "collection", "doc_id"]]
-    edited_df = st.data_editor(filtered_df, hide_index=True, use_container_width=True, height=320, key="embeddings_editor")
-    selected_embedding_ids = (
-        None
-        if select_all_embeddings
-        else edited_df[edited_df["selected"] == True]["id"].astype(str).tolist()
+    st.dataframe(
+        filtered_df[["id", "external_id", "collection", "doc_id"]],
+        hide_index=True,
+        use_container_width=True,
+        height=320,
     )
-    st.session_state["selected_embedding_ids"] = selected_embedding_ids
-    st.metric(
-        "Selected Embeddings",
-        valid_count if selected_embedding_ids is None else len(selected_embedding_ids),
-    )
-    if selected_embedding_ids is not None:
-        st.warning(
-            "Custom row selection intentionally creates partial document data. "
-            "Those documents will remain pending for V5 reprocessing."
-        )
-    return selected_embedding_ids
+    # None explicitly means complete extraction by document IDs. Never retain a
+    # stale list from a prior Streamlit session, which could cap migration at
+    # the bounded preview.
+    st.session_state["selected_embedding_ids"] = None
+    st.metric("Chunks to migrate", valid_count)
+    return None
 
 def render_conversations_selection(config: ConnectionConfig, prefix: str, user_ids: list):
     """Render selectable conversations list with date/retention filters."""

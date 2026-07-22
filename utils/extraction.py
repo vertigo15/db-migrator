@@ -513,6 +513,11 @@ class ExtractionEngine:
         Returns:
             Tuple of (DataFrame, output_file_path)
         """
+        if selected_embedding_ids is not None:
+            raise ValueError(
+                "Partial chunk selection is not supported. All chunk-data rows "
+                "for the selected documents must be migrated."
+            )
         table_name = get_table_name("embeddings", self.prefix)
         query = f"""
             SELECT id, external_id, collection, document, metadata, embeddings
@@ -520,17 +525,7 @@ class ExtractionEngine:
             WHERE metadata->>'type' = 'chunk-data'
         """
         params = []
-        if selected_embedding_ids is not None:
-            if not selected_embedding_ids:
-                empty_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
-                output_path = os.path.join(self.output_dir, f"embeddings_{self.timestamp}.csv")
-                if self.export_csv:
-                    empty_df.to_csv(output_path, index=False)
-                return empty_df, output_path
-            placeholders = ", ".join(["%s"] * len(selected_embedding_ids))
-            query += f" AND id IN ({placeholders})"
-            params.extend(selected_embedding_ids)
-        elif doc_ids:
+        if doc_ids:
             placeholders = ", ".join(["%s"] * len(doc_ids))
             query += f" AND metadata->>'doc_id' IN ({placeholders})"
             params.extend(doc_ids)

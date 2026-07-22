@@ -417,6 +417,11 @@ def test_documents_start_pending_and_step_four_reconciles_readiness(tmp_path):
     assert "SET status = 'COMPLETED'" in chunk_sql
     assert "NOT EXISTS" in chunk_sql
     assert run_id in chunk_sql
+    assert "SELECT id INTO v_document_processing_id" in chunk_sql
+    assert "document_processing_id," in chunk_sql
+    assert "v_document_processing_id," in chunk_sql
+    assert "c.document_processing_id = dp.id" in chunk_sql
+    assert "c.document_processing_id IS DISTINCT FROM dp.id" in chunk_sql
 
     readiness = ExtractionEngine.evaluate_document_readiness(
         pd.DataFrame([{"doc_id": "doc-1"}, {"doc_id": "doc-without-chunks"}]),
@@ -489,6 +494,18 @@ def test_extract_embeddings_all_mode_is_not_preview_capped(monkeypatch, tmp_path
     )
     extracted, _ = engine.extract_embeddings(["doc-1"], None)
     assert len(extracted) == 5001
+
+
+def test_extract_embeddings_rejects_partial_chunk_selection(tmp_path):
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path),
+        generate_sql=False,
+        export_csv=False,
+    )
+    with pytest.raises(ValueError, match="Partial chunk selection"):
+        engine.extract_embeddings(["doc-1"], ["chunk-1"])
 
 
 def test_folder_sort_is_topological_and_rejects_bad_graphs():
