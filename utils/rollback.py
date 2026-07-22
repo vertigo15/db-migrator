@@ -541,9 +541,18 @@ def rollback_migration(
     target_db: str,
     migration_run_id: str,
     user_scope: dict = None,
+    force: bool = False,
 ) -> tuple:
     """
     Rollback a migration by deleting migrated data and clearing mapping table.
+
+    When ``force`` is True the same-database "unexpected dependent rows" guard
+    is skipped. This is meant for dev / re-migration scenarios where the run
+    recorded pre-existing entities as ``created`` and application rows (e.g.
+    ``agent_drafts``) now reference them. Deletion still relies on the database's
+    own foreign keys: ``ON DELETE CASCADE`` children are removed automatically,
+    while a ``RESTRICT`` child aborts the whole transaction so nothing is
+    partially deleted. The cross-database reverse-order guard always applies.
 
     Returns:
         (success: bool, message: str, rows_deleted: int)
@@ -663,16 +672,26 @@ def rollback_migration(
                     0,
                 )
 
-            local_blockers = _local_rollback_blockers(
-                cursor,
-                step_key,
-                mapped_ids,
-                migration_run_id,
+            local_blockers = (
+                []
+                if force
+                else _local_rollback_blockers(
+                    cursor,
+                    step_key,
+                    mapped_ids,
+                    migration_run_id,
+                )
             )
             if local_blockers:
                 raise RuntimeError(
-                    "Rollback would affect unexpected dependent rows: "
+                    "Rollback blocked to protect application data not created "
+                    "by this migration. The following rows reference entities "
+                    "this run recorded and would be cascade-deleted: "
                     + ", ".join(local_blockers)
+                    + ". These are typically created in the app after migration "
+                    "(or belong to pre-existing entities the run mislabeled as "
+                    "'created'). Re-run with the Force option to delete them "
+                    "anyway (database foreign keys remain the final safeguard)."
                 )
 
             total_deleted = _execute_scoped_rollback(
@@ -770,6 +789,7 @@ def rollback_all_migrations(
     migration_run_id: str,
     source_config: ConnectionConfig = None,
     progress_callback=None,
+    force: bool = False,
 ) -> tuple:
     """Rollback every produced step in strict reverse dependency order."""
     if not migration_run_id:
@@ -834,6 +854,7 @@ def rollback_all_migrations(
             file_info["filename"],
             database,
             migration_run_id,
+            force=force,
         )
         result = {
             "filename": file_info["filename"],
@@ -870,6 +891,7 @@ def rollback_tracked_batch(
     migration_run_id: str,
     source_config: ConnectionConfig = None,
     progress_callback=None,
+    force: bool = False,
 ) -> tuple:
     """Rollback a historical run using tracking rows, without SQL files."""
     tracked_steps = [
@@ -885,6 +907,7 @@ def rollback_tracked_batch(
         migration_run_id,
         source_config=source_config,
         progress_callback=progress_callback,
+        force=force,
     )
 
 
@@ -893,6 +916,7 @@ def rollback_tracked_step(
     migration_run_id: str,
     step_key: str,
     source_config: ConnectionConfig = None,
+    force: bool = False,
 ) -> tuple:
     """Rollback a single tracked step for the whole batch.
 
@@ -916,6 +940,7 @@ def rollback_tracked_step(
         f"{prefix}tracked_{migration_run_id}.sql",
         database,
         migration_run_id,
+        force=force,
     )
     # Keep the canonical batch status in sync after a single-step rollback.
     reconcile_rollback_status(
@@ -969,6 +994,7 @@ def rollback_tracked_user(
     email: str,
     source_config: ConnectionConfig = None,
     progress_callback=None,
+    force: bool = False,
 ) -> tuple:
     """Rollback only one user's run-created entities in reverse step order."""
     try:
@@ -992,6 +1018,7 @@ def rollback_tracked_user(
             database,
             migration_run_id,
             user_scope=user_scope,
+            force=force,
         )
         results.append(
             {
@@ -1025,6 +1052,7 @@ def rollback_tracked_user(
             base_config,
             migration_run_id,
             source_config=source_config,
+            force=force,
         )
         results.extend(batch_results)
         if not success:
