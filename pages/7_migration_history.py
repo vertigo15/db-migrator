@@ -163,6 +163,11 @@ def _expand_steps_columns(df: pd.DataFrame) -> pd.DataFrame:
 def main():
     st.title("📋 Migration History")
     st.caption("View migration batches and per-user results with per-step tracking.")
+    st.page_link(
+        "pages/4_run_migrations.py",
+        label="Open batch and per-user rollback controls",
+        icon="↩️",
+    )
 
     config = config_for_database(_get_target_config(), "user_db")
 

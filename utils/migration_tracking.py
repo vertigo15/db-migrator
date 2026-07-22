@@ -872,9 +872,10 @@ def reconcile_rollback_status(
                     completed_at = CASE
                         WHEN %s = 'rolled_back' THEN now() ELSE completed_at END
                 WHERE batch_id = %s::uuid
-                  AND result <> 'failed'
+                  AND (%s = 'rolled_back' OR result <> 'failed')
+                  AND (%s = 'rolled_back' OR result <> 'rolled_back')
                 """,
-                (overall, overall, run_id),
+                (overall, overall, run_id, overall, overall),
             )
     finally:
         conn.close()
@@ -916,10 +917,77 @@ def reconcile_rollback_status(
                         completed_at = CASE
                             WHEN %s = 'rolled_back' THEN now() ELSE completed_at END
                     WHERE batch_id = %s::uuid
-                      AND result <> 'failed'
+                      AND (%s = 'rolled_back' OR result <> 'failed')
+                      AND (%s = 'rolled_back' OR result <> 'rolled_back')
                     """,
-                    (overall, overall, run_id),
+                    (overall, overall, run_id, overall, overall),
                 )
         finally:
             conn.close()
     return overall
+
+
+def record_user_rollback_result(
+    base_config: ConnectionConfig,
+    run_id: str,
+    email: str,
+    source_config: Optional[ConnectionConfig] = None,
+) -> int:
+    """Mark one user's rollback everywhere and return users not yet rolled back."""
+    coordinator = config_for_database(base_config, "user_db")
+    ensure_tracking_schema(coordinator, coordinator=True)
+    conn = get_connection(coordinator)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE migration.migration_user_results
+                SET result = 'rolled_back',
+                    failed_step = NULL,
+                    error_message = NULL,
+                    completed_at = now()
+                WHERE batch_id = %s::uuid AND email = %s
+                """,
+                (run_id, email),
+            )
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM migration.migration_user_results
+                WHERE batch_id = %s::uuid
+                  AND result <> 'rolled_back'
+                """,
+                (run_id,),
+            )
+            remaining = int(cursor.fetchone()[0])
+    finally:
+        conn.close()
+
+    if source_config is not None:
+        ensure_source_tracking_schema(source_config)
+        conn = get_connection(source_config)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE migration.migration_user_results
+                    SET result = 'rolled_back',
+                        failed_step = NULL,
+                        error_message = NULL,
+                        completed_at = now()
+                    WHERE batch_id = %s::uuid AND email = %s
+                    """,
+                    (run_id, email),
+                )
+        finally:
+            conn.close()
+
+    if remaining:
+        for database in TARGET_DATABASES:
+            update_local_run(base_config, database, run_id, "partial")
+        if source_config is not None:
+            update_source_run(source_config, run_id, "partial")
+
+    return remaining

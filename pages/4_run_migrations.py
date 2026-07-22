@@ -18,8 +18,10 @@ from utils.db import ConnectionConfig, get_connection
 from utils.config import SessionKeys, get_env_connection_defaults
 from utils.sql_generator import NAMESPACE_UUID
 from utils.migration_tracking import (
+    config_for_database,
     finalize_distributed_run,
     reconcile_rollback_status,
+    record_user_rollback_result,
     record_step_result,
 )
 
@@ -731,17 +733,10 @@ def _local_rollback_blockers(
             (
                 "documents.folder",
                 """
-                SELECT COUNT(*) FROM documents d
-                WHERE d.folder_id = ANY(%s::uuid[])
-                  AND NOT EXISTS (
-                      SELECT 1 FROM migration.id_mappings m
-                      WHERE m.table_name = 'documents'
-                        AND m.new_id = d.id
-                        AND m.migration_run_id = %s::uuid
-                        AND m.record_action = 'created'
-                  )
+                SELECT COUNT(*) FROM documents
+                WHERE folder_id = ANY(%s::uuid[])
                 """,
-                (mapped_ids, migration_run_id),
+                (mapped_ids,),
             ),
             (
                 "upload_batch.target_folder",
@@ -864,24 +859,37 @@ def _execute_scoped_rollback(
     elif step_key == "06_agents":
         cursor.execute(
             """
-            SELECT DISTINCT new_id
-            FROM migration.id_mappings
-            WHERE table_name = 'knowledge_bases'
-              AND migration_run_id = %s::uuid
-              AND record_action = 'created'
+            SELECT DISTINCT knowledge_base_id
+            FROM knowledge_base_assignments
+            WHERE assigned_to_type = 'agent'
+              AND assigned_to_id = ANY(%s::uuid[])
             UNION
-            SELECT migration.deterministic_uuid_v4(
-                %s::uuid, old_id || '-kb'
-            )
-            FROM migration.id_mappings
-            WHERE table_name = 'agents'
-              AND migration_run_id = %s::uuid
-              AND record_action = 'created'
+            SELECT kb.new_id
+            FROM migration.id_mappings kb
+            JOIN migration.id_mappings agent
+              ON agent.table_name = 'agents'
+             AND agent.old_id = kb.old_id
+             AND agent.migration_run_id = kb.migration_run_id
+            WHERE kb.table_name = 'knowledge_bases'
+              AND kb.migration_run_id = %s::uuid
+              AND kb.record_action = 'created'
+              AND agent.new_id = ANY(%s::uuid[])
             """,
-            (migration_run_id, NAMESPACE_UUID, migration_run_id),
+            (mapped_ids, migration_run_id, mapped_ids),
         )
         kb_ids = [str(row[0]) for row in cursor.fetchall()]
         if kb_ids:
+            cursor.execute(
+                """
+                SELECT id FROM knowledge_base_items
+                WHERE knowledge_base_id = ANY(%s::uuid[])
+                UNION
+                SELECT id FROM knowledge_base_assignments
+                WHERE knowledge_base_id = ANY(%s::uuid[])
+                """,
+                (kb_ids, kb_ids),
+            )
+            helper_ids = [str(row[0]) for row in cursor.fetchall()] + kb_ids
             cursor.execute(
                 """
                 SELECT COUNT(*) FROM knowledge_base_assignments
@@ -910,24 +918,25 @@ def _execute_scoped_rollback(
                 "DELETE FROM knowledge_bases WHERE id = ANY(%s::uuid[])",
                 (kb_ids,),
             )
+            cursor.execute(
+                """
+                DELETE FROM migration.id_mappings
+                WHERE migration_run_id = %s::uuid
+                  AND table_name IN (
+                      'knowledge_base_items',
+                      'knowledge_base_assignments',
+                      'knowledge_bases'
+                  )
+                  AND new_id = ANY(%s::uuid[])
+                """,
+                (migration_run_id, helper_ids),
+            )
         delete("DELETE FROM agent_settings WHERE agent_id = ANY(%s::uuid[])", (mapped_ids,))
         delete(
             "DELETE FROM legacy_bot_to_agent_mapping WHERE new_agent_id = ANY(%s::uuid[])",
             (mapped_ids,),
         )
         delete("DELETE FROM agents WHERE id = ANY(%s::uuid[])", (mapped_ids,))
-        cursor.execute(
-            """
-            DELETE FROM migration.id_mappings
-            WHERE migration_run_id = %s::uuid
-              AND table_name IN (
-                  'knowledge_base_items',
-                  'knowledge_base_assignments',
-                  'knowledge_bases'
-              )
-            """,
-            (migration_run_id,),
-        )
     elif step_key == "05_conversations":
         delete(
             """
@@ -964,11 +973,72 @@ def _execute_scoped_rollback(
     return deleted
 
 
+def _user_scoped_mapping_rows(
+    cursor,
+    mapping_table: str,
+    migration_run_id: str,
+    user_scope: dict,
+) -> tuple[list, list]:
+    """Return all and run-created mapping IDs owned by one migrated user."""
+    target_user_id = str(user_scope["v5_user_id"])
+    legacy_user_id = user_scope.get("legacy_user_id")
+
+    if mapping_table == "users":
+        cursor.execute(
+            """
+            SELECT new_id, record_action
+            FROM migration.id_mappings
+            WHERE table_name = 'users'
+              AND migration_run_id = %s::uuid
+              AND new_id = %s::uuid
+              AND (%s::text IS NULL OR old_id = %s)
+            """,
+            (
+                migration_run_id,
+                target_user_id,
+                legacy_user_id,
+                legacy_user_id,
+            ),
+        )
+    else:
+        owner_tables = {
+            "folders": "folders",
+            "documents": "documents",
+            "conversations": "conversations",
+            "agents": "agents",
+            "conversions": "conversions",
+        }
+        target_table = owner_tables.get(mapping_table)
+        if target_table is None:
+            raise RuntimeError(
+                f"Per-user rollback does not support mapping table {mapping_table}"
+            )
+        cursor.execute(
+            f"""
+            SELECT m.new_id, m.record_action
+            FROM migration.id_mappings m
+            JOIN public.{target_table} owned ON owned.id = m.new_id
+            WHERE m.table_name = %s
+              AND m.migration_run_id = %s::uuid
+              AND owned.user_id = %s::uuid
+            """,
+            (mapping_table, migration_run_id, target_user_id),
+        )
+
+    rows = [(str(new_id), action) for new_id, action in cursor.fetchall()]
+    all_ids = [new_id for new_id, _ in rows]
+    created_ids = [
+        new_id for new_id, action in rows if action == "created"
+    ]
+    return all_ids, created_ids
+
+
 def rollback_migration(
     config: ConnectionConfig,
     filename: str,
     target_db: str,
     migration_run_id: str,
+    user_scope: dict = None,
 ) -> tuple:
     """
     Rollback a migration by deleting migrated data and clearing mapping table.
@@ -993,8 +1063,10 @@ def rollback_migration(
         for prefix in TABLE_MAPPING
         if filename.startswith(prefix)
     )
-    order_blockers = _rollback_order_blockers(
-        config, step_key, migration_run_id
+    order_blockers = (
+        []
+        if user_scope
+        else _rollback_order_blockers(config, step_key, migration_run_id)
     )
     if order_blockers:
         return (
@@ -1030,29 +1102,46 @@ def rollback_migration(
                 cursor.close()
                 conn.close()
                 return (True, "ℹ️ Step was already rolled back.", 0)
-            if step_status[0] in ("pending", "skipped"):
+            if step_status[0] == "skipped":
+                conn.rollback()
+                cursor.close()
+                conn.close()
+                return (True, "ℹ️ Step was skipped for this run.", 0)
+            if step_status[0] == "pending" and not user_scope:
                 raise RuntimeError(
                     f"Step {step_key} has status {step_status[0]} and cannot be rolled back"
                 )
 
             # Snapshot only records created by this run. Reused entities are
             # intentionally excluded from all target-table DELETE statements.
-            cursor.execute("""
-                SELECT new_id
-                FROM migration.id_mappings
-                WHERE table_name = %s
-                  AND migration_run_id = %s::uuid
-                  AND record_action = 'created'
-            """, (table_info["mapping_table"], migration_run_id))
-            mapped_ids = [str(row[0]) for row in cursor.fetchall()]
-            mapped_count = len(mapped_ids)
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM migration.id_mappings
-                WHERE table_name = %s
-                  AND migration_run_id = %s::uuid
-            """, (table_info["mapping_table"], migration_run_id))
-            all_mapping_count = cursor.fetchone()[0]
+            if user_scope:
+                scope_mapping_ids, mapped_ids = _user_scoped_mapping_rows(
+                    cursor,
+                    table_info["mapping_table"],
+                    migration_run_id,
+                    user_scope,
+                )
+                all_mapping_count = len(scope_mapping_ids)
+            else:
+                cursor.execute("""
+                    SELECT new_id, record_action
+                    FROM migration.id_mappings
+                    WHERE table_name = %s
+                      AND migration_run_id = %s::uuid
+                """, (table_info["mapping_table"], migration_run_id))
+                mapping_rows = [
+                    (str(new_id), action)
+                    for new_id, action in cursor.fetchall()
+                ]
+                scope_mapping_ids = [
+                    new_id for new_id, _ in mapping_rows
+                ]
+                mapped_ids = [
+                    new_id
+                    for new_id, action in mapping_rows
+                    if action == "created"
+                ]
+                all_mapping_count = len(scope_mapping_ids)
             
             blockers = (
                 _cross_database_rollback_blockers(
@@ -1111,22 +1200,31 @@ def rollback_migration(
 
             # Step 04 owns no document mappings, so it must never clear them.
             if table_info.get("clear_mappings", True):
-                cursor.execute("""
+                cursor.execute(
+                    """
                     DELETE FROM migration.id_mappings
                     WHERE table_name = %s
                       AND migration_run_id = %s::uuid
-                """, (table_info["mapping_table"], migration_run_id))
+                      AND new_id = ANY(%s::uuid[])
+                    """,
+                    (
+                        table_info["mapping_table"],
+                        migration_run_id,
+                        scope_mapping_ids,
+                    ),
+                )
 
-            cursor.execute("""
-                UPDATE migration.migration_steps
-                SET status = 'rolled_back', completed_at = now()
-                WHERE migration_run_id = %s::uuid AND step_key = %s
-            """, (migration_run_id, step_key))
-            cursor.execute("""
-                UPDATE migration.migration_runs
-                SET status = 'rollback_pending'
-                WHERE id = %s::uuid
-            """, (migration_run_id,))
+            if not user_scope:
+                cursor.execute("""
+                    UPDATE migration.migration_steps
+                    SET status = 'rolled_back', completed_at = now()
+                    WHERE migration_run_id = %s::uuid AND step_key = %s
+                """, (migration_run_id, step_key))
+                cursor.execute("""
+                    UPDATE migration.migration_runs
+                    SET status = 'rollback_pending'
+                    WHERE id = %s::uuid
+                """, (migration_run_id,))
             
             conn.commit()
             cursor.close()
@@ -1135,10 +1233,21 @@ def rollback_migration(
             return (
                 True,
                 (
-                    f"✅ Batch-scoped rollback successful! Deleted {total_deleted} "
-                    f"records created by run {migration_run_id}."
-                    if all_mapping_count
-                    else "ℹ️ No run-owned mappings existed; the step was marked rolled back."
+                    f"✅ User-scoped rollback successful for "
+                    f"{user_scope['email']}! Deleted {total_deleted} records."
+                    if user_scope
+                    else (
+                        (
+                            "✅ Batch-scoped rollback successful! Deleted "
+                            f"{total_deleted} records created by run "
+                            f"{migration_run_id}."
+                        )
+                        if all_mapping_count
+                        else (
+                            "ℹ️ No run-owned mappings existed; the step was "
+                            "marked rolled back."
+                        )
+                    )
                 ),
                 total_deleted,
             )
@@ -1252,6 +1361,339 @@ def rollback_all_migrations(
             f"Rollback stopped in state {overall}; inspect pending/failed steps.",
         )
     return True, results, "All produced steps rolled back successfully"
+
+
+def rollback_tracked_batch(
+    base_config: ConnectionConfig,
+    migration_run_id: str,
+    source_config: ConnectionConfig = None,
+    progress_callback=None,
+) -> tuple:
+    """Rollback a historical run using tracking rows, without SQL files."""
+    tracked_steps = [
+        {
+            "filename": f"{prefix}tracked_{migration_run_id}.sql",
+            "database": database,
+        }
+        for prefix, database, _ in ALL_STEPS
+    ]
+    return rollback_all_migrations(
+        base_config,
+        tracked_steps,
+        migration_run_id,
+        source_config=source_config,
+        progress_callback=progress_callback,
+    )
+
+
+def _load_tracked_user(
+    base_config: ConnectionConfig,
+    migration_run_id: str,
+    email: str,
+) -> dict:
+    config = config_for_database(base_config, "user_db")
+    conn = get_connection(config)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT email, legacy_user_id, v5_user_id, user_action, result
+                FROM migration.migration_user_results
+                WHERE batch_id = %s::uuid AND email = %s
+                """,
+                (migration_run_id, email),
+            )
+            row = cursor.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise RuntimeError(
+            f"User {email} is not tracked in migration run {migration_run_id}"
+        )
+    if row[2] is None:
+        raise RuntimeError(
+            f"User {email} has no resolved V5 UUID; per-user rollback is unsafe"
+        )
+    return {
+        "email": row[0],
+        "legacy_user_id": row[1],
+        "v5_user_id": str(row[2]),
+        "user_action": row[3],
+        "result": row[4],
+    }
+
+
+def rollback_tracked_user(
+    base_config: ConnectionConfig,
+    migration_run_id: str,
+    email: str,
+    source_config: ConnectionConfig = None,
+    progress_callback=None,
+) -> tuple:
+    """Rollback only one user's run-created entities in reverse step order."""
+    try:
+        user_scope = _load_tracked_user(
+            base_config, migration_run_id, email
+        )
+    except Exception as exc:
+        return False, [], str(exc)
+    if user_scope["result"] == "rolled_back":
+        return True, [], f"{user_scope['email']} is already rolled back"
+
+    results = []
+    total_steps = len(ROLLBACK_STEP_ORDER)
+    for index, (prefix, database, label) in enumerate(ROLLBACK_STEP_ORDER):
+        config = config_for_database(base_config, database)
+        if progress_callback:
+            progress_callback(index, total_steps, label)
+        success, message, rows = rollback_migration(
+            config,
+            f"{prefix}tracked_{migration_run_id}.sql",
+            database,
+            migration_run_id,
+            user_scope=user_scope,
+        )
+        results.append(
+            {
+                "filename": prefix.rstrip("_"),
+                "database": database,
+                "success": success,
+                "message": message,
+                "rows": rows,
+            }
+        )
+        if not success:
+            return False, results, message
+
+    try:
+        remaining = record_user_rollback_result(
+            base_config,
+            migration_run_id,
+            user_scope["email"],
+            source_config=source_config,
+        )
+    except Exception as exc:
+        return (
+            False,
+            results,
+            "Data was rolled back, but tracking reconciliation failed: "
+            + str(exc),
+        )
+
+    if remaining == 0:
+        success, batch_results, message = rollback_tracked_batch(
+            base_config,
+            migration_run_id,
+            source_config=source_config,
+        )
+        results.extend(batch_results)
+        if not success:
+            return False, results, message
+
+    return (
+        True,
+        results,
+        (
+            f"Rolled back {user_scope['email']}. "
+            f"{remaining} user(s) remain active in this batch."
+        ),
+    )
+
+
+def _load_rollback_history(base_config: ConnectionConfig) -> tuple[list, dict]:
+    """Load selectable historical runs and their per-user results."""
+    config = config_for_database(base_config, "user_db")
+    conn = get_connection(config)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id::text, started_at, status, total_users
+                FROM migration.migration_batches
+                ORDER BY started_at DESC
+                LIMIT 100
+                """
+            )
+            runs = [
+                {
+                    "id": row[0],
+                    "started_at": row[1],
+                    "status": row[2],
+                    "total_users": row[3],
+                }
+                for row in cursor.fetchall()
+            ]
+            users_by_run = {}
+            for run in runs:
+                cursor.execute(
+                    """
+                    SELECT email, result, user_action
+                    FROM migration.migration_user_results
+                    WHERE batch_id = %s::uuid
+                    ORDER BY email
+                    """,
+                    (run["id"],),
+                )
+                users_by_run[run["id"]] = [
+                    {
+                        "email": row[0],
+                        "result": row[1],
+                        "user_action": row[2],
+                    }
+                    for row in cursor.fetchall()
+                ]
+    finally:
+        conn.close()
+    return runs, users_by_run
+
+
+def render_tracked_rollbacks():
+    """Render rollback controls that survive Streamlit sessions/rebuilds."""
+    base_config = st.session_state.get("target_config")
+    if base_config is None:
+        return
+
+    st.subheader("Tracked Migration Rollback")
+    st.caption(
+        "Select any recorded migration batch. Roll back the entire batch, "
+        "or only one user while preserving the other users in that batch."
+    )
+    try:
+        runs, users_by_run = _load_rollback_history(base_config)
+    except Exception as exc:
+        st.error(f"Could not load migration history: {exc}")
+        return
+    if not runs:
+        st.info("No tracked migration batches are available.")
+        return
+
+    run_ids = [run["id"] for run in runs]
+    run_by_id = {run["id"]: run for run in runs}
+    selected_run_id = st.selectbox(
+        "Migration batch",
+        run_ids,
+        format_func=lambda run_id: (
+            f"{run_id[:8]}… · "
+            f"{run_by_id[run_id]['started_at']:%Y-%m-%d %H:%M} · "
+            f"{run_by_id[run_id]['status']} · "
+            f"{run_by_id[run_id]['total_users']} user(s)"
+        ),
+        key="tracked_rollback_run",
+    )
+    selected_run = run_by_id[selected_run_id]
+    tracked_users = users_by_run.get(selected_run_id, [])
+
+    run_col, user_col = st.columns(2)
+    with run_col:
+        with st.popover(
+            "Rollback Entire Batch",
+            use_container_width=True,
+            disabled=selected_run["status"] == "rolled_back",
+        ):
+            st.warning(
+                "Deletes all run-created entities for every user in this "
+                "batch. Reused V5 users and pre-existing entities are preserved."
+            )
+            st.code("07 → 06 → 05 → 04 → 03 → 02 → 01", language=None)
+            batch_confirmation = st.text_input(
+                "Type the full batch ID",
+                key=f"tracked_batch_confirm_{selected_run_id}",
+            )
+            if st.button(
+                "Confirm Entire Batch Rollback",
+                type="primary",
+                disabled=batch_confirmation != selected_run_id,
+                key=f"tracked_batch_rollback_{selected_run_id}",
+            ):
+                progress = st.progress(0)
+                status = st.empty()
+
+                def update_batch_progress(index, total, label):
+                    status.text(
+                        f"Rolling back {index + 1}/{total}: {label}"
+                    )
+                    progress.progress((index + 1) / total)
+
+                success, details, message = rollback_tracked_batch(
+                    base_config,
+                    selected_run_id,
+                    source_config=_source_tracking_config(),
+                    progress_callback=update_batch_progress,
+                )
+                st.session_state["tracked_rollback_result"] = {
+                    "success": success,
+                    "message": message,
+                    "details": details,
+                }
+                st.rerun()
+
+    with user_col:
+        eligible_users = [
+            user for user in tracked_users
+            if user["result"] != "rolled_back"
+        ]
+        if eligible_users:
+            selected_email = st.selectbox(
+                "User in this batch",
+                [user["email"] for user in eligible_users],
+                format_func=lambda email: (
+                    f"{email} · "
+                    f"{next(u['result'] for u in eligible_users if u['email'] == email)}"
+                ),
+                key=f"tracked_rollback_user_{selected_run_id}",
+            )
+            with st.popover(
+                "Rollback Selected User",
+                use_container_width=True,
+            ):
+                st.warning(
+                    "Deletes only this user's run-created entities. Other "
+                    "users in the selected batch are not changed."
+                )
+                user_confirmation = st.text_input(
+                    f"Type {selected_email} to confirm",
+                    key=f"tracked_user_confirm_{selected_run_id}_{selected_email}",
+                )
+                if st.button(
+                    "Confirm User Rollback",
+                    type="primary",
+                    disabled=user_confirmation != selected_email,
+                    key=f"tracked_user_rollback_{selected_run_id}_{selected_email}",
+                ):
+                    progress = st.progress(0)
+                    status = st.empty()
+
+                    def update_user_progress(index, total, label):
+                        status.text(
+                            f"Rolling back {index + 1}/{total}: {label}"
+                        )
+                        progress.progress((index + 1) / total)
+
+                    success, details, message = rollback_tracked_user(
+                        base_config,
+                        selected_run_id,
+                        selected_email,
+                        source_config=_source_tracking_config(),
+                        progress_callback=update_user_progress,
+                    )
+                    st.session_state["tracked_rollback_result"] = {
+                        "success": success,
+                        "message": message,
+                        "details": details,
+                    }
+                    st.rerun()
+        else:
+            st.info("Every user in this batch is already rolled back.")
+
+    result = st.session_state.get("tracked_rollback_result")
+    if result:
+        if result["success"]:
+            st.success(result["message"])
+        else:
+            st.error(result["message"])
+        with st.expander("Rollback details"):
+            st.dataframe(result["details"], hide_index=True)
+    st.markdown("---")
 
 
 def render_migration_files():
@@ -1631,7 +2073,8 @@ def main():
     """)
     
     st.markdown("---")
-    
+
+    render_tracked_rollbacks()
     render_migration_files()
 
 

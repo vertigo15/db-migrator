@@ -195,6 +195,12 @@ def _setup_databases(base):
             conn.close()
 
 
+@pytest.fixture(scope="module")
+def prepared_cluster(postgres_cluster):
+    _setup_databases(postgres_cluster)
+    return postgres_cluster
+
+
 def _snapshot_existing(base):
     queries = {
         "user_db": "SELECT jsonb_agg(to_jsonb(t) ORDER BY email) FROM users t WHERE payload->>'kind' = 'existing'",
@@ -223,9 +229,8 @@ def _snapshot_existing(base):
     return snapshot
 
 
-def test_append_only_migration_and_batch_scoped_rollback(postgres_cluster):
-    base = postgres_cluster
-    _setup_databases(base)
+def test_append_only_migration_and_batch_scoped_rollback(prepared_cluster):
+    base = prepared_cluster
     run_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     existing_users = [
         f"10000000-0000-4000-8000-00000000000{i}" for i in range(1, 5)
@@ -406,6 +411,7 @@ def test_append_only_migration_and_batch_scoped_rollback(postgres_cluster):
         finally:
             conn.close()
 
+
     steps = [
         ("01_users", "user_db"),
         ("02_folders", "document_db"),
@@ -479,5 +485,264 @@ def test_append_only_migration_and_batch_scoped_rollback(postgres_cluster):
                     (run_id,),
                 )
                 assert cursor.fetchone()[0] == "rolled_back"
+        finally:
+            conn.close()
+
+
+def test_per_user_rollback_preserves_other_users_in_batch(prepared_cluster):
+    base = prepared_cluster
+    run_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    users = [
+        {
+            "email": "scope-a@example.com",
+            "legacy_user_id": "legacy-scope-a",
+            "v5_user_id": "21000000-0000-4000-8000-000000000001",
+            "action": "created",
+        },
+        {
+            "email": "scope-b@example.com",
+            "legacy_user_id": "legacy-scope-b",
+            "v5_user_id": "21000000-0000-4000-8000-000000000002",
+            "action": "created",
+        },
+    ]
+    create_distributed_run(
+        base, run_id, users, {"database": "ephemeral-v4"}
+    )
+
+    owned = {}
+    for index, user in enumerate(users, 1):
+        suffix = str(index)
+        owned[user["email"]] = {
+            "user": user["v5_user_id"],
+            "folder": f"31000000-0000-4000-8000-00000000000{suffix}",
+            "document": f"41000000-0000-4000-8000-00000000000{suffix}",
+            "agent": f"51000000-0000-4000-8000-00000000000{suffix}",
+            "kb": f"52000000-0000-4000-8000-00000000000{suffix}",
+            "kb_assignment": f"53000000-0000-4000-8000-00000000000{suffix}",
+            "kb_item": f"54000000-0000-4000-8000-00000000000{suffix}",
+            "conversation": f"61000000-0000-4000-8000-00000000000{suffix}",
+            "conversion": f"71000000-0000-4000-8000-00000000000{suffix}",
+        }
+
+    for user in users:
+        ids = owned[user["email"]]
+        conn = _connect(base, "user_db")
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO users VALUES (%s, %s, '{\"kind\":\"scoped\"}')",
+                        (ids["user"], user["email"]),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO migration.id_mappings
+                            (table_name, old_id, new_id, migration_batch,
+                             migration_run_id, record_action)
+                        VALUES ('users', %s, %s, %s, %s, 'created')
+                        """,
+                        (
+                            user["legacy_user_id"],
+                            ids["user"],
+                            run_id,
+                            run_id,
+                        ),
+                    )
+        finally:
+            conn.close()
+
+        conn = _connect(base, "document_db")
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO folders VALUES (%s, %s, '{\"kind\":\"scoped\"}', NULL)",
+                        (ids["folder"], ids["user"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO documents VALUES (%s, %s, %s, '{\"kind\":\"scoped\"}')",
+                        (ids["document"], ids["user"], ids["folder"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO chunks VALUES (gen_random_uuid(), %s, '{\"kind\":\"scoped\"}')",
+                        (ids["document"],),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO embeddings
+                        SELECT gen_random_uuid(), id, document_id, '{"kind":"scoped"}'
+                        FROM chunks WHERE document_id = %s
+                        """,
+                        (ids["document"],),
+                    )
+                    for table_name, old_id, new_id in (
+                        ("folders", f"folder-{user['legacy_user_id']}", ids["folder"]),
+                        ("documents", f"doc-{user['legacy_user_id']}", ids["document"]),
+                    ):
+                        cursor.execute(
+                            """
+                            INSERT INTO migration.id_mappings
+                                (table_name, old_id, new_id, migration_batch,
+                                 migration_run_id, record_action)
+                            VALUES (%s, %s, %s, %s, %s, 'created')
+                            """,
+                            (table_name, old_id, new_id, run_id, run_id),
+                        )
+        finally:
+            conn.close()
+
+        conn = _connect(base, "completion_db")
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO agents VALUES (%s, %s, %s, '{\"kind\":\"scoped\"}')",
+                        (ids["agent"], ids["user"], ids["folder"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO knowledge_bases VALUES (%s)",
+                        (ids["kb"],),
+                    )
+                    cursor.execute(
+                        "INSERT INTO knowledge_base_assignments VALUES (%s, %s, %s, 'agent')",
+                        (ids["kb_assignment"], ids["kb"], ids["agent"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO knowledge_base_items VALUES (%s, %s, %s)",
+                        (ids["kb_item"], ids["kb"], ids["document"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO conversations VALUES (%s, %s, '{\"kind\":\"scoped\"}')",
+                        (ids["conversation"], ids["user"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO conversions VALUES (%s, %s)",
+                        (ids["conversion"], ids["user"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO agent_conversions VALUES (%s, %s)",
+                        (ids["agent"], ids["conversion"]),
+                    )
+                    for table_name, old_id, new_id in (
+                        ("agents", f"agent-{user['legacy_user_id']}", ids["agent"]),
+                        ("knowledge_bases", f"agent-{user['legacy_user_id']}", ids["kb"]),
+                        (
+                            "knowledge_base_assignments",
+                            f"assignment-{user['legacy_user_id']}",
+                            ids["kb_assignment"],
+                        ),
+                        (
+                            "knowledge_base_items",
+                            f"item-{user['legacy_user_id']}",
+                            ids["kb_item"],
+                        ),
+                        (
+                            "conversations",
+                            f"conversation-{user['legacy_user_id']}",
+                            ids["conversation"],
+                        ),
+                        (
+                            "conversions",
+                            f"conversion-{user['legacy_user_id']}",
+                            ids["conversion"],
+                        ),
+                    ):
+                        cursor.execute(
+                            """
+                            INSERT INTO migration.id_mappings
+                                (table_name, old_id, new_id, migration_batch,
+                                 migration_run_id, record_action)
+                            VALUES (%s, %s, %s, %s, %s, 'created')
+                            """,
+                            (table_name, old_id, new_id, run_id, run_id),
+                        )
+        finally:
+            conn.close()
+
+    for step, database in (
+        ("01_users", "user_db"),
+        ("02_folders", "document_db"),
+        ("03_documents", "document_db"),
+        ("04_chunks_embeddings", "document_db"),
+        ("05_conversations", "completion_db"),
+        ("06_agents", "completion_db"),
+        ("07_conversions", "completion_db"),
+    ):
+        record_step_result(base, run_id, step, database, True, 2)
+
+    success, _, message = RUN_PAGE.rollback_tracked_user(
+        base, run_id, users[0]["email"]
+    )
+    assert success, message
+
+    for database, table, entity_key in (
+        ("user_db", "users", "user"),
+        ("document_db", "documents", "document"),
+        ("completion_db", "agents", "agent"),
+        ("completion_db", "conversations", "conversation"),
+        ("completion_db", "conversions", "conversion"),
+    ):
+        conn = _connect(base, database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE id = %s",
+                    (owned[users[0]["email"]][entity_key],),
+                )
+                assert cursor.fetchone()[0] == 0
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE id = %s",
+                    (owned[users[1]["email"]][entity_key],),
+                )
+                assert cursor.fetchone()[0] == 1
+        finally:
+            conn.close()
+
+    conn = _connect(base, "user_db")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT email, result
+                FROM migration.migration_user_results
+                WHERE batch_id = %s
+                ORDER BY email
+                """,
+                (run_id,),
+            )
+            assert cursor.fetchall() == [
+                ("scope-a@example.com", "rolled_back"),
+                ("scope-b@example.com", "pending"),
+            ]
+            cursor.execute(
+                "SELECT status FROM migration.migration_batches WHERE id = %s",
+                (run_id,),
+            )
+            assert cursor.fetchone()[0] == "partial"
+    finally:
+        conn.close()
+
+    success, _, message = RUN_PAGE.rollback_tracked_user(
+        base, run_id, users[1]["email"]
+    )
+    assert success, message
+    for database in ("user_db", "document_db", "completion_db"):
+        conn = _connect(base, database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT status FROM migration.migration_runs WHERE id = %s",
+                    (run_id,),
+                )
+                assert cursor.fetchone()[0] == "rolled_back"
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM migration.id_mappings
+                    WHERE migration_run_id = %s
+                    """,
+                    (run_id,),
+                )
+                assert cursor.fetchone()[0] == 0
         finally:
             conn.close()
