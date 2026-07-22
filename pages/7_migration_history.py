@@ -14,6 +14,14 @@ from utils.migration_tracking import (
     config_for_database,
     ensure_tracking_schema,
 )
+from utils.rollback import (
+    ALL_STEPS,
+    STEP_LABELS,
+    load_batch_step_statuses,
+    rollback_tracked_batch,
+    rollback_tracked_step,
+    rollback_tracked_user,
+)
 
 st.set_page_config(page_title="Migration History", page_icon="📋", layout="wide")
 
@@ -160,13 +168,223 @@ def _expand_steps_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _get_source_config():
+    """V4 audit-mirroring config, if the user connected a source DB."""
+    return st.session_state.get("source_config")
+
+
+def render_rollback_controls(base_config, batch_id, batches_df):
+    """Batch / per-step / per-user rollback for one selected migration batch.
+
+    Deletes are always scoped to rows created by this run; reused users and
+    pre-existing V5 data are preserved, and reverse dependency order is enforced.
+    """
+    batch_id = str(batch_id)
+    st.markdown("---")
+    st.subheader("↩️ Rollback Controls")
+    st.caption(
+        "Roll back an entire batch, a single step (e.g. only Agents), or a "
+        "single user. Only rows created by this run are deleted — reused users "
+        "and pre-existing V5 data are always preserved."
+    )
+
+    try:
+        batch_status = (
+            batches_df[batches_df["id"].astype(str) == batch_id]["status"].iloc[0]
+        )
+    except Exception:
+        batch_status = None
+
+    source_config = _get_source_config()
+
+    try:
+        step_statuses = load_batch_step_statuses(base_config, batch_id)
+    except Exception as exc:
+        step_statuses = {}
+        st.warning(f"Could not load per-step status: {exc}")
+
+    tab_batch, tab_step, tab_user = st.tabs(
+        ["Entire batch", "Single step", "Single user"]
+    )
+
+    # ── Entire batch ──────────────────────────────────────────────────────
+    with tab_batch:
+        st.warning(
+            "Deletes all run-created entities for every user in this batch, "
+            "in strict reverse dependency order (07 → 01)."
+        )
+        st.code("07 → 06 → 05 → 04 → 03 → 02 → 01", language=None)
+        with st.popover(
+            "🔙 Rollback Entire Batch",
+            use_container_width=True,
+            disabled=batch_status == "rolled_back",
+        ):
+            confirm_batch = st.text_input(
+                "Type the full batch ID to confirm",
+                key=f"hist_batch_confirm_{batch_id}",
+            )
+            if st.button(
+                "Confirm Entire Batch Rollback",
+                type="primary",
+                disabled=confirm_batch != batch_id,
+                key=f"hist_batch_rollback_{batch_id}",
+            ):
+                progress = st.progress(0)
+                status = st.empty()
+
+                def _batch_progress(index, total, label):
+                    status.text(f"Rolling back {index + 1}/{total}: {label}")
+                    progress.progress((index + 1) / total)
+
+                success, details, message = rollback_tracked_batch(
+                    base_config,
+                    batch_id,
+                    source_config=source_config,
+                    progress_callback=_batch_progress,
+                )
+                st.session_state["hist_rollback_result"] = {
+                    "success": success,
+                    "message": message,
+                    "details": details,
+                }
+                st.rerun()
+
+    # ── Single step ───────────────────────────────────────────────────────
+    with tab_step:
+        step_keys = [prefix.rstrip("_") for prefix, _, _ in ALL_STEPS]
+        selected_step = st.selectbox(
+            "Step to roll back",
+            step_keys,
+            format_func=lambda k: (
+                f"{k} · {STEP_LABELS.get(k, k)} · {step_statuses.get(k, 'unknown')}"
+            ),
+            key=f"hist_step_select_{batch_id}",
+        )
+        current = step_statuses.get(selected_step, "unknown")
+        st.caption(f"Current status: **{current}**")
+        st.info(
+            "Reverse-order safety still applies: rolling back an earlier step "
+            "while a later dependent step is still live will be blocked with a "
+            "clear message telling you which steps to roll back first."
+        )
+        blocked = current in ("rolled_back", "skipped", "tracking_missing")
+        with st.popover(
+            "🔙 Rollback Selected Step",
+            use_container_width=True,
+            disabled=blocked,
+        ):
+            st.warning(
+                f"Deletes only the **{STEP_LABELS.get(selected_step, selected_step)}** "
+                "step's run-created rows for every user in this batch."
+            )
+            confirm_step = st.text_input(
+                f"Type {selected_step} to confirm",
+                key=f"hist_step_confirm_{batch_id}_{selected_step}",
+            )
+            if st.button(
+                "Confirm Step Rollback",
+                type="primary",
+                disabled=confirm_step != selected_step,
+                key=f"hist_step_rollback_{batch_id}_{selected_step}",
+            ):
+                with st.spinner(f"Rolling back {selected_step}..."):
+                    success, message, rows = rollback_tracked_step(
+                        base_config,
+                        batch_id,
+                        selected_step,
+                        source_config=source_config,
+                    )
+                st.session_state["hist_rollback_result"] = {
+                    "success": success,
+                    "message": message,
+                    "details": [
+                        {"step": selected_step, "rows": rows, "message": message}
+                    ],
+                }
+                st.rerun()
+
+    # ── Single user ───────────────────────────────────────────────────────
+    with tab_user:
+        user_config = config_for_database(base_config, "user_db")
+        users_df = _load_user_results(user_config, batch_id)
+        if users_df.empty:
+            st.info("No tracked users for this batch.")
+        else:
+            eligible = users_df[users_df["result"] != "rolled_back"]
+            if eligible.empty:
+                st.info("Every user in this batch is already rolled back.")
+            else:
+                emails = eligible["email"].tolist()
+                selected_email = st.selectbox(
+                    "User to roll back",
+                    emails,
+                    format_func=lambda e: (
+                        f"{e} · "
+                        f"{eligible[eligible['email'] == e]['result'].iloc[0]}"
+                    ),
+                    key=f"hist_user_select_{batch_id}",
+                )
+                with st.popover(
+                    "🔙 Rollback Selected User",
+                    use_container_width=True,
+                ):
+                    st.warning(
+                        "Deletes only this user's run-created entities. Other "
+                        "users in this batch are not changed."
+                    )
+                    confirm_user = st.text_input(
+                        f"Type {selected_email} to confirm",
+                        key=f"hist_user_confirm_{batch_id}_{selected_email}",
+                    )
+                    if st.button(
+                        "Confirm User Rollback",
+                        type="primary",
+                        disabled=confirm_user != selected_email,
+                        key=f"hist_user_rollback_{batch_id}_{selected_email}",
+                    ):
+                        progress = st.progress(0)
+                        status = st.empty()
+
+                        def _user_progress(index, total, label):
+                            status.text(
+                                f"Rolling back {index + 1}/{total}: {label}"
+                            )
+                            progress.progress((index + 1) / total)
+
+                        success, details, message = rollback_tracked_user(
+                            base_config,
+                            batch_id,
+                            selected_email,
+                            source_config=source_config,
+                            progress_callback=_user_progress,
+                        )
+                        st.session_state["hist_rollback_result"] = {
+                            "success": success,
+                            "message": message,
+                            "details": details,
+                        }
+                        st.rerun()
+
+    result = st.session_state.get("hist_rollback_result")
+    if result:
+        if result["success"]:
+            st.success(result["message"])
+        else:
+            st.error(result["message"])
+        if result.get("details"):
+            with st.expander("Rollback details", expanded=not result["success"]):
+                st.dataframe(result["details"], hide_index=True)
+        if st.button("Dismiss result", key="hist_rollback_dismiss"):
+            del st.session_state["hist_rollback_result"]
+            st.rerun()
+
+
 def main():
     st.title("📋 Migration History")
     st.caption("View migration batches and per-user results with per-step tracking.")
-    st.page_link(
-        "pages/4_run_migrations.py",
-        label="Open batch and per-user rollback controls",
-        icon="↩️",
+    st.caption(
+        "Select a specific batch below to reveal batch, per-step, and per-user "
+        "rollback controls."
     )
 
     config = config_for_database(_get_target_config(), "user_db")
@@ -224,6 +442,9 @@ def main():
         options=batch_options,
         format_func=lambda x: x if x == "All" else f"{str(x)[:8]}... ({batches_df[batches_df['id'] == x]['started_at'].iloc[0]})",
     )
+
+    if selected_batch != "All":
+        render_rollback_controls(_get_target_config(), selected_batch, batches_df)
 
     st.markdown("---")
     st.subheader("User Results")

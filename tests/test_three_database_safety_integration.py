@@ -1,11 +1,9 @@
 """Three-database append-only/rollback proof using an ephemeral PostgreSQL."""
-import importlib.util
 import json
 import os
 import shutil
 import socket
 import subprocess
-from pathlib import Path
 
 import psycopg2
 import pytest
@@ -16,6 +14,11 @@ from utils.migration_tracking import (
     reconcile_rollback_status,
     record_step_result,
 )
+from utils.rollback import (
+    rollback_all_migrations,
+    rollback_migration,
+    rollback_tracked_user,
+)
 from utils.sql_generator import (
     CONVERSIONS_NAMESPACE_UUID,
     DOC_NAMESPACE_UUID,
@@ -23,18 +26,6 @@ from utils.sql_generator import (
     deterministic_uuid_v4_py,
     generate_migration_schema_setup,
 )
-
-
-def _load_run_page():
-    path = Path(__file__).parents[1] / "pages" / "4_run_migrations.py"
-    spec = importlib.util.spec_from_file_location("run_migrations_page", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader
-    spec.loader.exec_module(module)
-    return module
-
-
-RUN_PAGE = _load_run_page()
 
 
 @pytest.fixture(scope="module")
@@ -427,7 +418,7 @@ def test_append_only_migration_and_batch_scoped_rollback(prepared_cluster):
     premature_user_config = ConnectionConfig(
         base.host, base.port, "user_db", base.username, base.password
     )
-    success, message, _ = RUN_PAGE.rollback_migration(
+    success, message, _ = rollback_migration(
         premature_user_config,
         "01_users_test.sql",
         "user_db",
@@ -445,7 +436,7 @@ def test_append_only_migration_and_batch_scoped_rollback(prepared_cluster):
         {"filename": "06_agents_test.sql", "target_db": "completion_db"},
         {"filename": "07_conversions_test.sql", "target_db": "completion_db"},
     ]
-    success, rollback_results, message = RUN_PAGE.rollback_all_migrations(
+    success, rollback_results, message = rollback_all_migrations(
         base, migration_files, run_id
     )
     assert success, message
@@ -671,7 +662,7 @@ def test_per_user_rollback_preserves_other_users_in_batch(prepared_cluster):
     ):
         record_step_result(base, run_id, step, database, True, 2)
 
-    success, _, message = RUN_PAGE.rollback_tracked_user(
+    success, _, message = rollback_tracked_user(
         base, run_id, users[0]["email"]
     )
     assert success, message
@@ -723,7 +714,7 @@ def test_per_user_rollback_preserves_other_users_in_batch(prepared_cluster):
     finally:
         conn.close()
 
-    success, _, message = RUN_PAGE.rollback_tracked_user(
+    success, _, message = rollback_tracked_user(
         base, run_id, users[1]["email"]
     )
     assert success, message
