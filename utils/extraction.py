@@ -173,6 +173,7 @@ class ExtractionEngine:
         user_id_overrides: Optional[Dict[str, str]] = None,
         migration_run_id: Optional[str] = None,
         cross_owner_policy: str = "block",
+        include_chunkless_documents: bool = False,
     ):
         """
         Initialize extraction engine.
@@ -190,6 +191,8 @@ class ExtractionEngine:
             target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
             user_id_overrides: Optional mapping of {v4_user_id: existing_v5_uuid} for users
                                who already exist in V5 with a different UUID
+            include_chunkless_documents: Preserve metadata-only documents that
+                                         have no V4 chunk rows (default: False)
         """
         self.config = config
         self.prefix = prefix
@@ -206,6 +209,7 @@ class ExtractionEngine:
         if cross_owner_policy not in {"block", "reassign"}:
             raise ValueError("cross_owner_policy must be 'block' or 'reassign'")
         self.cross_owner_policy = cross_owner_policy
+        self.include_chunkless_documents = include_chunkless_documents
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Ensure output directories exist
@@ -266,6 +270,26 @@ class ExtractionEngine:
             "ready_document_ids": sorted(ready),
             "documents_requiring_reprocessing": sorted(all_doc_ids - ready),
         }
+
+    @staticmethod
+    def document_ids_with_chunks(embeddings_df: pd.DataFrame) -> set[str]:
+        """Return document IDs represented by at least one V4 chunk row."""
+        chunked: set[str] = set()
+        if embeddings_df.empty:
+            return chunked
+        for _, row in embeddings_df.iterrows():
+            metadata = row.get("metadata")
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (ValueError, TypeError):
+                    metadata = {}
+            if not isinstance(metadata, dict):
+                continue
+            doc_id = metadata.get("doc_id")
+            if doc_id and metadata.get("type", "chunk-data") == "chunk-data":
+                chunked.add(str(doc_id))
+        return chunked
 
     def _get_users_group_column(self, users_table: str) -> Optional[str]:
         """Detect group-id column name in users table across environments."""
@@ -394,7 +418,8 @@ class ExtractionEngine:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         max_doc_size: Optional[int] = None,
-        selected_doc_ids: Optional[List[str]] = None
+        selected_doc_ids: Optional[List[str]] = None,
+        generate_sql_now: bool = True,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract documents with optional filters.
@@ -458,7 +483,7 @@ class ExtractionEngine:
             df.to_csv(output_path, index=False)
         
         # Generate SQL migration file if enabled
-        if self.generate_sql and len(df) > 0:
+        if self.generate_sql and generate_sql_now and len(df) > 0:
             sql_output_path = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
             try:
@@ -1106,6 +1131,7 @@ class ExtractionEngine:
 
         added_doc_ids: List[str] = []
         stale_doc_ids: List[str] = []
+        chunkless_doc_ids: List[str] = []
         out_of_scope_owner_doc_ids: List[str] = []
         doc_source_labels: Dict[str, str] = {}
 
@@ -1166,27 +1192,52 @@ class ExtractionEngine:
                 print(f"[topup] Warning: none of the {len(missing_doc_ids)} referenced doc ID(s) found "
                       "(may have been deleted from source).")
             else:
-                added_doc_ids = new_docs_df["doc_id"].tolist()
-                # Build SQL annotation labels
-                for doc_id in added_doc_ids:
-                    agent_ref = doc_to_agent.get(str(doc_id), 'unknown')
-                    doc_source_labels[str(doc_id)] = f'agent:{agent_ref[:16]}'
-
-                docs_df = pd.concat([docs_df, new_docs_df], ignore_index=True)
-
-                # Fetch embeddings for the newly added documents
-                new_doc_ids = new_docs_df["doc_id"].tolist()
+                # Fetch only actual chunk rows for newly discovered documents.
+                # Metadata-only documents are excluded by default because V5
+                # cannot use or reprocess them unless the original blob is
+                # separately available.
+                new_doc_ids = new_docs_df["doc_id"].astype(str).tolist()
                 emb_table = get_table_name("embeddings", self.prefix)
                 emb_placeholders = ", ".join(["%s"] * len(new_doc_ids))
                 emb_query = f"""
                     SELECT id, external_id, collection, document, metadata, embeddings
                     FROM public.{emb_table}
                     WHERE metadata->>'doc_id' IN ({emb_placeholders})
+                      AND metadata->>'type' = 'chunk-data'
                 """
                 new_emb_df = execute_query(self.config, emb_query, tuple(new_doc_ids))
-                if len(new_emb_df) > 0:
-                    embeddings_df = pd.concat([embeddings_df, new_emb_df], ignore_index=True)
-                print(f"[topup] Added {len(added_doc_ids)} document(s) and {len(new_emb_df)} embedding chunk(s).")
+                if not self.include_chunkless_documents:
+                    chunked_ids = self.document_ids_with_chunks(new_emb_df)
+                    chunkless_doc_ids = sorted(found_ids - chunked_ids)
+                    if chunkless_doc_ids:
+                        new_docs_df = new_docs_df[
+                            ~new_docs_df["doc_id"].astype(str).isin(chunkless_doc_ids)
+                        ].copy()
+
+                added_doc_ids = new_docs_df["doc_id"].astype(str).tolist()
+                # Build SQL annotation labels
+                for doc_id in added_doc_ids:
+                    agent_ref = doc_to_agent.get(str(doc_id), 'unknown')
+                    doc_source_labels[str(doc_id)] = f'agent:{agent_ref[:16]}'
+
+                if added_doc_ids:
+                    docs_df = pd.concat([docs_df, new_docs_df], ignore_index=True)
+                    # Excluded chunkless documents have no rows in new_emb_df,
+                    # so every fetched chunk belongs to a retained document.
+                    kept_emb_df = new_emb_df
+                    if len(kept_emb_df) > 0:
+                        embeddings_df = pd.concat(
+                            [embeddings_df, kept_emb_df], ignore_index=True
+                        )
+                    print(
+                        f"[topup] Added {len(added_doc_ids)} document(s) and "
+                        f"{len(kept_emb_df)} embedding chunk(s)."
+                    )
+                if chunkless_doc_ids:
+                    print(
+                        f"[topup] Excluded {len(chunkless_doc_ids)} chunkless "
+                        "agent-referenced document(s)."
+                    )
                 if stale_doc_ids:
                     print(f"[topup] Warning: {len(stale_doc_ids)} agent-referenced doc ID(s) not found in V4 "
                           f"(stale references — agent-document links will be dropped): {stale_doc_ids[:5]}")
@@ -1291,7 +1342,7 @@ class ExtractionEngine:
             elif missing_folder_ids:
                 stale_folder_ids = list(missing_folder_ids)
 
-        cross_owner_doc_set = set(out_of_scope_owner_doc_ids)
+        cross_owner_doc_set = set(out_of_scope_owner_doc_ids) - set(chunkless_doc_ids)
         cross_owner_folder_set = set(out_of_scope_owner_folder_ids)
         if self.cross_owner_policy == "block" and (
             cross_owner_doc_set or cross_owner_folder_set
@@ -1304,7 +1355,7 @@ class ExtractionEngine:
                 f"{sorted(cross_owner_folder_set)[:10]}"
             )
 
-        removed_doc_ids = set(stale_doc_ids)
+        removed_doc_ids = set(stale_doc_ids) | set(chunkless_doc_ids)
         removed_folder_ids = set(stale_folder_ids)
         sanitized_agents = self._sanitize_agent_refs(
             agents_df, removed_doc_ids, removed_folder_ids
@@ -1315,6 +1366,7 @@ class ExtractionEngine:
         report: Dict = {
             'added_doc_ids': added_doc_ids,
             'stale_doc_ids': stale_doc_ids,
+            'chunkless_doc_ids': chunkless_doc_ids,
             'added_folder_ids': added_folder_ids,
             'stale_folder_ids': stale_folder_ids,
             'out_of_scope_owner_folder_ids': out_of_scope_owner_folder_ids,
@@ -1561,16 +1613,14 @@ class ExtractionEngine:
             current_step += 1
             self._report_progress("documents", current_step, total_steps)
             docs_df, docs_path = self.extract_documents(
-                user_ids, date_from, date_to, max_doc_size, selected_doc_ids
+                user_ids,
+                date_from,
+                date_to,
+                max_doc_size,
+                selected_doc_ids,
+                generate_sql_now=False,
             )
             results["files"]["documents"] = docs_path
-            results["summary"]["documents"] = len(docs_df)
-            
-            # Track SQL generation
-            if self.generate_sql and len(docs_df) > 0:
-                sql_path = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
-                if os.path.exists(sql_path):
-                    results["sql_files"]["documents"] = sql_path
             
             # Get doc_ids for embeddings
             doc_ids = docs_df["doc_id"].tolist() if len(docs_df) > 0 else []
@@ -1596,28 +1646,53 @@ class ExtractionEngine:
                     if os.path.exists(sql_path):
                         results["sql_files"]["chunks_embeddings"] = sql_path
 
-                # Regenerate 03_documents_*.sql now that embeddings are known so that
-                # translate_to_english is correctly set on each document_processing record.
-                if self.generate_sql and len(docs_df) > 0:
-                    _docs_sql = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
-                    _src = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
-                    try:
-                        generate_documents_migration_sql(
-                            documents_df=docs_df,
-                            output_file=_docs_sql,
-                            source_info=_src,
-                            user_id_overrides=self.user_id_overrides,
-                            embeddings_df=embeddings_df,
-                            migration_run_id=self.migration_run_id,
-                        )
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Failed to regenerate documents SQL with translation info: {e}"
-                        ) from e
             else:
                 results["summary"]["embeddings"] = 0
                 results["summary"]["embedding_vectors"] = 0
                 embeddings_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
+
+            chunkless_doc_ids: List[str] = []
+            if not self.include_chunkless_documents and len(docs_df) > 0:
+                chunked_doc_ids = self.document_ids_with_chunks(embeddings_df)
+                planned_doc_ids = set(docs_df["doc_id"].astype(str))
+                chunkless_doc_ids = sorted(planned_doc_ids - chunked_doc_ids)
+                if chunkless_doc_ids:
+                    docs_df = docs_df[
+                        ~docs_df["doc_id"].astype(str).isin(chunkless_doc_ids)
+                    ].copy()
+
+            results["summary"]["documents"] = len(docs_df)
+            results["document_filter_report"] = {
+                "chunkless_doc_ids": chunkless_doc_ids,
+                "include_chunkless_documents": self.include_chunkless_documents,
+            }
+            if self.export_csv:
+                docs_df.to_csv(docs_path, index=False)
+
+            # Generate document SQL only after chunk availability is known.
+            # This prevents metadata-only records from entering V5 by default.
+            if self.generate_sql and len(docs_df) > 0:
+                docs_sql = os.path.join(
+                    self.sql_output_dir, f"03_documents_{self.timestamp}.sql"
+                )
+                source_info = (
+                    f"{self.config.host}:{self.config.port}/{self.config.database} "
+                    f"(prefix: {self.prefix})"
+                )
+                try:
+                    generate_documents_migration_sql(
+                        documents_df=docs_df,
+                        output_file=docs_sql,
+                        source_info=source_info,
+                        user_id_overrides=self.user_id_overrides,
+                        embeddings_df=embeddings_df,
+                        migration_run_id=self.migration_run_id,
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to generate documents SQL after chunk filtering: {e}"
+                    ) from e
+                results["sql_files"]["documents"] = docs_sql
 
             results["document_readiness"] = self.evaluate_document_readiness(
                 docs_df, embeddings_df
@@ -1648,6 +1723,14 @@ class ExtractionEngine:
             topup_report = getattr(self, '_last_topup_report', None)
             if topup_report:
                 results['topup_report'] = topup_report
+                topup_chunkless = topup_report.get("chunkless_doc_ids", [])
+                if topup_chunkless:
+                    existing_chunkless = results["document_filter_report"].get(
+                        "chunkless_doc_ids", []
+                    )
+                    results["document_filter_report"]["chunkless_doc_ids"] = sorted(
+                        set(existing_chunkless) | set(topup_chunkless)
+                    )
                 results["summary"]["folders"] = topup_report["total_folder_rows"]
                 results["summary"]["documents"] = topup_report["total_document_rows"]
                 results["summary"]["embeddings"] = topup_report["total_chunk_rows"]
@@ -1660,13 +1743,10 @@ class ExtractionEngine:
                 source_info_base = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
 
                 if topup_report.get('added_folder_ids'):
-                    # Re-fetch updated folders_df from the file that was regenerated
-                    results["summary"]["folders"] = results["summary"].get("folders", 0) + len(topup_report['added_folder_ids'])
                     if self.generate_sql:
                         results["sql_files"]["folders"] = os.path.join(self.sql_output_dir, f"02_folders_{self.timestamp}.sql")
 
                 if topup_report.get('added_doc_ids'):
-                    results["summary"]["documents"] = results["summary"].get("documents", 0) + len(topup_report['added_doc_ids'])
                     if self.generate_sql:
                         results["sql_files"]["documents"] = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
                         results["sql_files"]["chunks_embeddings"] = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")

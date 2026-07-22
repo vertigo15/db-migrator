@@ -50,29 +50,40 @@ DEPENDENCY_PREVIEW_LIMIT = 5000
 
 
 def _get_already_migrated_emails() -> set:
-    """Query target DB for emails that were already successfully migrated."""
+    """Return normalized terminal-success emails or fail closed."""
     from utils.db import get_connection
     target_defaults = get_env_target_defaults()
+    conn = None
     try:
         target_config = ConnectionConfig(
             host=target_defaults["host"],
             port=int(target_defaults["port"]),
-            database=target_defaults["database"],
+            database="user_db",
             username=target_defaults["username"],
             password=target_defaults["password"],
         )
         conn = get_connection(target_config)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT DISTINCT email FROM migration.migration_user_results
-            WHERE result = 'success'
-        """)
-        emails = {row[0] for row in cursor.fetchall()}
-        cursor.close()
-        conn.close()
-        return emails
-    except Exception:
-        return set()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT DISTINCT lower(btrim(email))
+                FROM migration.migration_user_results
+                WHERE result IN ('success', 'reused_existing_user')
+                  AND email IS NOT NULL
+                  AND btrim(email) <> ''
+            """)
+            return {
+                str(row[0]).strip().lower()
+                for row in cursor.fetchall()
+                if row[0]
+            }
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not read completed-user tracking from user_db. "
+            "Next Batch was stopped to prevent duplicate migration."
+        ) from exc
+    finally:
+        if conn is not None and not conn.closed:
+            conn.close()
 
 
 def _source_scope_key(config: ConnectionConfig, prefix: str) -> str:
@@ -374,13 +385,18 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
             with b_col2:
                 st.write("")
                 if st.button("Select Next Batch", type="primary"):
-                    already_migrated = _get_already_migrated_emails()
+                    try:
+                        already_migrated = _get_already_migrated_emails()
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                        st.stop()
                     new_selection = []
                     count = 0
                     for email in filtered_df["email"].tolist():
                         if count >= int(batch_size):
                             break
-                        if email not in already_migrated:
+                        normalized_email = str(email).strip().lower()
+                        if normalized_email not in already_migrated:
                             new_selection.append(email)
                             count += 1
                     st.session_state["_p2_batch_saved_emails"] = new_selection
@@ -576,23 +592,31 @@ def _load_documents_df(config: ConnectionConfig, prefix: str, user_ids: list, fi
     if not user_ids:
         return pd.DataFrame()
     doc_table = get_table_name("custom_documents", prefix)
+    embeddings_table = get_table_name("embeddings", prefix)
     placeholders = ", ".join(["%s"] * len(user_ids))
     query = f"""
-        SELECT doc_id, owner_id, doc_title, doc_name_origin, doc_size, created_at, folder_id, doc_type
-        FROM public.{doc_table}
-        WHERE owner_id IN ({placeholders})
+        SELECT d.doc_id, d.owner_id, d.doc_title, d.doc_name_origin, d.doc_size,
+               d.created_at, d.folder_id, d.doc_type,
+               EXISTS (
+                   SELECT 1
+                   FROM public.{embeddings_table} e
+                   WHERE e.metadata->>'doc_id' = d.doc_id
+                     AND e.metadata->>'type' = 'chunk-data'
+               ) AS has_chunks
+        FROM public.{doc_table} d
+        WHERE d.owner_id IN ({placeholders})
     """
     params = list(user_ids)
     if filters.get("date_from"):
-        query += " AND created_at >= %s"
+        query += " AND d.created_at >= %s"
         params.append(filters["date_from"])
     if filters.get("date_to"):
-        query += " AND created_at <= %s"
+        query += " AND d.created_at <= %s"
         params.append(filters["date_to"])
     if filters.get("max_size"):
-        query += " AND doc_size <= %s"
+        query += " AND d.doc_size <= %s"
         params.append(filters["max_size"])
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY d.created_at DESC"
     df = execute_query(config, query, tuple(params))
     if not df.empty and "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"], unit="s", errors="coerce")
@@ -621,7 +645,37 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
         st.info("No matching documents found.")
         st.session_state["selected_doc_ids"] = []
         return []
-    st.caption(f"Found {len(docs_df)} matching documents")
+    chunkless_scope = (
+        f"{_source_scope_key(config, prefix)}|"
+        f"{tuple(sorted(str(u) for u in user_ids))}"
+    )
+    if st.session_state.get("_chunkless_policy_scope") != chunkless_scope:
+        st.session_state["_chunkless_policy_scope"] = chunkless_scope
+        st.session_state["include_chunkless_documents"] = False
+    include_chunkless_documents = st.checkbox(
+        "Include documents without chunks",
+        value=False,
+        key="include_chunkless_documents",
+        help=(
+            "Off by default. Chunkless documents contain no usable content in "
+            "the migration and agent references to them will be removed."
+        ),
+    )
+    chunkless_count = (
+        int((~docs_df["has_chunks"].fillna(False).astype(bool)).sum())
+        if "has_chunks" in docs_df.columns
+        else 0
+    )
+    if chunkless_count and not include_chunkless_documents:
+        st.warning(
+            f"{chunkless_count} chunkless document(s) are excluded by default."
+        )
+        docs_df = docs_df[docs_df["has_chunks"].fillna(False).astype(bool)].copy()
+    st.caption(f"Found {len(docs_df)} migratable documents")
+    if docs_df.empty:
+        st.info("No documents with chunks match the current selection.")
+        st.session_state["selected_doc_ids"] = []
+        return []
     owner_options = sorted(docs_df["owner_id"].dropna().astype(str).unique().tolist())
     selected_owners = st.multiselect("Filter by owner", options=owner_options, default=owner_options, key="doc_owner_filter")
     search = st.text_input("🔍 Search documents", placeholder="Search by doc id/title/name...", key="doc_search")
@@ -645,7 +699,13 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
         else:
             filtered_df["selected"] = True
     filtered_df["doc_name"] = filtered_df["doc_title"].fillna("").where(filtered_df["doc_title"].str.strip().ne(""), filtered_df["doc_name_origin"])
-    filtered_df = filtered_df[["selected", "doc_name", "doc_id", "owner_id", "doc_size", "created_at", "folder_id", "doc_type"]]
+    display_columns = [
+        "selected", "doc_name", "doc_id", "owner_id", "doc_size",
+        "created_at", "folder_id", "doc_type",
+    ]
+    if include_chunkless_documents and "has_chunks" in filtered_df.columns:
+        display_columns.append("has_chunks")
+    filtered_df = filtered_df[display_columns]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,
@@ -1110,7 +1170,12 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
         return
     
     filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
-    _rk = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}|{_filters_fingerprint(filters)}"
+    _rk = (
+        f"{_source_scope_key(config, prefix)}|"
+        f"{tuple(sorted(str(u) for u in user_ids))}|"
+        f"{_filters_fingerprint(filters)}|"
+        f"{st.session_state.get('include_chunkless_documents', False)}"
+    )
     if st.session_state.get("_p2_related_key") == _rk:
         doc_ids = st.session_state["_p2_related_doc_ids"]
         counts = st.session_state["_p2_related_counts"]
@@ -1118,10 +1183,21 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
     else:
         with st.spinner("Calculating related data..."):
             doc_table = get_table_name("custom_documents", prefix)
+            embeddings_table = get_table_name("embeddings", prefix)
             placeholders = ", ".join(["%s"] * len(user_ids))
 
             query = f"SELECT doc_id FROM public.{doc_table} WHERE owner_id IN ({placeholders})"
             params = list(user_ids)
+
+            if not st.session_state.get("include_chunkless_documents", False):
+                query += f"""
+                    AND EXISTS (
+                        SELECT 1
+                        FROM public.{embeddings_table} e
+                        WHERE e.metadata->>'doc_id' = public.{doc_table}.doc_id
+                          AND e.metadata->>'type' = 'chunk-data'
+                    )
+                """
 
             if filters.get("date_from"):
                 query += " AND created_at >= %s"
@@ -1194,6 +1270,16 @@ def render_copy_preview(config: ConnectionConfig, prefix: str, user_ids: list):
     placeholders = ", ".join(["%s"] * len(user_ids))
     doc_query = f"SELECT doc_id FROM public.{doc_table} WHERE owner_id IN ({placeholders})"
     doc_params = list(user_ids)
+
+    if not st.session_state.get("include_chunkless_documents", False):
+        doc_query += f"""
+            AND EXISTS (
+                SELECT 1
+                FROM public.{embeddings_table} e
+                WHERE e.metadata->>'doc_id' = public.{doc_table}.doc_id
+                  AND e.metadata->>'type' = 'chunk-data'
+            )
+        """
 
     if filters.get("date_from"):
         doc_query += " AND created_at >= %s"
@@ -1590,6 +1676,9 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             user_id_overrides=user_id_overrides if generate_sql else {},
             migration_run_id=migration_run_id,
             cross_owner_policy=cross_owner_policy,
+            include_chunkless_documents=st.session_state.get(
+                "include_chunkless_documents", False
+            ),
         )
         
         # Run extraction
@@ -1717,6 +1806,16 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 "blank, or invalid chat UUID and were skipped."
             )
 
+        document_filter_report = results.get("document_filter_report", {})
+        excluded_chunkless = document_filter_report.get("chunkless_doc_ids", [])
+        if excluded_chunkless:
+            st.warning(
+                f"{len(excluded_chunkless)} document(s) had no V4 chunks and "
+                "were not migrated. Any agent links to them were removed."
+            )
+            with st.expander("Excluded chunkless documents"):
+                st.code("\n".join(excluded_chunkless))
+
         readiness = results.get("document_readiness", {})
         needs_reprocessing = readiness.get(
             "documents_requiring_reprocessing", []
@@ -1748,6 +1847,7 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             stale_docs    = topup.get("stale_doc_ids", [])
             added_folders = topup.get("added_folder_ids", [])
             stale_folders = topup.get("stale_folder_ids", [])
+            chunkless_docs = topup.get("chunkless_doc_ids", [])
             oos_docs      = topup.get("out_of_scope_owner_doc_ids", [])
             oos_folders   = topup.get("out_of_scope_owner_folder_ids", [])
             reassigned_docs = topup.get("reassigned_doc_ids", [])
@@ -1781,6 +1881,21 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                     st.dataframe(
                         pd.DataFrame({"Stale doc_id": stale_docs}),
                         hide_index=True, use_container_width=True
+                    )
+
+            if chunkless_docs:
+                with st.expander(
+                    f"⚠️ {len(chunkless_docs)} chunkless agent document "
+                    "reference(s) — links will be dropped"
+                ):
+                    st.warning(
+                        "These documents exist in V4 but have no chunk data, "
+                        "so neither the documents nor their agent links will migrate."
+                    )
+                    st.dataframe(
+                        pd.DataFrame({"Chunkless doc_id": chunkless_docs}),
+                        hide_index=True,
+                        use_container_width=True,
                     )
 
             if stale_folders:

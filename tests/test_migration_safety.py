@@ -155,6 +155,7 @@ def test_agent_stale_refs_drop_and_cross_owner_content_is_reassigned(monkeypatch
         generate_sql=False,
         export_csv=False,
         cross_owner_policy="reassign",
+        include_chunkless_documents=True,
     )
     agents = _agent_frame()
     empty_docs = pd.DataFrame(columns=["doc_id", "owner_id"])
@@ -217,6 +218,7 @@ def test_cross_owner_agent_dependency_blocks_by_default(monkeypatch, tmp_path):
         str(tmp_path),
         generate_sql=False,
         export_csv=False,
+        include_chunkless_documents=True,
     )
     agents = _agent_frame()
     agents.at[0, "chosen_docs_folders"] = []
@@ -230,6 +232,142 @@ def test_cross_owner_agent_dependency_blocks_by_default(monkeypatch, tmp_path):
             pd.DataFrame(columns=["id", "owner_id"]),
             selected_user_ids=["owner-1"],
         )
+
+
+def test_chunkless_agent_document_is_excluded_and_reference_removed(
+    monkeypatch, tmp_path
+):
+    def fake_query(_config, query, _params=None):
+        if "custom_documents" in query:
+            return pd.DataFrame([{
+                "doc_id": "chunkless-doc",
+                "owner_id": "owner-1",
+                "created_at": None,
+                "doc_name_origin": "empty.txt",
+                "doc_title": "empty",
+                "doc_size": 1,
+                "folder_id": None,
+                "doc_description": None,
+                "doc_type": "txt",
+                "vector_methods": None,
+                "doc_summery": None,
+                "doc_summery_modified_by": None,
+                "doc_summery_modified_at": None,
+                "tags": [],
+                "embedding_model": None,
+                "blob_source": None,
+                "version": None,
+                "doc_checksum": None,
+                "data_integration_doc_metadata": None,
+            }])
+        return pd.DataFrame(
+            columns=[
+                "id", "external_id", "collection", "document",
+                "metadata", "embeddings",
+            ]
+        )
+
+    monkeypatch.setattr("utils.extraction.execute_query", fake_query)
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path),
+        generate_sql=False,
+        export_csv=False,
+    )
+    agents = pd.DataFrame([{
+        "bot_id": "bot-1",
+        "user_id": "owner-1",
+        "docs_chosen": ["chunkless-doc"],
+        "chosen_docs_folders": [],
+        "folder_id": None,
+    }])
+
+    docs, embeddings, _, report = engine._topup_agent_documents(
+        agents,
+        pd.DataFrame(columns=["doc_id", "owner_id"]),
+        pd.DataFrame(columns=["metadata"]),
+        pd.DataFrame(columns=["id", "owner_id"]),
+        selected_user_ids=["owner-1"],
+    )
+
+    assert docs.empty
+    assert embeddings.empty
+    assert agents.iloc[0]["docs_chosen"] == []
+    assert report["chunkless_doc_ids"] == ["chunkless-doc"]
+    assert report["removed_doc_ids"] == ["chunkless-doc"]
+
+
+def test_full_extraction_excludes_selected_chunkless_document(
+    monkeypatch, tmp_path
+):
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path),
+        generate_sql=False,
+        export_csv=False,
+    )
+    documents = pd.DataFrame([
+        {"doc_id": "chunked-doc", "owner_id": "owner-1"},
+        {"doc_id": "chunkless-doc", "owner_id": "owner-1"},
+    ])
+    chunks = pd.DataFrame([{
+        "id": "chunk-1",
+        "external_id": "external-1",
+        "collection": "test",
+        "document": json.dumps({"page_content": "hello"}),
+        "metadata": {"doc_id": "chunked-doc", "type": "chunk-data"},
+        "embeddings": "[0.1,0.2]",
+    }])
+    captured = {}
+
+    monkeypatch.setattr(
+        engine,
+        "extract_users",
+        lambda _emails: (pd.DataFrame([{"id": "owner-1"}]), "users.csv"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "extract_folders",
+        lambda _user_ids: (pd.DataFrame(columns=["id"]), "folders.csv"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "extract_documents",
+        lambda *_args, **_kwargs: (documents.copy(), "documents.csv"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "extract_embeddings",
+        lambda *_args, **_kwargs: (chunks.copy(), "embeddings.csv"),
+    )
+
+    def fake_extract_agents(
+        _user_ids,
+        _selected_agent_ids=None,
+        docs_df=None,
+        folders_df=None,
+        embeddings_df=None,
+    ):
+        captured["doc_ids"] = docs_df["doc_id"].astype(str).tolist()
+        return pd.DataFrame(columns=["bot_id"]), "agents.csv"
+
+    monkeypatch.setattr(engine, "extract_agents", fake_extract_agents)
+    monkeypatch.setattr(
+        engine,
+        "extract_logs",
+        lambda *_args, **_kwargs: (pd.DataFrame(columns=["chat_id"]), "logs.csv"),
+    )
+
+    results = engine.run_full_extraction(["user@example.com"])
+
+    assert results["errors"] == []
+    assert results["summary"]["documents"] == 1
+    assert results["document_filter_report"]["chunkless_doc_ids"] == [
+        "chunkless-doc"
+    ]
+    assert captured["doc_ids"] == ["chunked-doc"]
 
 
 def test_documents_start_pending_and_step_four_reconciles_readiness(tmp_path):
