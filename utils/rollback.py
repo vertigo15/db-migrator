@@ -667,8 +667,14 @@ def rollback_migration(
                 conn.close()
                 return (
                     False,
-                    "❌ Rollback blocked by dependent rows; rollback later steps first: "
-                    + ", ".join(blockers),
+                    "❌ Rollback blocked: rows in other databases still reference "
+                    "this step's entities: "
+                    + ", ".join(blockers)
+                    + ". If these belong to a later migration step, roll that "
+                    "step back first. If they were created in the app (they are "
+                    "not part of this run), they must be removed there first — "
+                    "Force does not bypass this cross-database guard because "
+                    "PostgreSQL cannot protect references that span databases.",
                     0,
                 )
 
