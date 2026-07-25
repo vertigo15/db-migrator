@@ -2,21 +2,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Iterable, Mapping, Optional
 
 from utils.db import ConnectionConfig, get_connection
+from utils.migration_steps import STEP_TARGET_DB as STEP_TARGETS
 
 
 TARGET_DATABASES = ("user_db", "document_db", "completion_db")
-STEP_TARGETS = {
-    "01_users": "user_db",
-    "02_folders": "document_db",
-    "03_documents": "document_db",
-    "04_chunks_embeddings": "document_db",
-    "05_conversations": "completion_db",
-    "06_agents": "completion_db",
-    "07_conversions": "completion_db",
-}
 
 LOCAL_TRACKING_DDL = """
 CREATE SCHEMA IF NOT EXISTS migration;
@@ -48,6 +41,86 @@ CREATE TABLE IF NOT EXISTS migration.migration_steps (
 
 ALTER TABLE migration.migration_steps
     ADD COLUMN IF NOT EXISTS verification_details JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS migration.migration_step_entities (
+    migration_run_id UUID NOT NULL
+        REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(50) NOT NULL,
+    table_name VARCHAR(100) NOT NULL,
+    old_id VARCHAR(255) NOT NULL,
+    new_id UUID NOT NULL,
+    record_action VARCHAR(20) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (migration_run_id, step_key, table_name, old_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_step_entities_new_id
+    ON migration.migration_step_entities(table_name, new_id);
+"""
+
+# Durable job/shard queue. Lives in whichever database a step's shards
+# execute against (mirrors migration_steps placement). Workers claim shards
+# atomically with FOR UPDATE SKIP LOCKED and track leases for stale recovery.
+SHARD_TRACKING_DDL = """
+CREATE SCHEMA IF NOT EXISTS migration;
+
+CREATE TABLE IF NOT EXISTS migration.migration_shards (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    migration_run_id UUID NOT NULL,
+    step_key VARCHAR(50) NOT NULL,
+    step_order INTEGER NOT NULL,
+    target_database VARCHAR(100) NOT NULL,
+    shard_index INTEGER NOT NULL,
+    total_shards INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    expected_rows INTEGER NOT NULL DEFAULT 0,
+    byte_size BIGINT NOT NULL DEFAULT 0,
+    checksum VARCHAR(64) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    owner VARCHAR(200),
+    lease_expires_at TIMESTAMPTZ,
+    affected_count INTEGER,
+    driver_rowcount INTEGER,
+    error_message TEXT,
+    owner_emails JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    CONSTRAINT uq_migration_shard UNIQUE (migration_run_id, step_key, shard_index)
+);
+
+ALTER TABLE migration.migration_shards
+    ADD COLUMN IF NOT EXISTS owner_emails JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'migration'
+          AND table_name = 'migration_shards'
+          AND column_name = 'driver_rowcount'
+    ) THEN
+        ALTER TABLE migration.migration_shards
+            ADD COLUMN driver_rowcount INTEGER;
+        UPDATE migration.migration_shards
+        SET driver_rowcount = affected_count,
+            affected_count = NULL
+        WHERE affected_count IS NOT NULL;
+    END IF;
+END $$;
+
+COMMENT ON COLUMN migration.migration_shards.affected_count IS
+    'Reserved for an exact shard-level entity count; NULL when not explicitly verified.';
+COMMENT ON COLUMN migration.migration_shards.driver_rowcount IS
+    'Raw DB-API rowcount for the final statement in the shard; diagnostic only.';
+
+CREATE INDEX IF NOT EXISTS ix_migration_shards_claimable
+    ON migration.migration_shards (target_database, status, created_at);
+CREATE INDEX IF NOT EXISTS ix_migration_shards_run_step
+    ON migration.migration_shards (migration_run_id, step_key);
 """
 
 COORDINATOR_TRACKING_DDL = """
@@ -158,27 +231,85 @@ def config_for_database(base: ConnectionConfig, database: str) -> ConnectionConf
     )
 
 
+# Arbitrary fixed key identifying the "create migration tracking DDL"
+# advisory lock domain. Plain `CREATE TABLE IF NOT EXISTS` is *not* safe
+# against concurrent first-time callers (multiple worker processes can start
+# at once against a brand-new database and race on the same catalog row,
+# raising a spurious `duplicate key value violates unique constraint
+# "pg_type_typname_nsp_index"`), so every DDL-running function below
+# serializes on this session-scoped lock instead.
+_SCHEMA_DDL_LOCK_KEY = 727837465
+_SCHEMA_READY = set()
+_SCHEMA_READY_LOCK = threading.Lock()
+
+
+def _schema_cache_key(
+    config: ConnectionConfig,
+    schema_kind: str,
+    coordinator: bool = False,
+) -> tuple:
+    return (
+        schema_kind,
+        config.host,
+        int(config.port),
+        config.database,
+        config.username,
+        coordinator,
+    )
+
+
 def ensure_tracking_schema(config: ConnectionConfig, coordinator: bool = False) -> None:
-    conn = get_connection(config)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cursor:
-            cursor.execute(LOCAL_TRACKING_DDL)
-            if coordinator:
-                cursor.execute(COORDINATOR_TRACKING_DDL)
-    finally:
-        conn.close()
+    """Install tracking DDL once per process and target database.
+
+    Queue/status reads must never call this function. The cache prevents hot
+    mutation paths from repeatedly requesting PostgreSQL table locks after
+    startup or run creation has already installed the schema.
+    """
+    cache_key = _schema_cache_key(config, "target", coordinator)
+    with _SCHEMA_READY_LOCK:
+        if cache_key in _SCHEMA_READY:
+            return
+        conn = get_connection(config)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_DDL_LOCK_KEY,))
+                try:
+                    cursor.execute(LOCAL_TRACKING_DDL)
+                    cursor.execute(SHARD_TRACKING_DDL)
+                    if coordinator:
+                        cursor.execute(COORDINATOR_TRACKING_DDL)
+                finally:
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(%s)",
+                        (_SCHEMA_DDL_LOCK_KEY,),
+                    )
+            _SCHEMA_READY.add(cache_key)
+        finally:
+            conn.close()
 
 
 def ensure_source_tracking_schema(source_config: ConnectionConfig) -> None:
     """Create V4 audit tables only; never mutate V4 business schemas."""
-    conn = get_connection(source_config)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cursor:
-            cursor.execute(SOURCE_TRACKING_DDL)
-    finally:
-        conn.close()
+    cache_key = _schema_cache_key(source_config, "source")
+    with _SCHEMA_READY_LOCK:
+        if cache_key in _SCHEMA_READY:
+            return
+        conn = get_connection(source_config)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_DDL_LOCK_KEY,))
+                try:
+                    cursor.execute(SOURCE_TRACKING_DDL)
+                finally:
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(%s)",
+                        (_SCHEMA_DDL_LOCK_KEY,),
+                    )
+            _SCHEMA_READY.add(cache_key)
+        finally:
+            conn.close()
 
 
 def _target_info_from_base(base_config: ConnectionConfig) -> dict:
@@ -552,6 +683,7 @@ def _mirror_source_step_and_users(
     success: bool,
     affected_count: Optional[int],
     error_message: Optional[str],
+    owner_emails: Optional[Iterable[str]] = None,
 ) -> None:
     ensure_source_tracking_schema(source_config)
     conn = get_connection(source_config)
@@ -588,27 +720,56 @@ def _mirror_source_step_and_users(
                 ("running" if success else "partial", error_message, run_id),
             )
             step_value = "success" if success else "failed"
+            scoped_emails = list(owner_emails) if owner_emails else None
             cursor.execute(
                 """
                 UPDATE migration.migration_user_results
                 SET steps_completed =
                         COALESCE(steps_completed, '{}'::jsonb) || %s::jsonb,
-                    result = CASE WHEN %s THEN result ELSE 'failed' END,
-                    failed_step = CASE WHEN %s THEN failed_step ELSE %s END,
-                    error_message = CASE WHEN %s THEN error_message ELSE %s END,
-                    completed_at = CASE WHEN %s THEN completed_at ELSE now() END
+                    result = CASE
+                        WHEN %s AND result = 'failed' AND failed_step = %s
+                            THEN 'pending'
+                        WHEN %s THEN result
+                        ELSE 'failed'
+                    END,
+                    failed_step = CASE
+                        WHEN %s AND failed_step = %s THEN NULL
+                        WHEN %s THEN failed_step
+                        ELSE %s
+                    END,
+                    error_message = CASE
+                        WHEN %s AND failed_step = %s THEN NULL
+                        WHEN %s THEN error_message
+                        ELSE %s
+                    END,
+                    completed_at = CASE
+                        WHEN %s AND failed_step = %s THEN NULL
+                        WHEN %s THEN completed_at
+                        ELSE now()
+                    END
                 WHERE batch_id = %s::uuid
                   AND result IN ('pending', 'failed')
+                  AND (%s::text[] IS NULL OR email = ANY(%s::text[]))
                 """,
                 (
                     json.dumps({step_key: step_value}),
                     success,
+                    step_key,
+                    success,
+                    success,
+                    step_key,
+                    success,
+                    step_key,
                     success,
                     step_key,
                     success,
                     error_message,
                     success,
+                    step_key,
+                    success,
                     run_id,
+                    scoped_emails,
+                    scoped_emails,
                 ),
             )
     finally:
@@ -625,6 +786,7 @@ def record_step_result(
     error_message: Optional[str] = None,
     verification_details: Optional[Mapping[str, object]] = None,
     source_config: Optional[ConnectionConfig] = None,
+    owner_emails: Optional[Iterable[str]] = None,
 ) -> None:
     """Store the local fact and update the canonical per-user summary."""
     target = config_for_database(base_config, target_database)
@@ -677,27 +839,56 @@ def record_step_result(
         conn.autocommit = True
         with conn.cursor() as cursor:
             step_value = "success" if success else "failed"
+            scoped_emails = list(owner_emails) if owner_emails else None
             cursor.execute(
                 """
                 UPDATE migration.migration_user_results
                 SET steps_completed =
                         COALESCE(steps_completed, '{}'::jsonb) || %s::jsonb,
-                    result = CASE WHEN %s THEN result ELSE 'failed' END,
-                    failed_step = CASE WHEN %s THEN failed_step ELSE %s END,
-                    error_message = CASE WHEN %s THEN error_message ELSE %s END,
-                    completed_at = CASE WHEN %s THEN completed_at ELSE now() END
+                    result = CASE
+                        WHEN %s AND result = 'failed' AND failed_step = %s
+                            THEN 'pending'
+                        WHEN %s THEN result
+                        ELSE 'failed'
+                    END,
+                    failed_step = CASE
+                        WHEN %s AND failed_step = %s THEN NULL
+                        WHEN %s THEN failed_step
+                        ELSE %s
+                    END,
+                    error_message = CASE
+                        WHEN %s AND failed_step = %s THEN NULL
+                        WHEN %s THEN error_message
+                        ELSE %s
+                    END,
+                    completed_at = CASE
+                        WHEN %s AND failed_step = %s THEN NULL
+                        WHEN %s THEN completed_at
+                        ELSE now()
+                    END
                 WHERE batch_id = %s::uuid
                   AND result IN ('pending', 'failed')
+                  AND (%s::text[] IS NULL OR email = ANY(%s::text[]))
                 """,
                 (
                     json.dumps({step_key: step_value}),
                     success,
+                    step_key,
+                    success,
+                    success,
+                    step_key,
+                    success,
+                    step_key,
                     success,
                     step_key,
                     success,
                     error_message,
                     success,
+                    step_key,
+                    success,
                     run_id,
+                    scoped_emails,
+                    scoped_emails,
                 ),
             )
             if not success:
@@ -729,6 +920,7 @@ def record_step_result(
             success,
             affected_count,
             error_message,
+            owner_emails,
         )
 
 
@@ -820,6 +1012,32 @@ def finalize_distributed_run(
                 )
         finally:
             conn.close()
+
+
+def is_distributed_run_ready(
+    base_config: ConnectionConfig,
+    run_id: str,
+) -> bool:
+    """True only when every canonical step exists and is completed/skipped."""
+    for step_key, database in STEP_TARGETS.items():
+        config = config_for_database(base_config, database)
+        conn = get_connection(config)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM migration.migration_steps
+                    WHERE migration_run_id = %s::uuid AND step_key = %s
+                    """,
+                    (run_id, step_key),
+                )
+                row = cursor.fetchone()
+                if row is None or row[0] not in ("completed", "skipped"):
+                    return False
+        finally:
+            conn.close()
+    return True
 
 
 def reconcile_rollback_status(

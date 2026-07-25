@@ -8,9 +8,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Callable
 import pandas as pd
 
-from utils.db import ConnectionConfig, execute_query, get_connection
+from utils.db import ConnectionConfig, execute_query, execute_query_chunked, get_connection
 from utils.config import (
     EXTRACTION_ORDER,
+    SHAREPOINT_DOCUMENT_BLOB_SOURCE,
     get_table_name,
     get_query_for_table,
     TABLE_DEFINITIONS
@@ -26,10 +27,96 @@ from utils.sql_generator import (
     USER_NAMESPACE_UUID,
 )
 
+CONVERSATION_UUID_PATTERN = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+
 
 def normalize_email(value: object) -> str:
     """Return the canonical email key used for source/target matching."""
     return str(value or "").strip().lower()
+
+
+def build_conversation_scope_cte(
+    table_name: str,
+    user_ids: List[str],
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    max_per_user: Optional[int] = None,
+) -> Tuple[str, tuple]:
+    """Build the canonical conversation-level filter shared by UI and extraction.
+
+    A V4 conversation consists of one or more log rows sharing a ``chat_id``.
+    Date and per-user limits select complete conversations; callers can then
+    join the selected chat IDs back to the source table to fetch every log row.
+    """
+    if not user_ids:
+        raise ValueError("At least one user ID is required for conversation scope")
+
+    placeholders = ", ".join(["%s"] * len(user_ids))
+    params: List[object] = list(user_ids) + [CONVERSATION_UUID_PATTERN]
+    having = []
+    if date_from is not None:
+        having.append("MIN(l.created_at) >= %s")
+        params.append(date_from)
+    if date_to is not None:
+        having.append("MIN(l.created_at) <= %s")
+        params.append(date_to)
+    having_sql = f"HAVING {' AND '.join(having)}" if having else ""
+    limit_sql = ""
+    if max_per_user is not None and int(max_per_user) > 0:
+        limit_sql = "WHERE conversation_rank <= %s"
+        params.append(int(max_per_user))
+
+    cte = f"""
+        WITH grouped_conversations AS (
+            SELECT
+                l.user_id,
+                lower(btrim(l.chat_id::text)) AS chat_id,
+                MIN(l.created_at) AS conversation_created_at,
+                MAX(l.created_at) AS conversation_updated_at,
+                COUNT(*)::bigint AS log_row_count
+            FROM public.{table_name} l
+            WHERE l.user_id IN ({placeholders})
+              AND btrim(l.chat_id::text) ~ %s
+            GROUP BY l.user_id, lower(btrim(l.chat_id::text))
+            {having_sql}
+        ),
+        ranked_conversations AS (
+            SELECT
+                grouped_conversations.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id
+                    ORDER BY conversation_created_at DESC, chat_id
+                ) AS conversation_rank
+            FROM grouped_conversations
+        ),
+        selected_conversations AS (
+            SELECT *
+            FROM ranked_conversations
+            {limit_sql}
+        )
+    """
+    return cte, tuple(params)
+
+
+def _get_extraction_stream_chunk_size() -> int:
+    """Return the validated row count used for streamed extraction."""
+    raw_value = os.getenv("EXTRACTION_STREAM_CHUNK_SIZE", "5000")
+    try:
+        chunk_size = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "EXTRACTION_STREAM_CHUNK_SIZE must be a positive integer; "
+            f"got {raw_value!r}"
+        ) from exc
+    if chunk_size <= 0:
+        raise ValueError(
+            "EXTRACTION_STREAM_CHUNK_SIZE must be a positive integer; "
+            f"got {raw_value!r}"
+        )
+    return chunk_size
 
 
 def resolve_existing_user_overrides(
@@ -440,9 +527,9 @@ class ExtractionEngine:
                    doc_summery_modified_by, doc_summery_modified_at, tags, embedding_model,
                    blob_source, version, doc_checksum, data_integration_doc_metadata
             FROM public.{table_name}
-            WHERE 1=1
+            WHERE COALESCE(blob_source, '') <> %s
         """
-        params = []
+        params = [SHAREPOINT_DOCUMENT_BLOB_SOURCE]
         
         if selected_doc_ids is not None:
             if not selected_doc_ids:
@@ -518,37 +605,46 @@ class ExtractionEngine:
                 "Partial chunk selection is not supported. All chunk-data rows "
                 "for the selected documents must be migrated."
             )
+        chunk_size = _get_extraction_stream_chunk_size()
         table_name = get_table_name("embeddings", self.prefix)
+        output_path = os.path.join(self.output_dir, f"embeddings_{self.timestamp}.csv")
+        if not doc_ids:
+            empty_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
+            if self.export_csv:
+                empty_df.to_csv(output_path, index=False)
+            return empty_df, output_path
+
+        placeholders = ", ".join(["%s"] * len(doc_ids))
+        # ORDER BY doc_id, id lets the chunk generator assign chunk_index with
+        # a running per-document counter while only holding one bounded chunk
+        # of rows in memory at a time, instead of one DataFrame sized to the
+        # user's entire chunk/embedding volume.
         query = f"""
             SELECT id, external_id, collection, document, metadata, embeddings
             FROM public.{table_name}
             WHERE metadata->>'type' = 'chunk-data'
+              AND metadata->>'doc_id' IN ({placeholders})
+            ORDER BY metadata->>'doc_id', id
         """
-        params = []
-        if doc_ids:
-            placeholders = ", ".join(["%s"] * len(doc_ids))
-            query += f" AND metadata->>'doc_id' IN ({placeholders})"
-            params.extend(doc_ids)
-        else:
-            empty_df = pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
-            output_path = os.path.join(self.output_dir, f"embeddings_{self.timestamp}.csv")
-            if self.export_csv:
-                empty_df.to_csv(output_path, index=False)
-            return empty_df, output_path
-        
-        df = execute_query(self.config, query, tuple(params))
-        
-        output_path = os.path.join(self.output_dir, f"embeddings_{self.timestamp}.csv")
-        if self.export_csv:
-            df.to_csv(output_path, index=False)
-        
-        # Generate SQL migration file if enabled (chunks + embeddings combined)
-        if self.generate_sql and len(df) > 0:
+        collected_frames: List[pd.DataFrame] = []
+        wrote_csv_header = False
+
+        def _stream_and_collect():
+            nonlocal wrote_csv_header
+            for frame in execute_query_chunked(self.config, query, tuple(doc_ids), chunk_size=chunk_size):
+                collected_frames.append(frame)
+                if self.export_csv:
+                    frame.to_csv(output_path, mode='a', index=False, header=not wrote_csv_header)
+                    wrote_csv_header = True
+                yield frame
+
+        sql_output_path = None
+        if self.generate_sql:
             sql_output_path = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
             source_info = f"{self.config.host}:{self.config.port}/{self.config.database} (table: {get_table_name('embeddings', self.prefix)})"
             try:
-                generate_chunks_embeddings_migration_sql(
-                    jeen_dev_df=df,
+                gen_result = generate_chunks_embeddings_migration_sql(
+                    jeen_dev_df=_stream_and_collect(),
                     output_file=sql_output_path,
                     source_info=source_info,
                     default_embedding_model=self.embedding_model,
@@ -560,7 +656,29 @@ class ExtractionEngine:
                 raise RuntimeError(
                     f"Failed to generate chunks/embeddings SQL: {e}"
                 ) from e
-        
+        else:
+            for _ in _stream_and_collect():
+                pass
+
+        df = (
+            pd.concat(collected_frames, ignore_index=True)
+            if collected_frames
+            else pd.DataFrame(columns=["id", "external_id", "collection", "document", "metadata", "embeddings"])
+        )
+
+        if self.generate_sql and len(df) == 0:
+            # The query matched no chunk-data rows; discard the shard(s) that
+            # only contain preamble/epilogue so an empty step is never enqueued.
+            for shard in gen_result.get('shards', []):
+                if os.path.exists(shard):
+                    os.remove(shard)
+            manifest_file = sql_output_path + '.manifest.json'
+            if os.path.exists(manifest_file):
+                os.remove(manifest_file)
+        if self.export_csv and not wrote_csv_header:
+            # No rows were streamed; still produce an (empty) CSV for consistency.
+            df.to_csv(output_path, index=False)
+
         return df, output_path
     
     def extract_agents(
@@ -1007,14 +1125,35 @@ class ExtractionEngine:
                 ph = ', '.join(['%s'] * len(missing_doc_ids))
                 found_df = execute_query(
                     self.config,
-                    f"SELECT doc_id FROM public.{docs_table} WHERE doc_id IN ({ph})",
+                    f"""
+                        SELECT doc_id, blob_source
+                        FROM public.{docs_table}
+                        WHERE doc_id IN ({ph})
+                    """,
                     tuple(missing_doc_ids)
                 )
-                found_ids = set(found_df['doc_id'].astype(str).tolist()) if len(found_df) > 0 else set()
-                can_topup_doc_ids = found_ids
+                found_ids = (
+                    set(found_df["doc_id"].astype(str).tolist())
+                    if len(found_df) > 0
+                    else set()
+                )
+                excluded_sharepoint_doc_ids = (
+                    set(
+                        found_df.loc[
+                            found_df["blob_source"] == SHAREPOINT_DOCUMENT_BLOB_SOURCE,
+                            "doc_id",
+                        ].astype(str)
+                    )
+                    if len(found_df) > 0
+                    else set()
+                )
+                can_topup_doc_ids = found_ids - excluded_sharepoint_doc_ids
                 stale_doc_ids = missing_doc_ids - found_ids
             except Exception:
                 stale_doc_ids = missing_doc_ids
+                excluded_sharepoint_doc_ids = set()
+        else:
+            excluded_sharepoint_doc_ids = set()
 
         # Query V4 for missing folders
         can_topup_folder_ids: set = set()
@@ -1049,6 +1188,7 @@ class ExtractionEngine:
             'already_selected_doc_ids': existing_doc_ids & all_agent_doc_ids,
             'can_topup_doc_ids': can_topup_doc_ids,
             'stale_doc_ids': stale_doc_ids,
+            'excluded_sharepoint_doc_ids': excluded_sharepoint_doc_ids,
             'already_selected_folder_ids': existing_folder_ids & all_agent_folder_ids,
             'can_topup_folder_ids': can_topup_folder_ids,
             'stale_folder_ids': stale_folder_ids,
@@ -1132,6 +1272,7 @@ class ExtractionEngine:
         added_doc_ids: List[str] = []
         stale_doc_ids: List[str] = []
         chunkless_doc_ids: List[str] = []
+        excluded_sharepoint_doc_ids: List[str] = []
         out_of_scope_owner_doc_ids: List[str] = []
         doc_source_labels: Dict[str, str] = {}
 
@@ -1162,8 +1303,26 @@ class ExtractionEngine:
             """
             new_docs_df = execute_query(self.config, docs_query, tuple(missing_doc_ids))
 
-            found_ids = set(new_docs_df["doc_id"].astype(str).tolist()) if len(new_docs_df) > 0 else set()
-            stale_doc_ids = list(missing_doc_ids - found_ids)
+            source_found_ids = (
+                set(new_docs_df["doc_id"].astype(str).tolist())
+                if len(new_docs_df) > 0
+                else set()
+            )
+            if len(new_docs_df) > 0:
+                sharepoint_mask = (
+                    new_docs_df["blob_source"].fillna("")
+                    == SHAREPOINT_DOCUMENT_BLOB_SOURCE
+                )
+                excluded_sharepoint_doc_ids = sorted(
+                    new_docs_df.loc[sharepoint_mask, "doc_id"].astype(str).tolist()
+                )
+                new_docs_df = new_docs_df.loc[~sharepoint_mask].copy()
+            found_ids = (
+                set(new_docs_df["doc_id"].astype(str).tolist())
+                if len(new_docs_df) > 0
+                else set()
+            )
+            stale_doc_ids = list(missing_doc_ids - source_found_ids)
             if selected_set and len(new_docs_df) > 0:
                 out_of_scope_owner_doc_ids.extend(
                     str(row["doc_id"])
@@ -1183,14 +1342,11 @@ class ExtractionEngine:
                             )
                         new_docs_df.at[index, "owner_id"] = owner
 
-            if found_ids:
-                stale_doc_ids = list(missing_doc_ids - found_ids)
-            else:
-                stale_doc_ids = list(missing_doc_ids)
-
             if len(new_docs_df) == 0:
-                print(f"[topup] Warning: none of the {len(missing_doc_ids)} referenced doc ID(s) found "
-                      "(may have been deleted from source).")
+                print(
+                    f"[topup] Warning: none of the {len(missing_doc_ids)} "
+                    "referenced document ID(s) are eligible for migration."
+                )
             else:
                 # Fetch only actual chunk rows for newly discovered documents.
                 # Metadata-only documents are excluded by default because V5
@@ -1237,6 +1393,11 @@ class ExtractionEngine:
                     print(
                         f"[topup] Excluded {len(chunkless_doc_ids)} chunkless "
                         "agent-referenced document(s)."
+                    )
+                if excluded_sharepoint_doc_ids:
+                    print(
+                        f"[topup] Excluded {len(excluded_sharepoint_doc_ids)} "
+                        "SharePoint-backed agent-referenced document(s)."
                     )
                 if stale_doc_ids:
                     print(f"[topup] Warning: {len(stale_doc_ids)} agent-referenced doc ID(s) not found in V4 "
@@ -1355,7 +1516,11 @@ class ExtractionEngine:
                 f"{sorted(cross_owner_folder_set)[:10]}"
             )
 
-        removed_doc_ids = set(stale_doc_ids) | set(chunkless_doc_ids)
+        removed_doc_ids = (
+            set(stale_doc_ids)
+            | set(chunkless_doc_ids)
+            | set(excluded_sharepoint_doc_ids)
+        )
         removed_folder_ids = set(stale_folder_ids)
         sanitized_agents = self._sanitize_agent_refs(
             agents_df, removed_doc_ids, removed_folder_ids
@@ -1367,6 +1532,7 @@ class ExtractionEngine:
             'added_doc_ids': added_doc_ids,
             'stale_doc_ids': stale_doc_ids,
             'chunkless_doc_ids': chunkless_doc_ids,
+            'excluded_sharepoint_doc_ids': excluded_sharepoint_doc_ids,
             'added_folder_ids': added_folder_ids,
             'stale_folder_ids': stale_folder_ids,
             'out_of_scope_owner_folder_ids': out_of_scope_owner_folder_ids,
@@ -1406,56 +1572,53 @@ class ExtractionEngine:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         max_per_user: Optional[int] = None,
+        selected_chat_ids: Optional[List[str]] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract conversation logs belonging to specified users.
 
         Args:
             user_ids: List of user IDs whose logs to extract
-            date_from: Optional start date filter (keep logs created on or after)
-            date_to: Optional end date filter (keep logs created on or before)
-            max_per_user: If set, keep only the most recent N logs per user
+            date_from: Optional conversation creation date filter (inclusive)
+            date_to: Optional conversation creation date filter (inclusive)
+            max_per_user: If set, keep only the most recent N conversations per user
+            selected_chat_ids: Optional explicit subset of chat IDs from the preview
 
         Returns:
             Tuple of (DataFrame, output_file_path)
         """
         table_name = get_table_name("logs", self.prefix)
-        placeholders = ", ".join(["%s"] * len(user_ids))
-
-        # Build optional date WHERE clauses
-        date_where = ""
-        date_params: List = []
-        if date_from:
-            date_where += " AND created_at >= %s"
-            date_params.append(date_from)
-        if date_to:
-            date_where += " AND created_at <= %s"
-            date_params.append(date_to)
 
         cols = """id, user_id, chat_id, question, question_in_english, answer, created_at,
                    message_index, question_number, token_amount, words_amount, is_like,
                    type, bot_id, toolkit_settings, title, category, sentiment,
                    sourcetext, sourcelink, webpagelink, documents_selected, calculated_time"""
-
-        if max_per_user and max_per_user > 0:
-            query = f"""
-                SELECT {cols}
-                FROM (
-                    SELECT {cols},
-                           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS _rn
-                    FROM public.{table_name}
-                    WHERE user_id IN ({placeholders}){date_where}
-                ) _ranked
-                WHERE _rn <= %s
-            """
-            params: tuple = tuple(list(user_ids) + date_params + [max_per_user])
-        else:
-            query = f"""
-                SELECT {cols}
-                FROM public.{table_name}
-                WHERE user_id IN ({placeholders}){date_where}
-            """
-            params = tuple(list(user_ids) + date_params)
+        scope_cte, params = build_conversation_scope_cte(
+            table_name,
+            user_ids,
+            date_from=date_from,
+            date_to=date_to,
+            max_per_user=max_per_user,
+        )
+        selected_where = ""
+        if selected_chat_ids is not None:
+            normalized_chat_ids = [
+                str(chat_id).strip().lower()
+                for chat_id in selected_chat_ids
+                if str(chat_id).strip()
+            ]
+            selected_where = "WHERE selected.chat_id = ANY(%s)"
+            params += (normalized_chat_ids,)
+        query = f"""
+            {scope_cte}
+            SELECT {', '.join(f'l.{column.strip()}' for column in cols.split(','))}
+            FROM public.{table_name} l
+            JOIN selected_conversations selected
+              ON selected.user_id = l.user_id
+             AND selected.chat_id = lower(btrim(l.chat_id::text))
+            {selected_where}
+            ORDER BY l.user_id, selected.chat_id, l.created_at, l.id
+        """
 
         df = execute_query(self.config, query, params)
         
@@ -1543,6 +1706,7 @@ class ExtractionEngine:
         selected_doc_ids: Optional[List[str]] = None,
         selected_embedding_ids: Optional[List[str]] = None,
         selected_agent_ids: Optional[List[str]] = None,
+        selected_conversation_chat_ids: Optional[List[str]] = None,
         extract_conversions: bool = True,
         conv_date_from: Optional[datetime] = None,
         conv_date_to: Optional[datetime] = None,
@@ -1759,6 +1923,7 @@ class ExtractionEngine:
                 date_from=conv_date_from,
                 date_to=conv_date_to,
                 max_per_user=conv_max_per_user,
+                selected_chat_ids=selected_conversation_chat_ids,
             )
             results["files"]["logs"] = logs_path
             results["summary"]["logs"] = len(logs_df)
@@ -1846,8 +2011,9 @@ def get_document_count_preview(
         SELECT COUNT(*) as count
         FROM public.{table_name}
         WHERE owner_id IN ({placeholders})
+          AND COALESCE(blob_source, '') <> %s
     """
-    params = list(user_ids)
+    params = list(user_ids) + [SHAREPOINT_DOCUMENT_BLOB_SOURCE]
     
     if date_from:
         query += " AND created_at >= %s"
@@ -1883,52 +2049,162 @@ def get_related_counts(
     Returns:
         Dictionary of table name to row count
     """
-    counts = {}
-    
-    # Folders count
+    if not user_ids:
+        return {
+            "folders": 0,
+            "embeddings": 0,
+            "embedding_bytes": 0,
+            "agents": 0,
+            "logs": 0,
+        }
+    folders_table = get_table_name("folders", prefix)
+    embeddings_table = get_table_name("embeddings", prefix)
+    agents_table = get_table_name("agents", prefix)
+    logs_table = get_table_name("logs", prefix)
+    user_placeholders = ", ".join(["%s"] * len(user_ids))
+    params = list(user_ids)
+    params.extend(user_ids)
+    params.extend(user_ids)
+
+    if doc_ids:
+        doc_placeholders = ", ".join(["%s"] * len(doc_ids))
+        embedding_counts = f"""
+            SELECT COUNT(*)::bigint,
+                   COALESCE(SUM(pg_column_size(embeddings)), 0)::bigint
+            FROM public.{embeddings_table}
+            WHERE metadata->>'doc_id' IN ({doc_placeholders})
+              AND metadata->>'type' = 'chunk-data'
+        """
+        params.extend(doc_ids)
+    else:
+        embedding_counts = "SELECT 0::bigint, 0::bigint"
+
+    query = f"""
+        SELECT
+            (SELECT COUNT(*) FROM public.{folders_table}
+             WHERE owner_id IN ({user_placeholders}))::bigint AS folders,
+            embedding_stats.embedding_count AS embeddings,
+            embedding_stats.embedding_bytes,
+            (SELECT COUNT(*) FROM public.{agents_table}
+             WHERE user_id IN ({user_placeholders}))::bigint AS agents,
+            (SELECT COUNT(*) FROM public.{logs_table}
+             WHERE user_id IN ({user_placeholders}))::bigint AS logs
+        FROM LATERAL ({embedding_counts}) AS embedding_stats(
+            embedding_count, embedding_bytes
+        )
+    """
     try:
-        folders_table = get_table_name("folders", prefix)
-        placeholders = ", ".join(["%s"] * len(user_ids))
-        query = f"SELECT COUNT(*) as count FROM public.{folders_table} WHERE owner_id IN ({placeholders})"
-        df = execute_query(config, query, tuple(user_ids))
-        counts["folders"] = int(df["count"].iloc[0])
-    except:
-        counts["folders"] = 0
-    
-    # Embeddings count
-    try:
-        if doc_ids:
-            embeddings_table = get_table_name("embeddings", prefix)
-            placeholders = ", ".join(["%s"] * len(doc_ids))
-            query = f"SELECT COUNT(*) as count FROM public.{embeddings_table} WHERE metadata->>'doc_id' IN ({placeholders})"
-            df = execute_query(config, query, tuple(doc_ids))
-            counts["embeddings"] = int(df["count"].iloc[0])
-        else:
-            counts["embeddings"] = 0
-    except:
-        counts["embeddings"] = 0
-    
-    # Agents count
-    try:
-        agents_table = get_table_name("agents", prefix)
-        placeholders = ", ".join(["%s"] * len(user_ids))
-        query = f"SELECT COUNT(*) as count FROM public.{agents_table} WHERE user_id IN ({placeholders})"
-        df = execute_query(config, query, tuple(user_ids))
-        counts["agents"] = int(df["count"].iloc[0])
-    except:
-        counts["agents"] = 0
-    
-    # Logs/conversations count
-    try:
-        logs_table = get_table_name("logs", prefix)
-        placeholders = ", ".join(["%s"] * len(user_ids))
-        query = f"SELECT COUNT(*) as count FROM public.{logs_table} WHERE user_id IN ({placeholders})"
-        df = execute_query(config, query, tuple(user_ids))
-        counts["logs"] = int(df["count"].iloc[0])
-    except:
-        counts["logs"] = 0
-    
-    return counts
+        df = execute_query(config, query, tuple(params))
+        if df.empty:
+            raise RuntimeError("Summary query returned no rows")
+        row = df.iloc[0]
+        return {
+            key: int(row[key] or 0)
+            for key in ("folders", "embeddings", "embedding_bytes", "agents", "logs")
+        }
+    except Exception:
+        return {
+            "folders": 0,
+            "embeddings": 0,
+            "embedding_bytes": 0,
+            "agents": 0,
+            "logs": 0,
+        }
+
+
+def get_selection_summary(
+    config: ConnectionConfig,
+    prefix: str,
+    user_ids: List[str],
+    filters: Optional[Dict] = None,
+    include_chunkless_documents: bool = False,
+) -> Dict[str, int]:
+    """Fetch all selection-summary facts with one database round trip."""
+    if not user_ids:
+        return {
+            "documents": 0,
+            "folders": 0,
+            "embeddings": 0,
+            "embedding_bytes": 0,
+            "agents": 0,
+            "logs": 0,
+        }
+
+    filters = filters or {}
+    documents_table = get_table_name("custom_documents", prefix)
+    folders_table = get_table_name("folders", prefix)
+    embeddings_table = get_table_name("embeddings", prefix)
+    agents_table = get_table_name("agents", prefix)
+    logs_table = get_table_name("logs", prefix)
+    placeholders = ", ".join(["%s"] * len(user_ids))
+    document_predicates = [
+        f"d.owner_id IN ({placeholders})",
+        "COALESCE(d.blob_source, '') <> %s",
+    ]
+    params = list(user_ids) + [SHAREPOINT_DOCUMENT_BLOB_SOURCE]
+    if not include_chunkless_documents:
+        document_predicates.append(
+            f"""EXISTS (
+                SELECT 1 FROM public.{embeddings_table} chunk_check
+                WHERE chunk_check.metadata->>'doc_id' = d.doc_id
+                  AND chunk_check.metadata->>'type' = 'chunk-data'
+            )"""
+        )
+    if filters.get("date_from"):
+        document_predicates.append("d.created_at >= %s")
+        params.append(filters["date_from"])
+    if filters.get("date_to"):
+        document_predicates.append("d.created_at <= %s")
+        params.append(filters["date_to"])
+    if filters.get("max_size"):
+        document_predicates.append("d.doc_size <= %s")
+        params.append(filters["max_size"])
+
+    params.extend(user_ids)
+    params.extend(user_ids)
+    params.extend(user_ids)
+    query = f"""
+        WITH selected_documents AS MATERIALIZED (
+            SELECT d.doc_id
+            FROM public.{documents_table} d
+            WHERE {' AND '.join(document_predicates)}
+        ),
+        embedding_stats AS (
+            SELECT COUNT(*)::bigint AS embedding_count,
+                   COALESCE(SUM(pg_column_size(e.embeddings)), 0)::bigint
+                       AS embedding_bytes
+            FROM public.{embeddings_table} e
+            JOIN selected_documents d
+              ON d.doc_id = e.metadata->>'doc_id'
+            WHERE e.metadata->>'type' = 'chunk-data'
+        )
+        SELECT
+            (SELECT COUNT(*) FROM selected_documents)::bigint AS documents,
+            (SELECT COUNT(*) FROM public.{folders_table}
+             WHERE owner_id IN ({placeholders}))::bigint AS folders,
+            embedding_stats.embedding_count AS embeddings,
+            embedding_stats.embedding_bytes,
+            (SELECT COUNT(*) FROM public.{agents_table}
+             WHERE user_id IN ({placeholders}))::bigint AS agents,
+            (SELECT COUNT(*) FROM public.{logs_table}
+             WHERE user_id IN ({placeholders}))::bigint AS logs
+        FROM embedding_stats
+    """
+    df = execute_query(config, query, tuple(params))
+    if df.empty:
+        raise RuntimeError("Selection summary query returned no rows")
+    row = df.iloc[0]
+    return {
+        key: int(row[key] or 0)
+        for key in (
+            "documents",
+            "folders",
+            "embeddings",
+            "embedding_bytes",
+            "agents",
+            "logs",
+        )
+    }
 
 
 def estimate_embeddings_size(

@@ -31,6 +31,8 @@ def save_to_storage(key: str, value: Any) -> bool:
     """Save a value to session_state and browser localStorage."""
     full_key = key if key.startswith(STORAGE_PREFIX) else f"{STORAGE_PREFIX}{key}"
     cache_key = f"{_CACHE_PREFIX}{full_key}"
+    if cache_key in st.session_state and st.session_state[cache_key] == value:
+        return True
     st.session_state[cache_key] = value
 
     try:

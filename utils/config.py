@@ -15,6 +15,12 @@ load_dotenv(_ENV_PATH, override=True)
 # Storage namespace prefix for localStorage keys
 STORAGE_PREFIX = "db_migrator_"
 
+# SharePoint-backed files are intentionally out of migration scope. Their
+# searchable chunks can move, but the migrator does not transfer the backing
+# SharePoint/blob object, so including the document row would create a file
+# that cannot be reliably opened or downloaded in V5.
+SHAREPOINT_DOCUMENT_BLOB_SOURCE = "application_sharepoint"
+
 # Storage keys
 STORAGE_KEYS = {
     "source_connection": f"{STORAGE_PREFIX}source_connection",

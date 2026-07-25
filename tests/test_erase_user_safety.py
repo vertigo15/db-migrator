@@ -3,6 +3,10 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pandas as pd
+
+from utils.db import ConnectionConfig
+
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
@@ -144,3 +148,75 @@ def test_optional_tracking_query_incompatibility_does_not_block(monkeypatch):
         "completion_db",
         "migration.id_mappings (agents)",
     ) in plan["skipped_steps"]
+
+
+def test_plan_fingerprint_is_bound_to_selection_and_dataset():
+    config = ConnectionConfig("host", 5432, "user_db", "user", "password")
+
+    original = erase_page._deletion_plan_fingerprint(
+        config, ["user-1"], ("dataset-a",)
+    )
+
+    assert original != erase_page._deletion_plan_fingerprint(
+        config, ["user-2"], ("dataset-a",)
+    )
+    assert original != erase_page._deletion_plan_fingerprint(
+        config, ["user-1"], ("dataset-b",)
+    )
+
+
+def test_available_user_fingerprint_changes_when_displayed_dataset_changes():
+    config = ConnectionConfig("host", 5432, "user_db", "user", "password")
+    original = pd.DataFrame([{
+        "id": "user-1",
+        "email": "before@example.com",
+        "organization_id": "org-1",
+        "created_at": "2026-01-01",
+    }])
+    changed = original.copy()
+    changed.loc[0, "email"] = "after@example.com"
+
+    assert erase_page._available_users_fingerprint(
+        config, original
+    ) != erase_page._available_users_fingerprint(config, changed)
+
+
+def test_clearing_active_selection_removes_stale_plan_but_keeps_verification():
+    erase_page.st.session_state.clear()
+    erase_page.st.session_state.update({
+        "v5_erase_selected_ids": ["user-1"],
+        "v5_erase_plan": {"rows": []},
+        "v5_erase_plan_key": ("old",),
+        "_v5_erase_last_deleted_ids": ["previous-user"],
+    })
+
+    erase_page._clear_active_erasure_selection()
+
+    assert "v5_erase_selected_ids" not in erase_page.st.session_state
+    assert "v5_erase_plan" not in erase_page.st.session_state
+    assert "v5_erase_plan_key" not in erase_page.st.session_state
+    assert erase_page.st.session_state["_v5_erase_last_deleted_ids"] == [
+        "previous-user"
+    ]
+
+
+def test_execution_rejects_plan_from_previous_selection():
+    config = ConnectionConfig("host", 5432, "user_db", "user", "password")
+    erase_page.st.session_state.clear()
+    erase_page.st.error.reset_mock()
+    erase_page.st.session_state.update({
+        "v5_erase_config": config,
+        "_v5_erase_dataset_fingerprint": ("current-dataset",),
+        "v5_erase_plan": {"rows": [], "blockers": []},
+        "v5_erase_plan_key": erase_page._deletion_plan_fingerprint(
+            config,
+            ["previous-user"],
+            ("current-dataset",),
+        ),
+    })
+
+    erase_page.render_execute_deletion(["current-user"])
+
+    assert "does not match the currently displayed selection" in (
+        erase_page.st.error.call_args.args[0]
+    )

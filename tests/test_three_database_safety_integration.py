@@ -1,9 +1,6 @@
 """Three-database append-only/rollback proof using an ephemeral PostgreSQL."""
 import json
 import os
-import shutil
-import socket
-import subprocess
 
 import psycopg2
 import pytest
@@ -19,6 +16,7 @@ from utils.rollback import (
     rollback_migration,
     rollback_tracked_user,
 )
+from utils.shard_queue import enqueue_shards
 from utils.sql_generator import (
     CONVERSIONS_NAMESPACE_UUID,
     DOC_NAMESPACE_UUID,
@@ -26,79 +24,6 @@ from utils.sql_generator import (
     deterministic_uuid_v4_py,
     generate_migration_schema_setup,
 )
-
-
-@pytest.fixture(scope="module")
-def postgres_cluster(tmp_path_factory):
-    required = ["initdb", "pg_ctl", "psql"]
-    if any(shutil.which(binary) is None for binary in required):
-        pytest.skip("Local PostgreSQL binaries are required for integration proof")
-
-    root = tmp_path_factory.mktemp("migration-postgres")
-    data = root / "data"
-    log = root / "postgres.log"
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    postgres_env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-
-    subprocess.run(
-        ["initdb", "-D", str(data), "-A", "trust", "-U", "postgres", "--no-locale"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=postgres_env,
-    )
-    subprocess.run(
-        [
-            "pg_ctl",
-            "-D",
-            str(data),
-            "-l",
-            str(log),
-            "-o",
-            f"-F -p {port} -h 127.0.0.1",
-            "start",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=postgres_env,
-    )
-    try:
-        for database in ("user_db", "document_db", "completion_db"):
-            subprocess.run(
-                [
-                    "psql",
-                    "-h",
-                    "127.0.0.1",
-                    "-p",
-                    str(port),
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "postgres",
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "-c",
-                    f"CREATE DATABASE {database}",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=postgres_env,
-            )
-        yield ConnectionConfig(
-            "127.0.0.1", port, "user_db", "postgres", ""
-        )
-    finally:
-        subprocess.run(
-            ["pg_ctl", "-D", str(data), "stop", "-m", "fast"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=postgres_env,
-        )
 
 
 def _connect(base, database):
@@ -184,6 +109,332 @@ def _setup_databases(base):
                 cursor.execute(database_ddl)
         finally:
             conn.close()
+
+
+def test_force_removes_cross_database_kb_item_before_document(
+    prepared_cluster,
+):
+    base = prepared_cluster
+    run_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    user_id = "22000000-0000-4000-8000-000000000001"
+    folder_id = "32000000-0000-4000-8000-000000000001"
+    document_id = "42000000-0000-4000-8000-000000000001"
+    kb_id = "52000000-0000-4000-8000-000000000009"
+    kb_item_id = "54000000-0000-4000-8000-000000000009"
+
+    create_distributed_run(
+        base,
+        run_id,
+        [{
+            "email": "force-kb@example.com",
+            "legacy_user_id": "legacy-force-kb",
+            "v5_user_id": user_id,
+            "action": "created",
+        }],
+        {"database": "ephemeral-v4"},
+    )
+
+    conn = _connect(base, "user_db")
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO users VALUES (%s, %s, '{\"kind\":\"force-kb\"}')",
+                    (user_id, "force-kb@example.com"),
+                )
+    finally:
+        conn.close()
+
+    conn = _connect(base, "document_db")
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO folders VALUES (%s, %s, '{\"kind\":\"force-kb\"}', NULL)",
+                    (folder_id, user_id),
+                )
+                cursor.execute(
+                    "INSERT INTO documents VALUES (%s, %s, %s, '{\"kind\":\"force-kb\"}')",
+                    (document_id, user_id, folder_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO migration.id_mappings
+                        (table_name, old_id, new_id, migration_batch,
+                         migration_run_id, record_action)
+                    VALUES ('documents', 'legacy-force-doc', %s, %s, %s, 'created')
+                    """,
+                    (document_id, run_id, run_id),
+                )
+    finally:
+        conn.close()
+
+    conn = _connect(base, "completion_db")
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO knowledge_bases VALUES (%s)",
+                    (kb_id,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO knowledge_base_assignments
+                    VALUES (gen_random_uuid(), %s, gen_random_uuid(), 'agent')
+                    """,
+                    (kb_id,),
+                )
+                cursor.execute(
+                    "INSERT INTO knowledge_base_items VALUES (%s, %s, %s)",
+                    (kb_item_id, kb_id, document_id),
+                )
+    finally:
+        conn.close()
+
+    record_step_result(
+        base, run_id, "03_documents", "document_db", True, 1
+    )
+    config = ConnectionConfig(
+        base.host, base.port, "document_db", base.username, base.password
+    )
+    user_scope = {
+        "email": "force-kb@example.com",
+        "legacy_user_id": "legacy-force-kb",
+        "v5_user_id": user_id,
+    }
+
+    success, message, _ = rollback_migration(
+        config,
+        "03_documents_test.sql",
+        "document_db",
+        run_id,
+        user_scope=user_scope,
+    )
+    assert not success
+    assert "Enable Force" in message
+
+    success, message, _ = rollback_migration(
+        config,
+        "03_documents_test.sql",
+        "document_db",
+        run_id,
+        user_scope=user_scope,
+        force=True,
+    )
+    assert success, message
+
+    conn = _connect(base, "completion_db")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM knowledge_base_items WHERE id = %s",
+                (kb_item_id,),
+            )
+            assert cursor.fetchone()[0] == 0
+            cursor.execute(
+                "SELECT COUNT(*) FROM knowledge_bases WHERE id = %s",
+                (kb_id,),
+            )
+            assert cursor.fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    conn = _connect(base, "document_db")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM documents WHERE id = %s",
+                (document_id,),
+            )
+            assert cursor.fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_rollback_is_blocked_while_worker_shards_are_active(prepared_cluster):
+    base = prepared_cluster
+    run_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    create_distributed_run(
+        base,
+        run_id,
+        [{
+            "email": "active-worker@example.com",
+            "legacy_user_id": "legacy-active-worker",
+            "v5_user_id": "23000000-0000-4000-8000-000000000001",
+            "action": "created",
+        }],
+        {"database": "ephemeral-v4"},
+    )
+    enqueue_shards(
+        base,
+        run_id,
+        "03_documents",
+        {
+            "shards": [{
+                "shard_index": 1,
+                "file_path": "/tmp/active-document-shard.sql",
+                "expected_rows": 1,
+                "byte_size": 10,
+                "checksum": "active",
+            }]
+        },
+        owner_emails=["active-worker@example.com"],
+    )
+    config = ConnectionConfig(
+        base.host, base.port, "document_db", base.username, base.password
+    )
+    success, message, rows = rollback_migration(
+        config,
+        "03_documents_active.sql",
+        "document_db",
+        run_id,
+    )
+    assert success is False
+    assert rows == 0
+    assert "still queued or running" in message
+
+
+def test_is_migrated_repairs_stale_mapping_but_preserves_live_mapping(
+    prepared_cluster,
+):
+    base = prepared_cluster
+    stale_id = "35000000-0000-4000-8000-000000000001"
+    live_id = "35000000-0000-4000-8000-000000000002"
+    conn = _connect(base, "document_db")
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO folders (id, user_id, payload, parent_id)
+                    VALUES (
+                        %s, '25000000-0000-4000-8000-000000000001',
+                        '{"kind":"live-mapping"}', NULL
+                    )
+                    """,
+                    (live_id,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO migration.id_mappings
+                        (table_name, old_id, new_id, record_action)
+                    VALUES
+                        ('folders', 'stale-folder-integration', %s, 'created'),
+                        ('folders', 'live-folder-integration', %s, 'created')
+                    """,
+                    (stale_id, live_id),
+                )
+                cursor.execute(
+                    """
+                    SELECT migration.is_migrated(
+                        'folders', 'stale-folder-integration'
+                    )
+                    """
+                )
+                assert cursor.fetchone()[0] is False
+                cursor.execute(
+                    """
+                    SELECT migration.is_migrated(
+                        'folders', 'live-folder-integration'
+                    )
+                    """
+                )
+                assert cursor.fetchone()[0] is True
+                cursor.execute(
+                    """
+                    SELECT old_id
+                    FROM migration.id_mappings
+                    WHERE old_id IN (
+                        'stale-folder-integration',
+                        'live-folder-integration'
+                    )
+                    ORDER BY old_id
+                    """
+                )
+                assert cursor.fetchall() == [("live-folder-integration",)]
+    finally:
+        conn.close()
+
+
+def test_rollback_marks_never_started_cancelled_step_skipped(prepared_cluster):
+    base = prepared_cluster
+    run_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    create_distributed_run(
+        base,
+        run_id,
+        [{
+            "email": "cancelled-worker@example.com",
+            "legacy_user_id": "legacy-cancelled-worker",
+            "v5_user_id": "24000000-0000-4000-8000-000000000001",
+            "action": "created",
+        }],
+        {"database": "ephemeral-v4"},
+    )
+    for database in ("user_db", "document_db", "completion_db"):
+        conn = _connect(base, database)
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE migration.migration_steps
+                        SET status = 'skipped'
+                        WHERE migration_run_id = %s
+                          AND step_key <> '07_conversions'
+                        """,
+                        (run_id,),
+                    )
+        finally:
+            conn.close()
+
+    conn = _connect(base, "completion_db")
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO migration.migration_shards (
+                        migration_run_id, step_key, step_order,
+                        target_database, shard_index, total_shards,
+                        file_path, checksum, status
+                    )
+                    VALUES (%s, '07_conversions', 7, 'completion_db',
+                            1, 1, '/tmp/cancelled-conversion.sql',
+                            'cancelled', 'cancelled')
+                    """,
+                    (run_id,),
+                )
+    finally:
+        conn.close()
+
+    success, results, message = rollback_all_migrations(
+        base,
+        [{
+            "filename": "07_conversions_cancelled.sql",
+            "target_db": "completion_db",
+        }],
+        run_id,
+    )
+    assert success is True
+    assert message == "All produced steps rolled back successfully"
+    assert results[0]["rows"] == 0
+    assert "never started" in results[0]["message"]
+
+    conn = _connect(base, "completion_db")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status
+                FROM migration.migration_steps
+                WHERE migration_run_id = %s
+                  AND step_key = '07_conversions'
+                """,
+                (run_id,),
+            )
+            assert cursor.fetchone()[0] == "skipped"
+    finally:
+        conn.close()
 
 
 @pytest.fixture(scope="module")
@@ -542,7 +793,6 @@ def test_per_user_rollback_preserves_other_users_in_batch(prepared_cluster):
                     )
         finally:
             conn.close()
-
         conn = _connect(base, "document_db")
         try:
             with conn:

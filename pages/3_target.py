@@ -203,12 +203,17 @@ def render_target_tables_status():
 
     # Schema inspector
     with st.expander("🔍 Schema Inspector"):
-        for name in LOAD_ORDER:
-            info = table_info.get(name, {})
-            if info.get("exists") and info.get("columns"):
-                st.markdown(f"**{info.get('full_name')}**")
-                cols_df = pd.DataFrame(info["columns"])
-                st.dataframe(cols_df, hide_index=True, use_container_width=True)
+        if st.toggle(
+            "Render schema details",
+            value=False,
+            key="_render_target_schema_details",
+        ):
+            for name in LOAD_ORDER:
+                info = table_info.get(name, {})
+                if info.get("exists") and info.get("columns"):
+                    st.markdown(f"**{info.get('full_name')}**")
+                    cols_df = pd.DataFrame(info["columns"])
+                    st.dataframe(cols_df, hide_index=True, use_container_width=True)
 
 
 def render_load_configuration():

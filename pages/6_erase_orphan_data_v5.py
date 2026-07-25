@@ -16,7 +16,13 @@ import streamlit as st
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
 
-from utils.db import ConnectionConfig, get_connection, test_connection
+from utils.db import (
+    ConnectionConfig,
+    execute_query,
+    get_connection,
+    pooled_read_connection,
+    test_connection,
+)
 from utils.config import SessionKeys, get_env_target_defaults
 
 # ─── Page config ──────────────────────────────────────────────────────────────
@@ -536,16 +542,45 @@ def _fetch_valid_user_ids(base: ConnectionConfig) -> List[str]:
     """Load all user UUIDs from user_db.public.users."""
     config = _make_config(base, "user_db")
     try:
-        conn = get_connection(config)
-        cur = conn.cursor()
-        cur.execute("SELECT id::text FROM public.users")
-        ids = [row[0] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
-        return ids
+        frame = execute_query(config, "SELECT id::text AS id FROM public.users")
+        return frame["id"].tolist() if not frame.empty else []
     except Exception as e:
         st.error(f"Failed to load user IDs from user_db: {e}")
         return []
+
+
+def _run_counts_grouped(
+    base: ConnectionConfig,
+    user_ids: List[str],
+) -> Tuple[Dict[str, int], List[str]]:
+    """Run all orphan counts with one pooled connection per database."""
+    results: Dict[str, int] = {}
+    errors: List[str] = []
+    for db_name in ("completion_db", "document_db"):
+        checks = [check for check in ORPHAN_CHECKS if check["db"] == db_name]
+        try:
+            with pooled_read_connection(_make_config(base, db_name)) as conn:
+                for check in checks:
+                    if check["needs_user_ids"] and not user_ids:
+                        results[check["key"]] = -2
+                        continue
+                    try:
+                        sql, params = (
+                            _build_sql(check["count_sql"], user_ids)
+                            if check["needs_user_ids"]
+                            else (check["count_sql"], ())
+                        )
+                        with conn.cursor() as cur:
+                            cur.execute(sql, params)
+                            results[check["key"]] = int(cur.fetchone()[0])
+                    except Exception as exc:
+                        results[check["key"]] = -1
+                        errors.append(f"{db_name}.{check['label']}: {exc}")
+        except Exception as exc:
+            errors.append(f"{db_name}: {exc}")
+            for check in checks:
+                results.setdefault(check["key"], -1)
+    return results, errors
 
 
 # ─── UI sections ──────────────────────────────────────────────────────────────
@@ -630,22 +665,10 @@ def render_scan():
                 "Cross-DB orphan checks require at least one user and will be skipped."
             )
 
-        results = {}
-        progress = st.progress(0)
-        status = st.empty()
-
-        for i, check in enumerate(ORPHAN_CHECKS):
-            status.text(f"Checking: {check['label']}…")
-            progress.progress((i + 1) / len(ORPHAN_CHECKS))
-
-            if check["needs_user_ids"] and not valid_user_ids:
-                results[check["key"]] = -2  # skipped
-                continue
-
-            results[check["key"]] = _run_count(base, check, valid_user_ids)
-
-        progress.empty()
-        status.empty()
+        with st.spinner("Running grouped orphan counts..."):
+            results, errors = _run_counts_grouped(base, valid_user_ids)
+        for error in errors:
+            st.warning(f"Count failed for {error}")
 
         st.session_state["orphan_scan_results"] = results
         st.session_state["orphan_valid_user_ids"] = valid_user_ids

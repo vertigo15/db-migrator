@@ -7,7 +7,7 @@ CSV export, and the ability to re-run failed users.
 import streamlit as st
 import pandas as pd
 
-from utils.db import ConnectionConfig, execute_query, get_connection
+from utils.db import ConnectionConfig, execute_query
 from utils.config import get_env_target_defaults
 from utils.migration_tracking import (
     TARGET_DATABASES,
@@ -17,11 +17,29 @@ from utils.migration_tracking import (
 from utils.rollback import (
     ALL_STEPS,
     STEP_LABELS,
-    load_batch_step_statuses,
     rollback_tracked_batch,
     rollback_tracked_step,
     rollback_tracked_user,
 )
+from utils.queue_ui import (
+    cancel_run,
+    failed_shard_details,
+    has_actionable_failures,
+    has_in_flight_shards,
+    overall_counts,
+    resume_run,
+    run_progress_by_step,
+    steps_with_shards,
+)
+
+SHARD_STATUS_ICONS = {
+    "queued": "⏸️",
+    "retrying": "🔁",
+    "running": "⚙️",
+    "completed": "✅",
+    "failed": "❌",
+    "cancelled": "🚫",
+}
 
 st.set_page_config(page_title="Migration History", page_icon="📋", layout="wide")
 
@@ -41,14 +59,86 @@ def _get_target_config() -> ConnectionConfig:
     )
 
 
+@st.cache_resource(show_spinner=False)
+def _ensure_tracking_once(host, port, database, username, password):
+    """Create tracking DDL once per target configuration, not per rerun."""
+    config = ConnectionConfig(host, int(port), database, username, password)
+    ensure_tracking_schema(config_for_database(config, "user_db"), coordinator=True)
+    return True
+
+
 def _ensure_tracking_tables(config: ConnectionConfig):
-    """Create migration tracking tables if they don't exist."""
     try:
-        ensure_tracking_schema(
-            config_for_database(config, "user_db"), coordinator=True
+        return _ensure_tracking_once(
+            config.host,
+            config.port,
+            config.database,
+            config.username,
+            config.password,
         )
     except Exception:
-        pass
+        return False
+
+
+def _config_from_cache_args(host, port, database, username, password):
+    return ConnectionConfig(host, int(port), database, username, password)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_history_snapshot(
+    host, port, database, username, password, refresh_token
+) -> pd.DataFrame:
+    config = _config_from_cache_args(host, port, database, username, password)
+    return execute_query(
+        config,
+        """
+        WITH summary AS (
+            SELECT COUNT(DISTINCT batch_id)::bigint AS total_batches,
+                   COUNT(*)::bigint AS total_users,
+                   COUNT(*) FILTER (WHERE result = 'success')::bigint AS success,
+                   COUNT(*) FILTER (WHERE result = 'reused_existing_user')::bigint AS reused,
+                   COUNT(*) FILTER (WHERE result = 'failed')::bigint AS failed,
+                   COUNT(*) FILTER (WHERE result = 'skipped')::bigint AS skipped,
+                   COUNT(*) FILTER (WHERE result = 'pending')::bigint AS pending
+            FROM migration.migration_user_results
+        )
+        SELECT b.id, b.started_at, b.completed_at, b.status, b.total_users,
+               b.source_info->>'host' AS source_host,
+               b.source_info->>'database' AS source_db, b.notes,
+               s.total_batches, s.total_users AS summary_total_users,
+               s.success, s.reused, s.failed, s.skipped, s.pending
+        FROM migration.migration_batches b
+        CROSS JOIN summary s
+        ORDER BY b.started_at DESC
+        """,
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_user_results(
+    host, port, database, username, password, batch_id, refresh_token
+) -> pd.DataFrame:
+    config = _config_from_cache_args(host, port, database, username, password)
+    return _load_user_results(config, batch_id or None)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_distributed_steps(
+    host, port, database, username, password, migration_run_id, refresh_token
+) -> pd.DataFrame:
+    config = _config_from_cache_args(host, port, database, username, password)
+    return _load_distributed_steps(config, migration_run_id)
+
+
+def _cache_args(config: ConnectionConfig):
+    return (
+        config.host,
+        config.port,
+        config.database,
+        config.username,
+        config.password,
+        st.session_state.get("_history_refresh_token", 0),
+    )
 
 
 def _load_batches(config: ConnectionConfig) -> pd.DataFrame:
@@ -260,6 +350,99 @@ def render_batch_overview(base_config, batch_row, step_statuses):
     st.caption(f"Batch ID: `{batch_row['id']}`")
 
 
+def render_shard_queue_status(base_config, batch_id: str):
+    """Queued/running/failed/cancelled shard state for the background workers.
+
+    Read-only progress plus cancel/resume controls; actually executing
+    shards happens out-of-process in ``worker.py``.
+    """
+    progress = run_progress_by_step(base_config, batch_id)
+    active = steps_with_shards(progress)
+    if not active:
+        return
+
+    st.markdown("#### 🚀 Background Worker Queue")
+    totals = overall_counts(progress)
+    total_shards = sum(totals.values())
+    completed = totals.get("completed", 0)
+    st.progress(completed / total_shards if total_shards else 0.0)
+    st.caption(
+        "Overall: "
+        + " · ".join(
+            f"{SHARD_STATUS_ICONS.get(status, '')} {status}: {count}"
+            for status, count in totals.items()
+            if count
+        )
+    )
+
+    for prefix, _, _ in ALL_STEPS:
+        step_key = prefix.rstrip("_")
+        statuses = active.get(step_key)
+        if not statuses:
+            continue
+        cols = st.columns([2, 4])
+        with cols[0]:
+            st.markdown(f"**{STEP_LABELS.get(step_key, step_key)}**")
+        with cols[1]:
+            st.caption(
+                " · ".join(
+                    f"{SHARD_STATUS_ICONS.get(status, '')} {status}: {count}"
+                    for status, count in statuses.items()
+                    if count
+                )
+            )
+
+    failures = failed_shard_details(base_config, batch_id)
+    if failures:
+        with st.expander(
+            f"Failed shard diagnostics ({len(failures)})",
+            expanded=True,
+        ):
+            for failure in failures:
+                st.error(
+                    f"{failure['step_key']} shard "
+                    f"{failure['shard_index']}/{failure['total_shards']} "
+                    f"on {failure['target_database']} "
+                    f"(attempt {failure['attempts']}/{failure['max_attempts']}): "
+                    f"{failure['error_message']}"
+                )
+                if failure["owner_emails"]:
+                    st.caption(
+                        "Affected users: "
+                        + ", ".join(failure["owner_emails"])
+                    )
+                st.caption(f"SQL shard: {failure['file_path']}")
+
+    col_cancel, col_resume = st.columns(2)
+    with col_cancel:
+        if st.button(
+            "⏸️ Cancel remaining shards",
+            disabled=not has_in_flight_shards(progress),
+            key=f"hist_cancel_shards_{batch_id}",
+        ):
+            cancelled = cancel_run(base_config, batch_id)
+            st.warning(
+                f"Cancelled {cancelled} queued/retrying shard(s). "
+                "Already-running shards will finish safely."
+            )
+            st.session_state["_history_refresh_token"] = (
+                st.session_state.get("_history_refresh_token", 0) + 1
+            )
+            st.rerun()
+    with col_resume:
+        if st.button(
+            "▶️ Resume failed/cancelled shards",
+            disabled=not (has_actionable_failures(progress) or totals.get("cancelled", 0)),
+            key=f"hist_resume_shards_{batch_id}",
+        ):
+            resumed = resume_run(base_config, batch_id)
+            st.success(f"Re-queued {resumed} shard(s) for workers to retry.")
+            st.session_state["_history_refresh_token"] = (
+                st.session_state.get("_history_refresh_token", 0) + 1
+            )
+            st.rerun()
+
+
 def render_rollback_panel(base_config, batch_row, step_statuses):
     """A single, streamlined rollback area for the selected batch.
 
@@ -269,6 +452,8 @@ def render_rollback_panel(base_config, batch_row, step_statuses):
     """
     batch_id = str(batch_row["id"])
     source_config = _get_source_config()
+    queue_progress = run_progress_by_step(base_config, batch_id)
+    rollback_blocked = has_in_flight_shards(queue_progress)
 
     st.markdown("#### ↩️ Rollback")
     scope = st.radio(
@@ -284,6 +469,12 @@ def render_rollback_panel(base_config, batch_row, step_statuses):
     target_value = None
     summary = ""
     can_run = True
+    if rollback_blocked:
+        st.warning(
+            "Rollback is disabled while migration shards are queued or running. "
+            "Cancel queued work and wait for active workers to finish."
+        )
+        can_run = False
 
     if scope == "Entire batch":
         target_kind = "batch"
@@ -318,7 +509,11 @@ def render_rollback_panel(base_config, batch_row, step_statuses):
 
     else:  # Single user
         user_config = config_for_database(base_config, "user_db")
-        users_df = _load_user_results(user_config, batch_id)
+        users_df = _cached_user_results(
+            *_cache_args(user_config)[:-1],
+            batch_id,
+            _cache_args(user_config)[-1],
+        )
         eligible = (
             users_df[users_df["result"] != "rolled_back"]
             if not users_df.empty
@@ -354,9 +549,9 @@ def render_rollback_panel(base_config, batch_row, step_statuses):
             help=(
                 "Skips the safety guard that blocks deletion when application "
                 "rows created after migration (e.g. agent_drafts) reference "
-                "this run's entities. Database foreign keys remain the final "
-                "safeguard: cascade children are removed, restrict children "
-                "abort the whole transaction with no partial deletes."
+                "this run's entities. It can also remove completion-db "
+                "knowledge-base item links to documents/folders being rolled "
+                "back. Other cross-database dependencies remain blocked."
             ),
         )
     with confirm_col:
@@ -411,6 +606,9 @@ def render_rollback_panel(base_config, batch_row, step_statuses):
             "message": message,
             "details": details,
         }
+        st.session_state["_history_refresh_token"] = (
+            st.session_state.get("_history_refresh_token", 0) + 1
+        )
         st.rerun()
 
     result = st.session_state.get("hist_rollback_result")
@@ -424,16 +622,20 @@ def render_rollback_panel(base_config, batch_row, step_statuses):
             st.rerun()
 
 
-def render_user_results(config, batch_id):
+def render_user_results(config, batch_id, step_results):
     """Per-user results table for the selected batch (or all batches)."""
     show_all = st.checkbox(
         "Show users from all batches (read-only)",
         key="hist_show_all_users",
     )
-    results_df = _load_user_results(config) if show_all else _load_user_results(config, batch_id)
+    cache_args = _cache_args(config)
+    results_df = _cached_user_results(
+        *cache_args[:-1],
+        None if show_all else batch_id,
+        cache_args[-1],
+    )
 
     if not show_all:
-        step_results = _load_distributed_steps(config, str(batch_id))
         if not step_results.empty:
             with st.expander("Per-database step facts", expanded=False):
                 st.dataframe(step_results, hide_index=True, use_container_width=True)
@@ -518,11 +720,33 @@ def main():
         return
 
     _ensure_tracking_tables(config)
+    refresh_col, _ = st.columns([1, 5])
+    with refresh_col:
+        if st.button("↻ Refresh history", use_container_width=True):
+            st.session_state["_history_refresh_token"] = (
+                st.session_state.get("_history_refresh_token", 0) + 1
+            )
+            st.rerun()
 
-    summary = _load_summary(config)
-    if not summary:
+    cache_args = _cache_args(config)
+    try:
+        snapshot = _cached_history_snapshot(*cache_args)
+    except Exception as exc:
+        st.error(f"Could not load migration history: {exc}")
+        return
+    if snapshot.empty:
         st.info("No migration history found. Run a migration to see results here.")
         return
+    first = snapshot.iloc[0]
+    summary = {
+        "total_batches": first.get("total_batches", 0),
+        "total_users": first.get("summary_total_users", 0),
+        "success": first.get("success", 0),
+        "reused": first.get("reused", 0),
+        "failed": first.get("failed", 0),
+        "skipped": first.get("skipped", 0),
+        "pending": first.get("pending", 0),
+    }
 
     cols = st.columns(6)
     cols[0].metric("Total Batches", summary.get("total_batches", 0))
@@ -532,7 +756,18 @@ def main():
     cols[4].metric("Failed", summary.get("failed", 0))
     cols[5].metric("Pending", summary.get("pending", 0))
 
-    batches_df = _load_batches(config)
+    batches_df = snapshot[
+        [
+            "id",
+            "started_at",
+            "completed_at",
+            "status",
+            "total_users",
+            "source_host",
+            "source_db",
+            "notes",
+        ]
+    ].copy()
     if batches_df.empty:
         st.info("No batches recorded yet.")
         return
@@ -551,11 +786,20 @@ def main():
     batch_row = row_by_id[str(selected_batch)]
     base_config = _get_target_config()
 
-    try:
-        step_statuses = load_batch_step_statuses(base_config, str(selected_batch))
-    except Exception as exc:
-        step_statuses = {}
-        st.warning(f"Could not load per-step status: {exc}")
+    step_cache_args = _cache_args(base_config)
+    step_results = _cached_distributed_steps(
+        *step_cache_args[:-1],
+        str(selected_batch),
+        step_cache_args[-1],
+    )
+    step_statuses = (
+        {
+            str(row["step_key"]): str(row["status"])
+            for _, row in step_results.iterrows()
+        }
+        if not step_results.empty
+        else {}
+    )
 
     # ── Selected batch: overview + rollback, side by side ─────────────────
     overview_col, rollback_col = st.columns([1.15, 1], gap="large")
@@ -566,10 +810,12 @@ def main():
         render_rollback_panel(base_config, batch_row, step_statuses)
 
     st.markdown("---")
+    render_shard_queue_status(base_config, str(selected_batch))
+    st.markdown("---")
 
     # ── Per-user results for the selected batch ───────────────────────────
     st.subheader("👥 User Results")
-    render_user_results(config, str(selected_batch))
+    render_user_results(config, str(selected_batch), step_results)
 
     # ── All batches (reference) ───────────────────────────────────────────
     with st.expander("📚 All batches (reference table)", expanded=False):

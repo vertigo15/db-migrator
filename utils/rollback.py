@@ -6,39 +6,87 @@ Run Migrations and Migration History pages. Every delete is strictly scoped to
 rows created by a specific migration run and executed child-before-parent in
 reverse dependency order.
 """
-from utils.db import ConnectionConfig, get_connection
+from utils.db import ConnectionConfig, execute_query, get_connection
 from utils.sql_generator import NAMESPACE_UUID
 from utils.migration_tracking import (
     config_for_database,
     reconcile_rollback_status,
     record_user_rollback_result,
 )
+from utils.migration_steps import MIGRATION_STEP_ORDER
 
 
 # Database mapping for each migration file prefix
-DB_MAPPING = {
-    "01_users_": "user_db",
-    "02_folders_": "document_db",  # folders is in document_db, not user_db
-    "03_documents_": "document_db",
-    "04_chunks_embeddings_": "document_db",
-    "05_conversations_": "completion_db",
-    "06_agents_": "completion_db",
-    "07_conversions_": "completion_db",
-}
+DB_MAPPING = {f"{key}_": db for key, db, _ in MIGRATION_STEP_ORDER}
 
-ALL_STEPS = [
-    ("01_users_", "user_db", "Users"),
-    ("02_folders_", "document_db", "Document folders"),
-    ("03_documents_", "document_db", "Documents"),
-    ("04_chunks_embeddings_", "document_db", "Chunks & embeddings"),
-    ("05_conversations_", "completion_db", "Conversations"),
-    ("06_agents_", "completion_db", "Agents"),
-    ("07_conversions_", "completion_db", "Agent-conversation links"),
-]
+ALL_STEPS = [(f"{key}_", db, label) for key, db, label in MIGRATION_STEP_ORDER]
 ROLLBACK_STEP_ORDER = list(reversed(ALL_STEPS))
 
 # step_key (prefix without trailing underscore) -> human label
-STEP_LABELS = {prefix.rstrip("_"): label for prefix, _, label in ALL_STEPS}
+STEP_LABELS = {key: label for key, _, label in MIGRATION_STEP_ORDER}
+
+_CHUNKS_PROCESSING_INDEX = "idx_chunks_document_processing_id_rollback"
+
+
+def _ensure_document_rollback_index(config: ConnectionConfig) -> None:
+    """Ensure document cascades do not repeatedly scan the full chunks table."""
+    conn = get_connection(config)
+    try:
+        # CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction.
+        conn.autocommit = True
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'chunks'
+                      AND column_name = 'document_processing_id'
+                )
+                """
+            )
+            if not cursor.fetchone()[0]:
+                return
+
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_index i
+                    JOIN pg_class t ON t.oid = i.indrelid
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    JOIN pg_attribute a
+                      ON a.attrelid = t.oid
+                     AND a.attname = 'document_processing_id'
+                    WHERE n.nspname = 'public'
+                      AND t.relname = 'chunks'
+                      AND i.indisvalid
+                      AND i.indisready
+                      AND i.indpred IS NULL
+                      AND i.indkey[0] = a.attnum
+                )
+                """
+            )
+            if cursor.fetchone()[0]:
+                return
+
+            # Index creation can legitimately exceed the target's normal
+            # statement timeout on large installations. It runs once and
+            # CONCURRENTLY avoids blocking normal chunk reads/writes.
+            cursor.execute("SET statement_timeout = 0")
+            cursor.execute("SET lock_timeout = 0")
+            cursor.execute(
+                f"DROP INDEX CONCURRENTLY IF EXISTS "
+                f"public.{_CHUNKS_PROCESSING_INDEX}"
+            )
+            cursor.execute(
+                f"CREATE INDEX CONCURRENTLY {_CHUNKS_PROCESSING_INDEX} "
+                "ON public.chunks (document_processing_id)"
+            )
+    finally:
+        conn.close()
+
 
 # Table mapping for rollback — each entry defines the mapping_table used in
 # migration.id_mappings and a list of delete operations (executed in order).
@@ -209,6 +257,93 @@ def _cross_database_rollback_blockers(
         finally:
             conn.close()
     return blockers
+
+
+def _force_remove_knowledge_base_item_references(
+    config: ConnectionConfig,
+    mapping_table: str,
+    new_ids: list,
+) -> int:
+    """Remove explicitly forced KB item links before document/folder deletion."""
+    if mapping_table not in {"documents", "folders"} or not new_ids:
+        return 0
+
+    completion_config = ConnectionConfig(
+        host=config.host,
+        port=config.port,
+        database="completion_db",
+        username=config.username,
+        password=config.password,
+    )
+    conn = get_connection(completion_config)
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM public.knowledge_base_items
+                WHERE item_id = ANY(%s::uuid[])
+                RETURNING id, knowledge_base_id
+                """,
+                (new_ids,),
+            )
+            deleted_rows = cursor.fetchall()
+            if not deleted_rows:
+                conn.rollback()
+                return 0
+
+            deleted_ids = [str(row[0]) for row in deleted_rows]
+            kb_ids = list({str(row[1]) for row in deleted_rows})
+            cursor.execute(
+                """
+                DELETE FROM migration.id_mappings
+                WHERE table_name = 'knowledge_base_items'
+                  AND new_id = ANY(%s::uuid[])
+                """,
+                (deleted_ids,),
+            )
+
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'knowledge_bases'
+                      AND column_name = 'total_document_count'
+                ),
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'knowledge_base_items'
+                      AND column_name = 'is_active'
+                )
+                """
+            )
+            has_document_count, has_item_active = cursor.fetchone()
+            if has_document_count:
+                active_filter = "AND item.is_active" if has_item_active else ""
+                cursor.execute(
+                    f"""
+                    UPDATE public.knowledge_bases kb
+                    SET total_document_count = (
+                        SELECT COUNT(*)
+                        FROM public.knowledge_base_items item
+                        WHERE item.knowledge_base_id = kb.id
+                        {active_filter}
+                    )
+                    WHERE kb.id = ANY(%s::uuid[])
+                    """,
+                    (kb_ids,),
+                )
+        conn.commit()
+        return len(deleted_rows)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _local_rollback_blockers(
@@ -535,6 +670,119 @@ def _user_scoped_mapping_rows(
     return all_ids, created_ids
 
 
+def _active_shard_count(
+    base_config: ConnectionConfig,
+    migration_run_id: str,
+) -> int:
+    """Count queued/executing work so rollback cannot race background workers."""
+    total = 0
+    for database in {database for _, database, _ in MIGRATION_STEP_ORDER}:
+        config = config_for_database(base_config, database)
+        conn = get_connection(config)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT to_regclass('migration.migration_shards')"
+                )
+                if cursor.fetchone()[0] is None:
+                    continue
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM migration.migration_shards
+                    WHERE migration_run_id = %s::uuid
+                      AND status IN ('queued', 'retrying', 'running')
+                    """,
+                    (migration_run_id,),
+                )
+                total += cursor.fetchone()[0]
+        finally:
+            conn.close()
+    return total
+
+
+def _pending_step_is_definitively_unexecuted(
+    cursor,
+    step_key: str,
+    migration_run_id: str,
+    table_info: dict,
+) -> bool:
+    """Prove that a pending step never started and created no run-owned data."""
+    cursor.execute(
+        """
+        SELECT COUNT(*),
+               COUNT(*) FILTER (
+                   WHERE status = 'cancelled'
+                     AND attempts = 0
+                     AND started_at IS NULL
+               )
+        FROM migration.migration_shards
+        WHERE migration_run_id = %s::uuid
+          AND step_key = %s
+        """,
+        (migration_run_id, step_key),
+    )
+    total_shards, never_started_shards = cursor.fetchone()
+    if not total_shards or never_started_shards != total_shards:
+        return False
+
+    cursor.execute("SELECT to_regclass('migration.migration_step_entities')")
+    if cursor.fetchone()[0] is not None:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM migration.migration_step_entities
+            WHERE migration_run_id = %s::uuid
+              AND step_key = %s
+            """,
+            (migration_run_id, step_key),
+        )
+        if cursor.fetchone()[0]:
+            return False
+
+    if step_key == "04_chunks_embeddings":
+        cursor.execute(
+            """
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM public.chunks
+                    WHERE document_id IN (
+                        SELECT new_id
+                        FROM migration.id_mappings
+                        WHERE migration_run_id = %s::uuid
+                          AND table_name = 'documents'
+                          AND record_action = 'created'
+                    )
+                )
+                +
+                (
+                    SELECT COUNT(*)
+                    FROM public.embeddings
+                    WHERE document_id IN (
+                        SELECT new_id
+                        FROM migration.id_mappings
+                        WHERE migration_run_id = %s::uuid
+                          AND table_name = 'documents'
+                          AND record_action = 'created'
+                    )
+                )
+            """,
+            (migration_run_id, migration_run_id),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM migration.id_mappings
+            WHERE migration_run_id = %s::uuid
+              AND table_name = %s
+            """,
+            (migration_run_id, table_info["mapping_table"]),
+        )
+    return cursor.fetchone()[0] == 0
+
+
 def rollback_migration(
     config: ConnectionConfig,
     filename: str,
@@ -547,12 +795,9 @@ def rollback_migration(
     Rollback a migration by deleting migrated data and clearing mapping table.
 
     When ``force`` is True the same-database "unexpected dependent rows" guard
-    is skipped. This is meant for dev / re-migration scenarios where the run
-    recorded pre-existing entities as ``created`` and application rows (e.g.
-    ``agent_drafts``) now reference them. Deletion still relies on the database's
-    own foreign keys: ``ON DELETE CASCADE`` children are removed automatically,
-    while a ``RESTRICT`` child aborts the whole transaction so nothing is
-    partially deleted. The cross-database reverse-order guard always applies.
+    is skipped. For documents and folders, force may also remove
+    ``completion_db.knowledge_base_items`` links that PostgreSQL cannot cascade
+    across databases. Other cross-database dependencies still block rollback.
 
     Returns:
         (success: bool, message: str, rows_deleted: int)
@@ -568,12 +813,31 @@ def rollback_migration(
         return (False, "❌ Unknown migration type", 0)
     if not migration_run_id:
         return (False, "❌ Select a tracked migration run before rollback", 0)
+    active_shards = _active_shard_count(config, migration_run_id)
+    if active_shards:
+        return (
+            False,
+            "❌ Rollback blocked: "
+            f"{active_shards} migration shard(s) are still queued or running. "
+            "Cancel queued work and wait for running workers to finish first.",
+            0,
+        )
 
     step_key = next(
         prefix.rstrip("_")
         for prefix in TABLE_MAPPING
         if filename.startswith(prefix)
     )
+    if step_key == "03_documents":
+        try:
+            _ensure_document_rollback_index(config)
+        except Exception as exc:
+            return (
+                False,
+                "❌ Rollback preparation failed while indexing "
+                f"chunks.document_processing_id: {exc}",
+                0,
+            )
     order_blockers = (
         []
         if user_scope
@@ -619,6 +883,31 @@ def rollback_migration(
                 conn.close()
                 return (True, "ℹ️ Step was skipped for this run.", 0)
             if step_status[0] == "pending" and not user_scope:
+                if _pending_step_is_definitively_unexecuted(
+                    cursor,
+                    step_key,
+                    migration_run_id,
+                    table_info,
+                ):
+                    cursor.execute(
+                        """
+                        UPDATE migration.migration_steps
+                        SET status = 'skipped',
+                            completed_at = now(),
+                            error_message = NULL
+                        WHERE migration_run_id = %s::uuid
+                          AND step_key = %s
+                        """,
+                        (migration_run_id, step_key),
+                    )
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    return (
+                        True,
+                        "ℹ️ Step never started; cancelled shards were marked skipped.",
+                        0,
+                    )
                 raise RuntimeError(
                     f"Step {step_key} has status {step_status[0]} and cannot be rolled back"
                 )
@@ -654,30 +943,6 @@ def rollback_migration(
                 ]
                 all_mapping_count = len(scope_mapping_ids)
 
-            blockers = (
-                _cross_database_rollback_blockers(
-                    config, table_info["mapping_table"], mapped_ids
-                )
-                if table_info.get("clear_mappings", True)
-                else []
-            )
-            if blockers:
-                conn.rollback()
-                cursor.close()
-                conn.close()
-                return (
-                    False,
-                    "❌ Rollback blocked: rows in other databases still reference "
-                    "this step's entities: "
-                    + ", ".join(blockers)
-                    + ". If these belong to a later migration step, roll that "
-                    "step back first. If they were created in the app (they are "
-                    "not part of this run), they must be removed there first — "
-                    "Force does not bypass this cross-database guard because "
-                    "PostgreSQL cannot protect references that span databases.",
-                    0,
-                )
-
             local_blockers = (
                 []
                 if force
@@ -700,7 +965,53 @@ def rollback_migration(
                     "anyway (database foreign keys remain the final safeguard)."
                 )
 
-            total_deleted = _execute_scoped_rollback(
+            blockers = (
+                _cross_database_rollback_blockers(
+                    config, table_info["mapping_table"], mapped_ids
+                )
+                if table_info.get("clear_mappings", True)
+                else []
+            )
+            forceable_kb_blockers = (
+                blockers
+                and table_info["mapping_table"] in {"documents", "folders"}
+                and all(
+                    blocker.startswith(
+                        "completion_db.knowledge_base_items:"
+                    )
+                    for blocker in blockers
+                )
+            )
+            if blockers and force and forceable_kb_blockers:
+                total_deleted += _force_remove_knowledge_base_item_references(
+                    config,
+                    table_info["mapping_table"],
+                    mapped_ids,
+                )
+                blockers = _cross_database_rollback_blockers(
+                    config, table_info["mapping_table"], mapped_ids
+                )
+            if blockers:
+                conn.rollback()
+                cursor.close()
+                conn.close()
+                force_hint = (
+                    " Enable Force to remove these knowledge-base links and "
+                    "continue."
+                    if forceable_kb_blockers and not force
+                    else " They must be removed before this rollback can continue."
+                )
+                return (
+                    False,
+                    "❌ Rollback blocked: rows in other databases still reference "
+                    "this step's entities: "
+                    + ", ".join(blockers)
+                    + "."
+                    + force_hint,
+                    0,
+                )
+
+            total_deleted += _execute_scoped_rollback(
                 cursor,
                 step_key,
                 mapped_ids,
@@ -845,13 +1156,6 @@ def rollback_all_migrations(
 
         if status in ("rolled_back", "skipped"):
             continue
-        if status == "pending":
-            return (
-                False,
-                results,
-                f"Step {prefix.rstrip('_')} is pending; rollback refuses to guess "
-                "whether untracked SQL was executed.",
-            )
 
         if progress_callback:
             progress_callback(index, total_steps, label)
@@ -1127,26 +1431,31 @@ def load_batch_step_statuses(
 ) -> dict:
     """Return {step_key: status} for one run across all target databases."""
     statuses = {}
+    steps_by_database = {}
     for prefix, database, _ in ALL_STEPS:
-        step_key = prefix.rstrip("_")
+        steps_by_database.setdefault(database, []).append(prefix.rstrip("_"))
+
+    for database, step_keys in steps_by_database.items():
         config = config_for_database(base_config, database)
-        conn = None
         try:
-            conn = get_connection(config)
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT status
-                    FROM migration.migration_steps
-                    WHERE migration_run_id = %s::uuid AND step_key = %s
-                    """,
-                    (migration_run_id, step_key),
-                )
-                row = cursor.fetchone()
-                statuses[step_key] = row[0] if row else "tracking_missing"
+            frame = execute_query(
+                config,
+                """
+                SELECT step_key, status
+                FROM migration.migration_steps
+                WHERE migration_run_id = %s::uuid
+                  AND step_key = ANY(%s::text[])
+                """,
+                (migration_run_id, step_keys),
+            )
+            found = (
+                dict(zip(frame["step_key"], frame["status"]))
+                if not frame.empty
+                else {}
+            )
+            for step_key in step_keys:
+                statuses[step_key] = found.get(step_key, "tracking_missing")
         except Exception as exc:
-            statuses[step_key] = f"unavailable({exc})"
-        finally:
-            if conn is not None and not conn.closed:
-                conn.close()
+            for step_key in step_keys:
+                statuses[step_key] = f"unavailable({exc})"
     return statuses

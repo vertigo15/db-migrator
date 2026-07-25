@@ -2,6 +2,7 @@
 SQL migration generator - generates INSERT statements directly from database data.
 Integrated with the extraction engine to create SQL files alongside CSV exports.
 """
+import contextlib
 import os
 import json
 import re
@@ -11,6 +12,30 @@ from typing import Dict, List, Optional, Any
 import pandas as pd
 from pathlib import Path
 import glob
+
+from utils.sharding import ShardWriter, ShardWriterFileAdapter, manifest_path_for
+
+# Per-step shard sizing defaults. Chunks/embeddings carry large vector payloads
+# so they use a smaller row cap and byte cap than the lighter-weight steps.
+SHARD_MAX_ROWS = {
+    "01_users": 1000,
+    "02_folders": 1000,
+    "03_documents": 500,
+    "04_chunks_embeddings": 500,
+    "05_conversations": 20,  # weight = conversations per unit (already batched)
+    "06_agents": 200,
+    "07_conversions": 1000,
+}
+SHARD_MAX_BYTES = {
+    "01_users": 8 * 1024 * 1024,
+    "02_folders": 8 * 1024 * 1024,
+    "03_documents": 8 * 1024 * 1024,
+    "04_chunks_embeddings": 6 * 1024 * 1024,
+    "05_conversations": 8 * 1024 * 1024,
+    "06_agents": 8 * 1024 * 1024,
+    "07_conversions": 8 * 1024 * 1024,
+}
+CONVERSATION_TITLE_MAX_LENGTH = 256
 
 
 # ============================================================
@@ -197,6 +222,24 @@ def _is_scalar_na(val):
         return False
 
 
+def _normalize_legacy_folder_id(value) -> Optional[str]:
+    """Return one canonical string for a V4 int4 folder identifier.
+
+    Nullable PostgreSQL integer columns are commonly loaded by pandas as
+    floats, so a parent such as ``1105`` can arrive as ``1105.0``. Folder UUIDs
+    are deterministic from this string; allowing both representations would
+    generate two different UUIDs for the same source folder.
+    """
+    if _is_scalar_na(value):
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    if re.fullmatch(r"[+-]?\d+\.0+", cleaned):
+        return cleaned.split(".", 1)[0]
+    return cleaned
+
+
 def escape_json_for_sql(json_data):
     """Escape JSON data for inclusion in SQL."""
     if json_data is None:
@@ -281,6 +324,23 @@ CREATE TABLE IF NOT EXISTS migration.migration_steps (
 ALTER TABLE migration.migration_steps
     ADD COLUMN IF NOT EXISTS verification_details JSONB NOT NULL DEFAULT '{}'::jsonb;
 
+-- Record entities verified by each step without changing the original
+-- id_mappings ownership used by rollback.
+CREATE TABLE IF NOT EXISTS migration.migration_step_entities (
+    migration_run_id UUID NOT NULL
+        REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(50) NOT NULL,
+    table_name VARCHAR(100) NOT NULL,
+    old_id VARCHAR(255) NOT NULL,
+    new_id UUID NOT NULL,
+    record_action VARCHAR(20) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (migration_run_id, step_key, table_name, old_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_step_entities_new_id
+    ON migration.migration_step_entities(table_name, new_id);
+
 -- Create indexes for fast lookups
 CREATE INDEX IF NOT EXISTS idx_mappings_table_old_id 
     ON migration.id_mappings(table_name, old_id);
@@ -323,11 +383,37 @@ CREATE OR REPLACE FUNCTION migration.is_migrated(
     p_table_name VARCHAR,
     p_old_id VARCHAR
 ) RETURNS BOOLEAN AS $$
+DECLARE
+    v_new_id UUID;
+    v_target_exists BOOLEAN;
 BEGIN
-    RETURN EXISTS (
-        SELECT 1 FROM migration.id_mappings
-        WHERE table_name = p_table_name AND old_id = p_old_id
-    );
+    SELECT new_id INTO v_new_id
+    FROM migration.id_mappings
+    WHERE table_name = p_table_name AND old_id = p_old_id;
+
+    IF v_new_id IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    EXECUTE format(
+        'SELECT EXISTS (SELECT 1 FROM public.%I WHERE id = $1)',
+        p_table_name
+    )
+    INTO v_target_exists
+    USING v_new_id;
+
+    IF v_target_exists THEN
+        RETURN TRUE;
+    END IF;
+
+    -- A mapping without its target row is stale bookkeeping, not proof that
+    -- the source entity is migrated. Remove it so this run can recreate and
+    -- own the target row safely.
+    DELETE FROM migration.id_mappings
+    WHERE table_name = p_table_name
+      AND old_id = p_old_id
+      AND new_id = v_new_id;
+    RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -750,22 +836,17 @@ def generate_users_migration_sql(
     
     record_count = 0
     skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = generate_sql_header(
-            table_name='users',
-            target_schema='user_db',
-            target_table='public.users',
-            source_info=source_info,
-            record_count=len(users_df),
-            org_id=org_id
-        )
-        sql_file.write(header)
-        
-        # Write UUID extension and batch tracking start
-        source_json = json.dumps({"source": source_info})
-        batch_start = f"""-- Ensure UUID extensions are available
+
+    header = generate_sql_header(
+        table_name='users',
+        target_schema='user_db',
+        target_table='public.users',
+        source_info=source_info,
+        record_count=len(users_df),
+        org_id=org_id
+    )
+    source_json = json.dumps({"source": source_info})
+    batch_start = f"""-- Ensure UUID extensions are available
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
@@ -774,29 +855,41 @@ VALUES ('{batch_id}', 'users', {len(users_df)}, '{source_json}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 """
-        sql_file.write(batch_start)
-        
-        # Write individual INSERT statements with batch_id substitution
-        expected_old_ids = []
-        for _, row in users_df.iterrows():
-            sql = generate_user_insert(
-                row, org_id, user_id_overrides, migration_run_id
-            )
-            if sql:
-                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
-                sql_file.write(sql)
-                sql_file.write('\n')
-                record_count += 1
-                old_id = clean_string(row.get('id'))
-                if old_id:
-                    expected_old_ids.append(old_id)
-            else:
-                skipped_count += 1
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='01_users',
+        target_database='user_db',
+        migration_run_id=migration_run_id,
+        preamble=header + batch_start,
+        max_rows_per_shard=SHARD_MAX_ROWS['01_users'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['01_users'],
+    )
 
-        # Write validation block
-        if expected_old_ids:
-            ids_array = ", ".join(escape_sql_string(oid) for oid in expected_old_ids)
-            validation = f"""
+    # Write individual INSERT statements with batch_id substitution
+    expected_old_ids = []
+    for _, row in users_df.iterrows():
+        sql = generate_user_insert(
+            row, org_id, user_id_overrides, migration_run_id
+        )
+        if sql:
+            sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
+            owner_id = clean_string(row.get('id'))
+            shard_writer.write_unit(
+                sql,
+                owner_legacy_ids=[owner_id] if owner_id else None,
+            )
+            record_count += 1
+            old_id = owner_id
+            if old_id:
+                expected_old_ids.append(old_id)
+        else:
+            skipped_count += 1
+
+    # Build validation block (runs once, in the last shard)
+    validation = ""
+    if expected_old_ids:
+        ids_array = ", ".join(escape_sql_string(oid) for oid in expected_old_ids)
+        validation = f"""
 -- ============================================================
 -- VALIDATION: verify all expected users have id_mappings entries
 -- ============================================================
@@ -825,10 +918,8 @@ BEGIN
 END $$;
 
 """
-            sql_file.write(validation)
 
-        # Write batch completion and footer
-        footer = f"""-- Complete batch tracking
+    footer = f"""-- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
 WHERE batch_id = '{batch_id}';
@@ -836,13 +927,16 @@ WHERE batch_id = '{batch_id}';
 -- Total records processed: {record_count}
 -- Skipped (no email): {skipped_count}
 """
-        sql_file.write(footer)
-    
+    manifest = shard_writer.finalize(epilogue=validation + footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'processed': record_count,
         'skipped': skipped_count,
-        'batch_id': batch_id
+        'batch_id': batch_id,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -864,9 +958,9 @@ def generate_folder_insert(
         SQL INSERT statement or None to skip
     """
     # Extract and clean fields
-    old_id = clean_string(row.get('id'))
+    old_id = _normalize_legacy_folder_id(row.get('id'))
     folder_name = clean_string(row.get('folder_name'))
-    parent_id = clean_string(row.get('parent_id'))
+    parent_id = _normalize_legacy_folder_id(row.get('parent_id'))
     owner_id = clean_string(row.get('owner_id'))  # Legacy hash ID
     # Map V4 folder_type to valid V5 enum values
     # V5 enum: 'default', 'agent' (TypeORM folders_folder_type_enum)
@@ -902,6 +996,39 @@ def generate_folder_insert(
         parent_id_sql = f"migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{parent_id}')"
     else:
         parent_id_sql = 'NULL'
+
+    reused_step_tracking_sql = ""
+    created_step_tracking_sql = ""
+    if migration_run_id:
+        run_sql = _migration_run_sql(migration_run_id)
+        reused_step_tracking_sql = f"""
+        INSERT INTO migration.migration_step_entities (
+            migration_run_id, step_key, table_name, old_id, new_id,
+            record_action
+        )
+        VALUES (
+            {run_sql}, '02_folders', 'folders', v_old_folder_id,
+            v_folder_id, 'reused'
+        )
+        ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+        DO UPDATE SET new_id = EXCLUDED.new_id,
+                      record_action = EXCLUDED.record_action,
+                      recorded_at = now();
+"""
+        created_step_tracking_sql = f"""
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    VALUES (
+        {run_sql}, '02_folders', 'folders', v_old_folder_id,
+        v_folder_id, 'created'
+    )
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET new_id = EXCLUDED.new_id,
+                  record_action = EXCLUDED.record_action,
+                  recorded_at = now();
+"""
     
     # Generate SQL with mapping table integration
     sql = f"""
@@ -911,13 +1038,39 @@ DECLARE
     v_old_folder_id VARCHAR := {escape_sql_string(old_id)};
     v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
     v_folder_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, v_old_folder_id);
+    v_mapped_folder_id uuid;
     v_parent_id uuid := {parent_id_sql};
     v_user_id uuid := {resolve_user_id_sql(owner_id, user_id_overrides)};
 BEGIN
-    -- Check if folder already migrated using mapping table (FAST)
+    -- Reuse only a canonical mapping whose target folder still exists.
+    -- migration.is_migrated removes stale mappings whose target disappeared.
     IF migration.is_migrated('folders', v_old_folder_id) THEN
-        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
-        RETURN;
+        SELECT new_id INTO v_mapped_folder_id
+        FROM migration.id_mappings
+        WHERE table_name = 'folders' AND old_id = v_old_folder_id;
+        IF EXISTS (
+            SELECT 1
+            FROM public.folders mapped
+            WHERE mapped.id = v_mapped_folder_id
+              AND mapped.user_id = v_user_id
+        ) THEN
+            v_folder_id := v_mapped_folder_id;
+{reused_step_tracking_sql}
+            RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
+            RETURN;
+        END IF;
+
+        -- Legacy migrations could map a folder to a deterministic user UUID
+        -- that is not the currently resolved V5 account. Preserve that old
+        -- row, but release the invalid canonical mapping so this run creates
+        -- a correctly owned folder under the current deterministic UUID.
+        DELETE FROM migration.id_mappings
+        WHERE table_name = 'folders'
+          AND old_id = v_old_folder_id
+          AND new_id = v_mapped_folder_id;
+        RAISE NOTICE
+            'Released folder mapping % because target owner does not match %',
+            v_old_folder_id, v_user_id;
     END IF;
     IF EXISTS (SELECT 1 FROM public.folders WHERE id = v_folder_id) THEN
         RAISE EXCEPTION
@@ -971,6 +1124,7 @@ BEGIN
         {_migration_run_sql(migration_run_id)},
         'created'
     );
+{created_step_tracking_sql}
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;
@@ -981,25 +1135,16 @@ END $$;
 
 def _topologically_sort_folders(folders_df: pd.DataFrame) -> pd.DataFrame:
     """Return folders in parent-before-child order and reject bad graphs."""
-    def normalize(value):
-        if _is_scalar_na(value):
-            return None
-        try:
-            return str(int(float(str(value).strip())))
-        except (ValueError, TypeError):
-            cleaned = str(value).strip()
-            return cleaned or None
-
     rows = {}
     parents = {}
     children = {}
     for index, row in folders_df.iterrows():
-        folder_id = normalize(row.get("id"))
+        folder_id = _normalize_legacy_folder_id(row.get("id"))
         if not folder_id:
             continue
         if folder_id in rows:
             raise ValueError(f"Duplicate source folder id: {folder_id}")
-        parent_id = normalize(row.get("parent_id"))
+        parent_id = _normalize_legacy_folder_id(row.get("parent_id"))
         rows[folder_id] = index
         parents[folder_id] = parent_id
         children.setdefault(folder_id, [])
@@ -1078,21 +1223,16 @@ def generate_folders_migration_sql(
     
     record_count = 0
     skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header using standard function
-        header = generate_sql_header(
-            table_name='folders',
-            target_schema='document_db',
-            target_table='public.folders',
-            source_info=source_info,
-            record_count=len(folders_df)
-        )
-        sql_file.write(header)
-        
-        # Write extension and batch tracking
-        source_json = json.dumps({"source": source_info})
-        batch_start = f"""-- Ensure uuid-ossp extension
+
+    header = generate_sql_header(
+        table_name='folders',
+        target_schema='document_db',
+        target_table='public.folders',
+        source_info=source_info,
+        record_count=len(folders_df)
+    )
+    source_json = json.dumps({"source": source_info})
+    batch_start = f"""-- Ensure uuid-ossp extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
@@ -1101,24 +1241,36 @@ VALUES ('{batch_id}', 'folders', {len(folders_df)}, '{source_json}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 """
-        sql_file.write(batch_start)
-        
-        # Write individual INSERT statements (sorted order)
-        for _, row in folders_sorted.iterrows():
-            sql = generate_folder_insert(
-                row, namespace_uuid, user_id_overrides, migration_run_id
+    # Folders must stay in parent-first order within a shard AND across shards
+    # (a child folder's shard must run after its parent's shard has committed),
+    # so the shard boundary itself never splits a parent from its own row —
+    # each row is one atomic unit and topological order is preserved globally.
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='02_folders',
+        target_database='document_db',
+        migration_run_id=migration_run_id,
+        preamble=header + batch_start,
+        max_rows_per_shard=SHARD_MAX_ROWS['02_folders'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['02_folders'],
+    )
+
+    for _, row in folders_sorted.iterrows():
+        sql = generate_folder_insert(
+            row, namespace_uuid, user_id_overrides, migration_run_id
+        )
+        if sql:
+            sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
+            owner_id = clean_string(row.get('owner_id'))
+            shard_writer.write_unit(
+                sql,
+                owner_legacy_ids=[owner_id] if owner_id else None,
             )
-            if sql:
-                # Replace batch placeholder with actual batch_id
-                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
-                sql_file.write(sql)
-                sql_file.write('\n')
-                record_count += 1
-            else:
-                skipped_count += 1
-        
-        # Write batch completion and footer
-        footer = f"""-- Complete batch tracking
+            record_count += 1
+        else:
+            skipped_count += 1
+
+    footer = f"""-- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
 WHERE batch_id = '{batch_id}';
@@ -1128,13 +1280,16 @@ WHERE batch_id = '{batch_id}';
 -- Note: Folders inserted in parent-first order using deterministic UUIDs (deterministic_uuid_v4)
 -- Namespace UUID: {namespace_uuid}
 """
-        sql_file.write(footer)
-    
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'processed': record_count,
         'skipped': skipped_count,
-        'batch_id': batch_id
+        'batch_id': batch_id,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -1195,14 +1350,7 @@ def generate_document_insert(
 
     # folder_id is int4 in V4 — pandas may load it as float (e.g. 1393.0).
     # Normalise to plain integer string so migration.id_mappings lookup matches.
-    _doc_folder_id_raw = row.get('folder_id')
-    if _doc_folder_id_raw is not None and not (isinstance(_doc_folder_id_raw, float) and pd.isna(_doc_folder_id_raw)):
-        try:
-            folder_id = str(int(float(_doc_folder_id_raw)))
-        except (ValueError, TypeError):
-            folder_id = clean_string(_doc_folder_id_raw)
-    else:
-        folder_id = None
+    folder_id = _normalize_legacy_folder_id(row.get('folder_id'))
     
     # Skip if no doc_id
     if not doc_id:
@@ -1487,22 +1635,17 @@ def generate_documents_migration_sql(
 
     # Generate batch ID for tracking
     batch_id = f"documents_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header with migration setup
-        header = generate_sql_header(
-            table_name='documents',
-            target_schema='document_db',
-            target_table='public.documents',
-            source_info=source_info,
-            record_count=len(documents_df),
-            include_mapping_setup=True
-        )
-        sql_file.write(header)
-        
-        # Write UUID extensions and batch tracking
-        source_json = json.dumps({"source": source_info, "namespace_uuid": namespace_uuid})
-        batch_start = f"""-- Ensure UUID extensions are available
+
+    header = generate_sql_header(
+        table_name='documents',
+        target_schema='document_db',
+        target_table='public.documents',
+        source_info=source_info,
+        record_count=len(documents_df),
+        include_mapping_setup=True
+    )
+    source_json = json.dumps({"source": source_info, "namespace_uuid": namespace_uuid})
+    batch_start = f"""-- Ensure UUID extensions are available
 -- Note: gen_random_uuid() is built-in for PostgreSQL 13+
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -1515,37 +1658,45 @@ ON CONFLICT (batch_id) DO NOTHING;
 -- Documents reference both users (owner_id) and folders (folder_id)
 
 """
-        sql_file.write(batch_start)
-        
-        # Write individual INSERT statements with batch_id substitution
-        for _, row in documents_df.iterrows():
-            try:
-                _doc_id = clean_string(row.get('doc_id'))
-                _source_label = doc_source_labels.get(_doc_id) if doc_source_labels and _doc_id else None
-                _translate = _doc_id in translated_doc_ids if _doc_id else False
-                sql = generate_document_insert(
-                    row, namespace_uuid, user_id_overrides,
-                    source_label=_source_label,
-                    translate_to_english=_translate,
-                    migration_run_id=migration_run_id,
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='03_documents',
+        target_database='document_db',
+        migration_run_id=migration_run_id,
+        preamble=header + batch_start,
+        max_rows_per_shard=SHARD_MAX_ROWS['03_documents'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['03_documents'],
+    )
+
+    for _, row in documents_df.iterrows():
+        try:
+            _doc_id = clean_string(row.get('doc_id'))
+            _source_label = doc_source_labels.get(_doc_id) if doc_source_labels and _doc_id else None
+            _translate = _doc_id in translated_doc_ids if _doc_id else False
+            sql = generate_document_insert(
+                row, namespace_uuid, user_id_overrides,
+                source_label=_source_label,
+                translate_to_english=_translate,
+                migration_run_id=migration_run_id,
+            )
+            if sql:
+                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
+                owner_id = clean_string(row.get('owner_id'))
+                shard_writer.write_unit(
+                    sql,
+                    owner_legacy_ids=[owner_id] if owner_id else None,
                 )
-                if sql:
-                    # Replace batch placeholder with actual batch_id
-                    sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
-                    sql_file.write(sql)
-                    sql_file.write('\n')
-                    record_count += 1
-                else:
-                    skipped_count += 1
-            except Exception as e:
-                import sys, traceback
-                doc_id = row.get('doc_id', 'unknown')
-                print(f"Warning: Failed to generate SQL for document {doc_id}: {e}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
+                record_count += 1
+            else:
                 skipped_count += 1
-        
-        # Write batch completion and footer
-        footer = f"""-- Complete batch tracking
+        except Exception as e:
+            import sys, traceback
+            doc_id = row.get('doc_id', 'unknown')
+            print(f"Warning: Failed to generate SQL for document {doc_id}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            skipped_count += 1
+
+    footer = f"""-- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
 WHERE batch_id = '{batch_id}';
@@ -1553,13 +1704,16 @@ WHERE batch_id = '{batch_id}';
 -- Total documents processed: {record_count}
 -- Skipped (no doc_id): {skipped_count}
 """
-        sql_file.write(footer)
-    
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'processed': record_count,
         'skipped': skipped_count,
-        'batch_id': batch_id
+        'batch_id': batch_id,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -1950,8 +2104,32 @@ END ${emb_tag}$;
     return combined_sql
 
 
+def _doc_id_from_metadata(metadata_raw) -> Optional[str]:
+    if isinstance(metadata_raw, str):
+        try:
+            return json.loads(metadata_raw.replace("'", '"')).get('doc_id')
+        except Exception:
+            return None
+    if isinstance(metadata_raw, dict):
+        return metadata_raw.get('doc_id')
+    return None
+
+
+def _owner_id_from_metadata(metadata_raw) -> Optional[str]:
+    if isinstance(metadata_raw, str):
+        try:
+            return clean_string(
+                json.loads(metadata_raw.replace("'", '"')).get('user_id')
+            )
+        except Exception:
+            return None
+    if isinstance(metadata_raw, dict):
+        return clean_string(metadata_raw.get('user_id'))
+    return None
+
+
 def generate_chunks_embeddings_migration_sql(
-    jeen_dev_df: pd.DataFrame,
+    jeen_dev_df,
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
@@ -1959,52 +2137,60 @@ def generate_chunks_embeddings_migration_sql(
     skip_empty_embeddings: bool = False,
     target_embedding_dim: Optional[int] = None,
     migration_run_id: Optional[str] = None,
+    expected_record_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for chunks and embeddings tables.
     Each source row generates TWO inserts: one for chunk, one for embedding.
-    
+
     Args:
-        jeen_dev_df: DataFrame with jeen_dev data
-        output_file: Path to output SQL file
+        jeen_dev_df: A DataFrame with jeen_dev data, OR an iterable of
+            DataFrame chunks (e.g. from ``execute_query_chunked``) already
+            ordered by ``metadata->>'doc_id', id`` at the SQL level. Passing
+            an iterable streams row generation without materializing the
+            full result set in memory, which matters for heavy users with
+            tens of thousands of chunks.
+        output_file: Path to output SQL file (also the first shard's path)
         source_info: Source database info string
         namespace_uuid: Fixed namespace UUID for chunk_id generation
         default_embedding_model: Default embedding model name
         skip_empty_embeddings: If True, skip rows without embeddings
         target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
-        
+        expected_record_count: Row count for the header, required when
+            ``jeen_dev_df`` is a streamed iterable (its length is unknown
+            up front); ignored when a DataFrame is passed directly.
+
     Returns:
         Dictionary with generation stats
     """
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    
+
     # Clean up old chunks/embeddings migration files
     cleanup_old_migration_files(output_file, '04_chunks_embeddings_')
-    
-    # Group by doc_id to assign chunk_index
-    jeen_dev_df['doc_id_from_metadata'] = jeen_dev_df['metadata'].apply(
-        lambda x: json.loads(x.replace("'", '"')).get('doc_id') if isinstance(x, str) else x.get('doc_id') if isinstance(x, dict) else None
-    )
-    
-    # Sort by doc_id and id for consistent chunk_index
-    jeen_dev_sorted = jeen_dev_df.sort_values(['doc_id_from_metadata', 'id'])
-    
-    # Assign chunk_index per document
-    jeen_dev_sorted['chunk_index'] = jeen_dev_sorted.groupby('doc_id_from_metadata').cumcount()
-    
-    chunk_count = 0
-    embedding_count = 0
-    skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
+
+    if isinstance(jeen_dev_df, pd.DataFrame):
+        jeen_dev_df = jeen_dev_df.copy()
+        jeen_dev_df['doc_id_from_metadata'] = jeen_dev_df['metadata'].apply(_doc_id_from_metadata)
+        jeen_dev_sorted = jeen_dev_df.sort_values(['doc_id_from_metadata', 'id'])
+        record_count_hint = len(jeen_dev_df)
+        frame_iter = [jeen_dev_sorted]
+    else:
+        # Streamed path: caller's query is ordered by (doc_id, id), so a
+        # running per-document counter reproduces the same chunk_index
+        # values as the DataFrame path's global sort + cumcount without
+        # ever holding the whole result set in memory.
+        record_count_hint = expected_record_count
+        frame_iter = jeen_dev_df
+
+    display_count = record_count_hint if record_count_hint is not None else 'unknown (streamed)'
+
+    header = f"""-- ============================================================
 -- CHUNKS & EMBEDDINGS MIGRATION SQL
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
 -- Source: {source_info}
 -- Destination: chunks + embeddings tables
--- Records to migrate: {len(jeen_dev_df)}
+-- Records to migrate: {display_count}
 -- 
 -- IMPORTANT: This script will INSERT chunks AND embeddings!
 -- IMPORTANT: Run users, folders, and documents migrations first.
@@ -2026,42 +2212,6 @@ SET client_encoding = 'UTF8';
 -- Ensure uuid-ossp extension is available
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- CONFIRMATION PROMPT: User must confirm before execution
-DO $$
-DECLARE
-    user_confirmation TEXT;
-BEGIN
-    RAISE NOTICE '';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'CHUNKS & EMBEDDINGS MIGRATION - CONFIRMATION REQUIRED';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'This script will migrate {len(jeen_dev_df)} chunks/embeddings';
-    RAISE NOTICE 'Namespace UUID: {namespace_uuid}';
-    RAISE NOTICE 'Default embedding model: {default_embedding_model}';
-    RAISE NOTICE 'Generated: {datetime.now().isoformat()}';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'PREREQUISITE: Users, folders, and documents must be migrated first!';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE '';
-    
-    user_confirmation := NULL;
-    
-    IF current_setting('is_superuser') = 'off' THEN
-        RAISE NOTICE 'Ready to proceed. Press Ctrl+C to cancel or Enter to continue...';
-    END IF;
-    
-    RAISE NOTICE 'Starting migration...';
-    RAISE NOTICE '';
-END $$;
-
--- Uncomment the lines below to require manual confirmation (recommended for first run)
--- Note: These are psql meta-commands that work in interactive psql sessions
--- \\\\prompt 'Type YES to confirm and continue with migration: ' user_confirmation
--- \\\\if :'user_confirmation' != 'YES'
---   \\\\echo 'Migration cancelled by user.'
---   \\\\quit
--- \\\\endif
-
 -- V5 uses untyped vector column + separate dimension column (per-row).
 -- Ensure the dimension column exists (it should from the V5 migration).
 DO $$
@@ -2076,36 +2226,54 @@ BEGIN
 END $$;
 
 """
-        sql_file.write(header)
-        
-        # Include migration schema setup (idempotent - safe if already exists in this DB)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
-        
-        # Write individual INSERT statements
-        for _, row in jeen_dev_sorted.iterrows():
+    preamble = header + generate_migration_schema_setup() + '\n'
+
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='04_chunks_embeddings',
+        target_database='document_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['04_chunks_embeddings'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['04_chunks_embeddings'],
+    )
+
+    chunk_count = 0
+    embedding_count = 0
+    skipped_count = 0
+    chunk_counters: Dict[str, int] = {}
+
+    for frame in frame_iter:
+        if 'doc_id_from_metadata' not in frame.columns:
+            frame = frame.copy()
+            frame['doc_id_from_metadata'] = frame['metadata'].apply(_doc_id_from_metadata)
+        for _, row in frame.iterrows():
+            doc_id = row['doc_id_from_metadata']
+            chunk_index = chunk_counters.get(doc_id, 0)
+            chunk_counters[doc_id] = chunk_index + 1
             sql = generate_chunk_and_embedding_inserts(
                 row,
-                chunk_index=int(row['chunk_index']),
+                chunk_index=chunk_index,
                 namespace_uuid=namespace_uuid,
                 default_embedding_model=default_embedding_model,
                 skip_empty_embeddings=skip_empty_embeddings,
                 target_embedding_dim=target_embedding_dim
             )
             if sql:
-                sql_file.write(sql)
-                sql_file.write('\n')
+                owner_id = _owner_id_from_metadata(row.get('metadata'))
+                shard_writer.write_unit(
+                    sql,
+                    owner_legacy_ids=[owner_id] if owner_id else None,
+                )
                 chunk_count += 1
-                # Check if embedding was included
                 if 'INSERT INTO embeddings' in sql:
                     embedding_count += 1
             else:
                 skipped_count += 1
-        
-        # Reconcile processing state only after every chunk/embedding statement
-        # above completed. A document is ready only if it has at least one chunk
-        # and every migrated chunk has an embedding.
-        sql_file.write(f"""
+
+    # Reconcile processing state only after every chunk/embedding statement
+    # above committed (merged into the final shard so it runs exactly once).
+    reconciliation_sql = f"""
 UPDATE public.document_processing dp
 SET status = 'COMPLETED'::public.document_processing_status_enum,
     is_ready = true
@@ -2164,18 +2332,21 @@ BEGIN
             'Readiness reconciliation failed: a ready document lacks chunks or embeddings';
     END IF;
 END $readiness_reconcile$;
-""")
 
-        # Write footer
-        sql_file.write(f'\n-- Total chunks processed: {chunk_count}\n')
-        sql_file.write(f'-- Total embeddings processed: {embedding_count}\n')
-        sql_file.write(f'-- Skipped: {skipped_count}\n')
-    
+-- Total chunks processed: {chunk_count}
+-- Total embeddings processed: {embedding_count}
+-- Skipped: {skipped_count}
+"""
+    manifest = shard_writer.finalize(epilogue=reconciliation_sql)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'chunks_processed': chunk_count,
         'embeddings_processed': embedding_count,
-        'skipped': skipped_count
+        'skipped': skipped_count,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -2345,6 +2516,7 @@ def generate_conversations_logs_migration_sql(
             'messages_processed': 0,
             'blocks_processed': 0,
             'skipped_invalid_chat_id': skipped_invalid_chat_id,
+            'truncated_titles': 0,
         }
     
     # Add question_number if not present (for ordering)
@@ -2359,10 +2531,9 @@ def generate_conversations_logs_migration_sql(
     conversations_processed = 0
     messages_processed = 0
     blocks_processed = 0
+    truncated_titles = 0
     
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
+    header = f"""-- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
@@ -2425,12 +2596,19 @@ END $$;
 -- \\\\endif
 
 """
-        sql_file.write(header)
-        
-        # Include migration schema setup (idempotent - safe if already exists in this DB)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
-        
+    preamble = header + generate_migration_schema_setup() + '\n'
+
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='05_conversations',
+        target_database='completion_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['05_conversations'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['05_conversations'],
+    )
+
+    with contextlib.nullcontext(ShardWriterFileAdapter(shard_writer)) as sql_file:
         # Group by user_id
         for user_id, user_logs in logs_df.groupby('user_id'):
             users_processed += 1
@@ -2446,7 +2624,13 @@ END $$;
                 
                 # Aggregate conversation data
                 latest_row = chat_logs_sorted.iloc[-1]
-                title = clean_string(latest_row.get('title')) or f'Conversation {chat_id[:8]}'
+                raw_title = (
+                    clean_string(latest_row.get('title'))
+                    or f'Conversation {chat_id[:8]}'
+                )
+                if len(raw_title) > CONVERSATION_TITLE_MAX_LENGTH:
+                    truncated_titles += 1
+                title = raw_title[:CONVERSATION_TITLE_MAX_LENGTH]
                 message_count = len(chat_logs_sorted) * 2  # user + assistant per row
                 total_tokens = int(chat_logs_sorted['token_amount'].fillna(0).sum())
                 created_at = chat_logs_sorted['created_at'].min()
@@ -2466,7 +2650,10 @@ END $$;
             # Batch conversations if needed
             for batch_idx, conv_batch in enumerate([conversations[i:i+max_records_per_insert] 
                                                      for i in range(0, len(conversations), max_records_per_insert)]):
-                
+                sql_file.begin_unit(
+                    weight=len(conv_batch),
+                    owner_legacy_ids=[str(user_id)],
+                )
                 sql_file.write(f"\n-- User: {user_id} (Batch {batch_idx + 1}, {len(conv_batch)} conversations)\n\n")
                 
                 # Generate conversations INSERT
@@ -2521,6 +2708,23 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                         f"'created', 'Migrated conversation') "
                         f"ON CONFLICT (table_name, old_id) DO NOTHING;\n"
                     )
+                    if migration_run_id:
+                        sql_file.write(
+                            "INSERT INTO migration.migration_step_entities "
+                            "(migration_run_id, step_key, table_name, old_id, new_id, record_action) "
+                            f"SELECT '{migration_run_id}'::uuid, '05_conversations', "
+                            f"'conversations', {escape_sql_string(conv['chat_id'])}, "
+                            f"'{conv['chat_id']}'::uuid, "
+                            f"CASE WHEN m.migration_run_id = '{migration_run_id}'::uuid "
+                            "THEN m.record_action ELSE 'reused' END "
+                            "FROM migration.id_mappings m "
+                            "WHERE m.table_name = 'conversations' "
+                            f"AND m.old_id = {escape_sql_string(conv['chat_id'])} "
+                            f"AND m.new_id = '{conv['chat_id']}'::uuid "
+                            "ON CONFLICT (migration_run_id, step_key, table_name, old_id) "
+                            "DO UPDATE SET new_id = EXCLUDED.new_id, "
+                            "record_action = EXCLUDED.record_action, recorded_at = now();\n"
+                        )
                 sql_file.write("\n")
                 conversations_processed += len(conv_batch)
                 
@@ -2674,9 +2878,9 @@ SELECT * FROM (
 WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
 
 """)
-        
-        # Write footer
-        sql_file.write(f"""\n-- ============================================================
+                sql_file.end_unit()
+
+    footer = f"""\n-- ============================================================
 -- MIGRATION SUMMARY
 -- ============================================================
 -- Users processed: {users_processed}
@@ -2685,8 +2889,10 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
 -- Content blocks processed: {blocks_processed}
 -- Rows skipped for null/blank/invalid chat_id: {skipped_invalid_chat_id}
 -- ============================================================
-""")
-    
+"""
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'users_processed': users_processed,
@@ -2694,6 +2900,9 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
         'messages_processed': messages_processed,
         'blocks_processed': blocks_processed,
         'skipped_invalid_chat_id': skipped_invalid_chat_id,
+        'truncated_titles': truncated_titles,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -2752,14 +2961,7 @@ def generate_agent_insert(
 
     # folder_id is int4 in V4 — pandas may load it as float (e.g. 1393.0).
     # Must normalise to plain integer string so migration.id_mappings lookup matches.
-    _folder_id_raw = row.get('folder_id')
-    if _folder_id_raw is not None and not (isinstance(_folder_id_raw, float) and pd.isna(_folder_id_raw)):
-        try:
-            folder_id = str(int(float(_folder_id_raw)))
-        except (ValueError, TypeError):
-            folder_id = clean_string(_folder_id_raw)
-    else:
-        folder_id = None
+    folder_id = _normalize_legacy_folder_id(row.get('folder_id'))
     
     if not bot_id:
         return None
@@ -2958,23 +3160,16 @@ def generate_agent_insert(
         if isinstance(folders_chosen_raw, list):
             # chosen_docs_folders is int4[] — normalise each element to plain integer string
             for f in folders_chosen_raw:
-                if f is not None:
-                    try:
-                        folders_chosen.append(str(int(float(f))))
-                    except (ValueError, TypeError):
-                        v = str(f).strip()
-                        if v:
-                            folders_chosen.append(v)
+                normalized = _normalize_legacy_folder_id(f)
+                if normalized:
+                    folders_chosen.append(normalized)
         elif isinstance(folders_chosen_raw, str):
             cleaned = folders_chosen_raw.strip('{}')
             if cleaned:
                 for f in cleaned.split(','):
-                    f = f.strip()
-                    if f:
-                        try:
-                            folders_chosen.append(str(int(float(f))))
-                        except (ValueError, TypeError):
-                            folders_chosen.append(f)
+                    normalized = _normalize_legacy_folder_id(f)
+                    if normalized:
+                        folders_chosen.append(normalized)
     
     # Build knowledge_bases + knowledge_base_assignments + knowledge_base_items SQL.
     # V5 moved from agent_documents to a knowledge-base architecture:
@@ -3319,10 +3514,8 @@ def generate_agents_migration_sql(
     
     agents_processed = 0
     skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
+
+    header = f"""-- ============================================================
 -- AGENTS MIGRATION SQL (from playground_bot_generator_config)
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
@@ -3352,14 +3545,7 @@ SET client_encoding = 'UTF8';
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 """
-        sql_file.write(header)
-        
-        # Include migration schema setup (idempotent)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
-        
-        # Create legacy mapping table
-        sql_file.write("""-- ============================================================
+    mapping_table_setup = """-- ============================================================
 -- CREATE MAPPING TABLE FOR TRACKING
 -- ============================================================
 CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
@@ -3370,38 +3556,53 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
     migrated_at TIMESTAMP DEFAULT now()
 );
 
-""")
-        
-        # Generate per-agent INSERT blocks
-        for _, row in agents_df.iterrows():
-            sql = generate_agent_insert(
-                row,
-                namespace_uuid,
-                user_id_overrides,
-                merged_instructions,
-                migration_run_id,
+"""
+    preamble = header + generate_migration_schema_setup() + '\n' + mapping_table_setup
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='06_agents',
+        target_database='completion_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['06_agents'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['06_agents'],
+    )
+
+    for _, row in agents_df.iterrows():
+        sql = generate_agent_insert(
+            row,
+            namespace_uuid,
+            user_id_overrides,
+            merged_instructions,
+            migration_run_id,
+        )
+        if sql:
+            owner_id = clean_string(row.get('user_id'))
+            shard_writer.write_unit(
+                sql,
+                owner_legacy_ids=[owner_id] if owner_id else None,
             )
-            if sql:
-                sql_file.write(sql)
-                sql_file.write('\n')
-                agents_processed += 1
-            else:
-                skipped_count += 1
-        
-        # Write summary footer
-        sql_file.write(f"""\n-- ============================================================
+            agents_processed += 1
+        else:
+            skipped_count += 1
+
+    footer = f"""\n-- ============================================================
 -- MIGRATION SUMMARY
 -- ============================================================
 -- Agents processed: {agents_processed}
 -- Skipped (no bot_id): {skipped_count}
 -- ============================================================
-""")
-    
+"""
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'agents_processed': agents_processed,
         'settings_processed': agents_processed,
-        'kb_items_linked': 0  # Tracked per-agent at runtime via RAISE NOTICE
+        'kb_items_linked': 0,  # Tracked per-agent at runtime via RAISE NOTICE
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -3501,8 +3702,7 @@ def generate_conversions_migration_sql(
     rows_processed = 0
     rows_skipped = 0
 
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        header = f"""-- ============================================================
+    header = f"""-- ============================================================
 -- CONVERSIONS & AGENT_CONVERSIONS MIGRATION SQL
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
@@ -3527,46 +3727,53 @@ SET client_encoding = 'UTF8';
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 """
-        sql_file.write(header)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
+    preamble = header + generate_migration_schema_setup() + '\n'
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='07_conversions',
+        target_database='completion_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['07_conversions'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['07_conversions'],
+    )
 
-        for _, row in translate_df.iterrows():
-            source_id = row.get('id')
-            bot_id = row.get('bot_id')
-            user_id = row.get('user_id')
-            src = row.get('src')
-            translated = row.get('translated')
-            conv_type = row.get('type')
-            last_updated = row.get('last_updated')
+    for _, row in translate_df.iterrows():
+        source_id = row.get('id')
+        bot_id = row.get('bot_id')
+        user_id = row.get('user_id')
+        src = row.get('src')
+        translated = row.get('translated')
+        conv_type = row.get('type')
+        last_updated = row.get('last_updated')
 
-            if not bot_id or _is_scalar_na(bot_id):
-                rows_skipped += 1
-                continue
+        if not bot_id or _is_scalar_na(bot_id):
+            rows_skipped += 1
+            continue
 
-            if not user_id or _is_scalar_na(user_id):
-                rows_skipped += 1
-                continue
+        if not user_id or _is_scalar_na(user_id):
+            rows_skipped += 1
+            continue
 
-            conv_type_str = str(conv_type).strip() if conv_type and not _is_scalar_na(conv_type) else 'input'
-            if conv_type_str not in VALID_CONVERSION_TYPES:
-                conv_type_str = 'input'
+        conv_type_str = str(conv_type).strip() if conv_type and not _is_scalar_na(conv_type) else 'input'
+        if conv_type_str not in VALID_CONVERSION_TYPES:
+            conv_type_str = 'input'
 
-            original_text = (str(src).strip()[:1024]) if src and not _is_scalar_na(src) else ''
-            converted_text = (str(translated).strip()[:1024]) if translated and not _is_scalar_na(translated) else ''
+        original_text = (str(src).strip()[:1024]) if src and not _is_scalar_na(src) else ''
+        converted_text = (str(translated).strip()[:1024]) if translated and not _is_scalar_na(translated) else ''
 
-            parsed_date = parse_hebrew_date(str(last_updated) if last_updated and not _is_scalar_na(last_updated) else None)
-            updated_at_sql = f"'{parsed_date}'::timestamptz" if parsed_date else "NOW()"
+        parsed_date = parse_hebrew_date(str(last_updated) if last_updated and not _is_scalar_na(last_updated) else None)
+        updated_at_sql = f"'{parsed_date}'::timestamptz" if parsed_date else "NOW()"
 
-            conv_id_input = f"conv-{source_id}-{bot_id}"
-            user_id_sql = resolve_user_id_sql(str(user_id), user_id_overrides)
+        conv_id_input = f"conv-{source_id}-{bot_id}"
+        user_id_sql = resolve_user_id_sql(str(user_id), user_id_overrides)
 
-            is_active_val = 'true'
-            raw_active = row.get('is_active')
-            if raw_active is not None and not _is_scalar_na(raw_active):
-                is_active_val = 'true' if str(raw_active).lower() == 'true' else 'false'
+        is_active_val = 'true'
+        raw_active = row.get('is_active')
+        if raw_active is not None and not _is_scalar_na(raw_active):
+            is_active_val = 'true' if str(raw_active).lower() == 'true' else 'false'
 
-            sql_file.write(f"""
+        shard_writer.write_unit(f"""
 DO $$
 DECLARE
     v_conversion_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, {escape_sql_string(conv_id_input)});
@@ -3575,57 +3782,57 @@ DECLARE
 BEGIN
     IF EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id)
        AND NOT EXISTS (
-           SELECT 1 FROM migration.id_mappings
-           WHERE table_name = 'conversions'
-             AND old_id = {escape_sql_string(conv_id_input)}
-             AND new_id = v_conversion_id
+       SELECT 1 FROM migration.id_mappings
+       WHERE table_name = 'conversions'
+         AND old_id = {escape_sql_string(conv_id_input)}
+         AND new_id = v_conversion_id
        ) THEN
-        RAISE EXCEPTION
-            'Conversion UUID collision for legacy conversion %',
-            {escape_sql_string(conv_id_input)};
+    RAISE EXCEPTION
+        'Conversion UUID collision for legacy conversion %',
+        {escape_sql_string(conv_id_input)};
     END IF;
 
     -- 1. Insert conversion entity
     IF NOT EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id) THEN
-        INSERT INTO conversions (
-            id, user_id, conversion_type, original_text, converted_text,
-            deleted_at, created_at, updated_at
-        ) VALUES (
-            v_conversion_id,
-            v_user_id,
-            '{conv_type_str}'::conversions_conversion_type_enum,
-            {escape_sql_string(original_text)},
-            {escape_sql_string(converted_text)},
-            NULL,
-            {updated_at_sql},
-            {updated_at_sql}
-        );
-        RAISE NOTICE 'Conversion % inserted (bot_id=%)', v_conversion_id, {escape_sql_string(str(bot_id))};
+    INSERT INTO conversions (
+        id, user_id, conversion_type, original_text, converted_text,
+        deleted_at, created_at, updated_at
+    ) VALUES (
+        v_conversion_id,
+        v_user_id,
+        '{conv_type_str}'::conversions_conversion_type_enum,
+        {escape_sql_string(original_text)},
+        {escape_sql_string(converted_text)},
+        NULL,
+        {updated_at_sql},
+        {updated_at_sql}
+    );
+    RAISE NOTICE 'Conversion % inserted (bot_id=%)', v_conversion_id, {escape_sql_string(str(bot_id))};
     END IF;
 
     -- 2. Link conversion to agent
     IF NOT EXISTS (SELECT 1 FROM agent_conversions WHERE agent_id = v_agent_id AND conversion_id = v_conversion_id) THEN
-        INSERT INTO agent_conversions (agent_id, conversion_id, created_at, is_active)
-        VALUES (v_agent_id, v_conversion_id, {updated_at_sql}, {is_active_val});
-        RAISE NOTICE 'agent_conversions link: agent=% conversion=%', v_agent_id, v_conversion_id;
+    INSERT INTO agent_conversions (agent_id, conversion_id, created_at, is_active)
+    VALUES (v_agent_id, v_conversion_id, {updated_at_sql}, {is_active_val});
+    RAISE NOTICE 'agent_conversions link: agent=% conversion=%', v_agent_id, v_conversion_id;
     END IF;
 
     -- 3. Track in id_mappings for rollback
     INSERT INTO migration.id_mappings (
-        table_name, old_id, new_id, migration_batch,
-        migration_run_id, record_action, notes
+    table_name, old_id, new_id, migration_batch,
+    migration_run_id, record_action, notes
     )
     VALUES (
-        'conversions', {escape_sql_string(conv_id_input)}, v_conversion_id,
-        '{migration_run_id or "conversions_batch"}',
-        {_migration_run_sql(migration_run_id)}, 'created', 'Migrated conversion'
+    'conversions', {escape_sql_string(conv_id_input)}, v_conversion_id,
+    '{migration_run_id or "conversions_batch"}',
+    {_migration_run_sql(migration_run_id)}, 'created', 'Migrated conversion'
     )
     ON CONFLICT (table_name, old_id) DO NOTHING;
 END $$;
-""")
-            rows_processed += 1
+""", owner_legacy_ids=[str(user_id)])
+        rows_processed += 1
 
-        sql_file.write(f"""
+    footer = f"""
 -- ============================================================
 -- MIGRATION SUMMARY
 -- ============================================================
@@ -3633,10 +3840,14 @@ END $$;
 -- Agent_conversions links created: {rows_processed}
 -- Skipped (no bot_id/user_id): {rows_skipped}
 -- ============================================================
-""")
+"""
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
 
     return {
         'file': output_file,
         'conversions_processed': rows_processed,
         'conversions_skipped': rows_skipped,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }

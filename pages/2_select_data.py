@@ -17,17 +17,32 @@ import streamlit as st
 import pandas as pd
 
 from utils.db import ConnectionConfig, execute_query
+from utils.file_preview import (
+    INLINE_DOWNLOAD_BYTES,
+    human_file_size,
+    read_inline_download,
+    read_text_preview,
+)
 from utils.storage import (
     save_selected_users, load_selected_users,
     save_document_filters, load_document_filters
 )
-from utils.config import SessionKeys, get_table_name, get_env_org_id, get_env_embedding_model, get_env_target_defaults, get_env_batch_size, EMBEDDING_MODEL_OPTIONS
+from utils.config import (
+    EMBEDDING_MODEL_OPTIONS,
+    SHAREPOINT_DOCUMENT_BLOB_SOURCE,
+    SessionKeys,
+    get_env_batch_size,
+    get_env_embedding_model,
+    get_env_org_id,
+    get_env_target_defaults,
+    get_table_name,
+)
 from utils.db import test_connection
 from utils.extraction import (
     ExtractionEngine,
+    build_conversation_scope_cte,
     get_document_count_preview,
-    get_related_counts,
-    estimate_embeddings_size,
+    get_selection_summary,
     resolve_existing_user_overrides,
     validate_target_organization,
 )
@@ -47,6 +62,31 @@ st.title("📋 Select Data to Migrate")
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(BASE_DIR, "output", "extract")
 DEPENDENCY_PREVIEW_LIMIT = 5000
+DEPENDENCY_DETAIL_KEYS = (
+    "_p2_show_document_details",
+    "_p2_show_embedding_details",
+    "_p2_show_agent_details",
+    "_p2_show_conversation_details",
+)
+
+
+def _contains_literal(series: pd.Series, value: str) -> pd.Series:
+    """Return case-insensitive literal matches for a UI search value."""
+    return series.astype("string").str.contains(
+        value,
+        case=False,
+        na=False,
+        regex=False,
+    )
+
+
+def _activate_dependency_detail(active_key: str) -> None:
+    """Keep at most one expensive dependency preview active."""
+    if not st.session_state.get(active_key):
+        return
+    for key in DEPENDENCY_DETAIL_KEYS:
+        if key != active_key:
+            st.session_state[key] = False
 
 
 def _get_already_migrated_emails() -> set:
@@ -277,6 +317,9 @@ def load_users_data(config: ConnectionConfig, prefix: str) -> pd.DataFrame:
     df = execute_query(config, query)
 
     if not df.empty:
+        if "email" in df.columns:
+            # V4 may store emails in fixed-width CHAR columns padded with spaces.
+            df["email"] = df["email"].astype("string").str.strip()
         if 'created_at' in df.columns:
             df['created_at'] = pd.to_datetime(df['created_at'], unit='s', errors='coerce')
         if 'last_connected' in df.columns:
@@ -292,7 +335,11 @@ def _load_saved_emails() -> list:
         return st.session_state[ss_key]
     loaded = load_selected_users()
     if isinstance(loaded, list):
-        emails = [e for e in loaded if isinstance(e, str)]
+        emails = [
+            e.strip()
+            for e in loaded
+            if isinstance(e, str) and e.strip()
+        ]
         st.session_state[ss_key] = emails
         return emails
     st.session_state[ss_key] = []
@@ -300,9 +347,81 @@ def _load_saved_emails() -> list:
 
 
 def _persist_saved_emails(emails: list):
-    """Persist emails to session_state (immediate) and localStorage (async)."""
-    st.session_state["_p2_saved_user_emails"] = emails
-    save_selected_users(emails)
+    """Persist only changed selections; avoid an iframe on unrelated reruns."""
+    normalized = list(
+        dict.fromkeys(
+            str(email).strip()
+            for email in emails
+            if str(email).strip()
+        )
+    )
+    if normalized == st.session_state.get("_p2_saved_user_emails", []):
+        return False
+    st.session_state["_p2_saved_user_emails"] = normalized
+    save_selected_users(normalized)
+    return True
+
+
+def _queue_bulk_user_selection(emails: list) -> None:
+    """Queue a bulk selection and invalidate stale data-editor checkbox state."""
+    st.session_state["_p2_batch_saved_emails"] = list(
+        dict.fromkeys(
+            str(email).strip()
+            for email in emails
+            if str(email).strip()
+        )
+    )
+    st.session_state["_p2_users_editor_revision"] = (
+        int(st.session_state.get("_p2_users_editor_revision", 0)) + 1
+    )
+
+
+def _match_user_emails(
+    source_emails: list,
+    requested_emails: list,
+) -> tuple[list, list]:
+    """Match emails case-insensitively after trimming V4 CHAR padding."""
+    source_lookup = {}
+    for source_email in source_emails:
+        canonical = str(source_email).strip()
+        if canonical:
+            source_lookup.setdefault(canonical.lower(), canonical)
+
+    requested = list(
+        dict.fromkeys(
+            str(email).strip().lower()
+            for email in requested_emails
+            if str(email).strip()
+        )
+    )
+    matched = [source_lookup[email] for email in requested if email in source_lookup]
+    unmatched = [email for email in requested if email not in source_lookup]
+    return matched, unmatched
+
+
+def _merge_visible_selection(
+    previous: list,
+    visible_ids: list,
+    selected_visible_ids: list,
+    valid_ids: list,
+) -> list:
+    """Apply live editor choices without dropping rows hidden by filters."""
+    valid = {str(value) for value in valid_ids}
+    visible = {str(value) for value in visible_ids}
+    selected_visible = {
+        str(value) for value in selected_visible_ids if str(value) in visible
+    }
+    merged = [
+        str(value)
+        for value in previous
+        if str(value) in valid and str(value) not in visible
+    ]
+    merged.extend(
+        str(value)
+        for value in visible_ids
+        if str(value) in selected_visible
+    )
+    return list(dict.fromkeys(merged))
 
 
 def render_user_selection(config: ConnectionConfig, prefix: str):
@@ -330,42 +449,60 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     # ─────────────────────────────────────────────────────────────────────────
     # SECTION 1: Filters
     # ─────────────────────────────────────────────────────────────────────────
+    sort_options = {
+        "Documents (desc)": ("doc_count", False),
+        "Agents (desc)": ("agent_count", False),
+        "Email (A-Z)": ("email", True),
+        "Created (newest)": ("created_at", False),
+    }
     with st.expander("Filters", expanded=True):
-        f_col1, f_col2 = st.columns(2)
-        with f_col1:
-            email_filter = st.text_input(
-                "Email filter (whitelist)",
-                placeholder="e.g. @company.co.il",
-                help="Show only users whose email contains this text.",
-                key="_p2_email_whitelist",
+        with st.form("user_filters_form"):
+            f_col1, f_col2 = st.columns(2)
+            with f_col1:
+                email_filter = st.text_input(
+                    "Email filter (whitelist)",
+                    placeholder="e.g. @company.co.il",
+                    help="Show only users whose email contains this text.",
+                    key="_p2_email_whitelist",
+                )
+            with f_col2:
+                search = st.text_input(
+                    "Search",
+                    placeholder="Search by name, email, or company...",
+                    key="_p2_user_search",
+                )
+            sort_label = st.selectbox(
+                "Sort by",
+                list(sort_options.keys()),
+                index=0,
+                key="_p2_user_sort",
             )
-        with f_col2:
-            search = st.text_input("Search", placeholder="Search by name, email, or company...")
+            st.form_submit_button("Apply filters", use_container_width=True)
 
-        sort_options = {
-            "Documents (desc)": ("doc_count", False),
-            "Agents (desc)": ("agent_count", False),
-            "Email (A-Z)": ("email", True),
-            "Created (newest)": ("created_at", False),
-        }
-        sort_label = st.selectbox("Sort by", list(sort_options.keys()), index=0)
+    filtered_df = users_df
 
     # Apply email whitelist filter
     if email_filter:
-        users_df = users_df[users_df["email"].str.contains(email_filter, case=False, na=False)].copy()
+        filtered_df = filtered_df[
+            _contains_literal(filtered_df["email"], email_filter)
+        ].copy()
 
     # Apply search filter
     if search:
         mask = (
-            users_df["name"].str.contains(search, case=False, na=False) |
-            users_df["email"].str.contains(search, case=False, na=False) |
-            users_df["company_name"].str.contains(search, case=False, na=False)
+            _contains_literal(filtered_df["name"], search) |
+            _contains_literal(filtered_df["email"], search) |
+            _contains_literal(filtered_df["company_name"], search)
         )
-        users_df = users_df[mask].copy()
+        filtered_df = filtered_df[mask].copy()
 
     # Apply sort
     sort_col, sort_asc = sort_options[sort_label]
-    filtered_df = users_df.sort_values(by=sort_col, ascending=sort_asc, na_position="last").reset_index(drop=True)
+    filtered_df = filtered_df.sort_values(
+        by=sort_col,
+        ascending=sort_asc,
+        na_position="last",
+    ).reset_index(drop=True)
 
     if email_filter or search:
         st.caption(f"Showing {len(filtered_df)} users after filters")
@@ -399,7 +536,7 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
                         if normalized_email not in already_migrated:
                             new_selection.append(email)
                             count += 1
-                    st.session_state["_p2_batch_saved_emails"] = new_selection
+                    _queue_bulk_user_selection(new_selection)
                     st.rerun()
 
         with tab_paste:
@@ -412,14 +549,22 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
             if st.button("Apply Pasted Emails"):
                 if pasted.strip():
                     raw_emails = [e.strip().lower() for e in pasted.replace(",", "\n").split("\n") if e.strip()]
-                    existing_lower = set(users_df["email"].str.lower())
-                    matched = [e for e in raw_emails if e in existing_lower]
-                    unmatched = [e for e in raw_emails if e not in existing_lower]
-                    original_case = users_df[users_df["email"].str.lower().isin(matched)]["email"].tolist()
-                    saved_emails = list(set(saved_emails + original_case))
-                    st.session_state["_p2_batch_saved_emails"] = saved_emails
+                    matched, unmatched = _match_user_emails(
+                        users_df["email"].tolist(),
+                        raw_emails,
+                    )
+                    saved_emails = list(dict.fromkeys(saved_emails + matched))
+                    _queue_bulk_user_selection(saved_emails)
+                    st.session_state["_p2_bulk_selection_notice"] = (
+                        f"Selected {len(matched)} pasted email"
+                        f"{'s' if len(matched) != 1 else ''}."
+                    )
                     if unmatched:
-                        st.warning(f"{len(unmatched)} emails not found in source DB: {', '.join(unmatched[:5])}{'...' if len(unmatched) > 5 else ''}")
+                        st.session_state["_p2_bulk_selection_warning"] = (
+                            f"{len(unmatched)} emails not found in source DB: "
+                            f"{', '.join(unmatched[:5])}"
+                            f"{'...' if len(unmatched) > 5 else ''}"
+                        )
                     st.rerun()
 
         with tab_file:
@@ -440,12 +585,12 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
                         st.error("File must contain an 'email' column.")
                     else:
                         uploaded_emails = upload_df[col_map["email"]].dropna().str.strip().str.lower().tolist()
-                        existing_lower = set(users_df["email"].str.lower())
-                        matched = [e for e in uploaded_emails if e in existing_lower]
-                        unmatched = [e for e in uploaded_emails if e not in existing_lower]
-                        original_case = users_df[users_df["email"].str.lower().isin(matched)]["email"].tolist()
-                        saved_emails = list(set(saved_emails + original_case))
-                        st.session_state["_p2_batch_saved_emails"] = saved_emails
+                        matched, unmatched = _match_user_emails(
+                            users_df["email"].tolist(),
+                            uploaded_emails,
+                        )
+                        saved_emails = list(dict.fromkeys(saved_emails + matched))
+                        _queue_bulk_user_selection(saved_emails)
                         c1, c2, c3 = st.columns(3)
                         c1.metric("Matched", len(matched))
                         c2.metric("Unmatched", len(unmatched))
@@ -461,21 +606,23 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     # ─────────────────────────────────────────────────────────────────────────
     if "_p2_batch_saved_emails" in st.session_state:
         saved_emails = st.session_state.pop("_p2_batch_saved_emails")
-        st.session_state["_p2_saved_user_emails"] = saved_emails
+        _persist_saved_emails(saved_emails)
+    if "_p2_bulk_selection_notice" in st.session_state:
+        st.success(st.session_state.pop("_p2_bulk_selection_notice"))
+    if "_p2_bulk_selection_warning" in st.session_state:
+        st.warning(st.session_state.pop("_p2_bulk_selection_warning"))
 
     # ─────────────────────────────────────────────────────────────────────────
     # SECTION 3: User Table
     # ─────────────────────────────────────────────────────────────────────────
-    select_all = st.checkbox("Select All", value=False)
-
-    if select_all:
-        filtered_df["selected"] = True
-    else:
-        filtered_df["selected"] = filtered_df["email"].isin(saved_emails)
-
     display_cols = ["selected", "name", "email", "company_name", "doc_count", "agent_count", "created_at", "last_connected"]
+    filtered_df["selected"] = filtered_df["email"].isin(saved_emails)
     filtered_df = filtered_df[display_cols]
-
+    select_all = st.checkbox(
+        "Select all filtered users",
+        value=False,
+        key="_p2_select_all_users",
+    )
     edited_df = st.data_editor(
         filtered_df,
         column_config={
@@ -491,18 +638,38 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
         hide_index=True,
         use_container_width=True,
         height=400,
+        key=(
+            f"_p2_users_editor_"
+            f"{int(st.session_state.get('_p2_users_editor_revision', 0))}"
+        ),
+        disabled=[column for column in display_cols if column != "selected"],
     )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SECTION 4: Persist selection
-    # ─────────────────────────────────────────────────────────────────────────
-    selected_emails = edited_df[edited_df["selected"] == True]["email"].tolist()
+    # Selection editors are deliberately outside forms: every visible checkbox
+    # change becomes canonical before an extraction button can be handled.
+    visible_emails = filtered_df["email"].astype(str).tolist()
+    selected_visible = (
+        visible_emails
+        if select_all
+        else edited_df[edited_df["selected"] == True]["email"].astype(str).tolist()
+    )
+    selected_emails = _merge_visible_selection(
+        saved_emails,
+        visible_emails,
+        selected_visible,
+        users_df["email"].astype(str).tolist(),
+    )
+    _persist_saved_emails(selected_emails)
 
     st.session_state[SessionKeys.SELECTED_USERS] = selected_emails
     selected_user_ids = users_df[users_df["email"].isin(selected_emails)]["id"].tolist()
     st.session_state[SessionKeys.SELECTED_USER_IDS] = selected_user_ids
-
-    _persist_saved_emails(selected_emails)
+    st.session_state["_p2_selected_user_email_by_id"] = {
+        str(row["id"]): str(row["email"]).strip()
+        for _, row in users_df[
+            users_df["email"].isin(selected_emails)
+        ][["id", "email"]].iterrows()
+    }
 
     st.metric("Selected Users", len(selected_emails))
 
@@ -605,8 +772,9 @@ def _load_documents_df(config: ConnectionConfig, prefix: str, user_ids: list, fi
                ) AS has_chunks
         FROM public.{doc_table} d
         WHERE d.owner_id IN ({placeholders})
+          AND COALESCE(d.blob_source, '') <> %s
     """
-    params = list(user_ids)
+    params = list(user_ids) + [SHAREPOINT_DOCUMENT_BLOB_SOURCE]
     if filters.get("date_from"):
         query += " AND d.created_at >= %s"
         params.append(filters["date_from"])
@@ -661,6 +829,7 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
             "the migration and agent references to them will be removed."
         ),
     )
+    st.caption("SharePoint-backed documents are always excluded.")
     chunkless_count = (
         int((~docs_df["has_chunks"].fillna(False).astype(bool)).sum())
         if "has_chunks" in docs_df.columns
@@ -676,29 +845,64 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
         st.info("No documents with chunks match the current selection.")
         st.session_state["selected_doc_ids"] = []
         return []
+    if not st.toggle(
+        "Customize document selection",
+        value=False,
+        key="_p2_show_document_details",
+        help="All matching documents are selected by default.",
+        on_change=_activate_dependency_detail,
+        args=("_p2_show_document_details",),
+    ):
+        selected_doc_ids = docs_df["doc_id"].astype(str).tolist()
+        st.session_state["selected_doc_ids"] = selected_doc_ids
+        st.caption(
+            f"All {len(selected_doc_ids):,} matching documents will migrate. "
+            "Load details only when individual exclusions are needed."
+        )
+        return selected_doc_ids
+    all_doc_ids = docs_df["doc_id"].astype(str).tolist()
+    previous = st.session_state.get("selected_doc_ids")
+    if not isinstance(previous, list):
+        previous = all_doc_ids
+    previous = [str(doc_id) for doc_id in previous if str(doc_id) in set(all_doc_ids)]
+
     owner_options = sorted(docs_df["owner_id"].dropna().astype(str).unique().tolist())
-    selected_owners = st.multiselect("Filter by owner", options=owner_options, default=owner_options, key="doc_owner_filter")
-    search = st.text_input("🔍 Search documents", placeholder="Search by doc id/title/name...", key="doc_search")
+    selected_owners = st.multiselect(
+        "Filter by owner",
+        options=owner_options,
+        default=owner_options,
+        key="doc_owner_filter",
+    )
+    search = st.text_input(
+        "🔍 Search documents",
+        placeholder="Search by doc id/title/name...",
+        key="doc_search",
+    )
     filtered_df = docs_df.copy()
     if selected_owners:
-        filtered_df = filtered_df[filtered_df["owner_id"].astype(str).isin(selected_owners)]
+        filtered_df = filtered_df[
+            filtered_df["owner_id"].astype(str).isin(selected_owners)
+        ]
     if search:
         mask = (
-            filtered_df["doc_id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["doc_title"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["doc_name_origin"].astype(str).str.contains(search, case=False, na=False)
+            _contains_literal(filtered_df["doc_id"], search)
+            | _contains_literal(filtered_df["doc_title"], search)
+            | _contains_literal(filtered_df["doc_name_origin"], search)
         )
         filtered_df = filtered_df[mask]
-    select_all_docs = st.checkbox("Select all documents in current list", value=True, key="select_all_docs")
-    previous = st.session_state.get("selected_doc_ids")
+    select_all_docs = st.checkbox(
+        "Select all documents in current list",
+        value=True,
+        key="select_all_docs",
+    )
     if select_all_docs:
         filtered_df["selected"] = True
     else:
-        if isinstance(previous, list):
-            filtered_df["selected"] = filtered_df["doc_id"].isin(previous)
-        else:
-            filtered_df["selected"] = True
-    filtered_df["doc_name"] = filtered_df["doc_title"].fillna("").where(filtered_df["doc_title"].str.strip().ne(""), filtered_df["doc_name_origin"])
+        filtered_df["selected"] = filtered_df["doc_id"].astype(str).isin(previous)
+    filtered_df["doc_name"] = filtered_df["doc_title"].fillna("").where(
+        filtered_df["doc_title"].str.strip().ne(""),
+        filtered_df["doc_name_origin"],
+    )
     display_columns = [
         "selected", "doc_name", "doc_id", "owner_id", "doc_size",
         "created_at", "folder_id", "doc_type",
@@ -717,8 +921,20 @@ def render_document_selection(config: ConnectionConfig, prefix: str, user_ids: l
             "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
         },
         key="documents_editor",
+        disabled=[column for column in display_columns if column != "selected"],
     )
-    selected_doc_ids = edited_df[edited_df["selected"] == True]["doc_id"].astype(str).tolist()
+    visible_doc_ids = filtered_df["doc_id"].astype(str).tolist()
+    selected_visible = (
+        visible_doc_ids
+        if select_all_docs
+        else edited_df[edited_df["selected"] == True]["doc_id"].astype(str).tolist()
+    )
+    selected_doc_ids = _merge_visible_selection(
+        previous,
+        visible_doc_ids,
+        selected_visible,
+        all_doc_ids,
+    )
     st.session_state["selected_doc_ids"] = selected_doc_ids
     st.metric("Selected Documents", len(selected_doc_ids))
     return selected_doc_ids
@@ -735,6 +951,7 @@ def _extract_doc_id_from_metadata(value):
             return None
     return None
 
+@st.fragment
 def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: list):
     """Preview chunk dependencies without turning the preview cap into a data cap."""
     st.markdown("---")
@@ -757,10 +974,38 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
         FROM public.{embeddings_table}
         WHERE metadata->>'doc_id' IN ({placeholders})
     """
-    counts = execute_query(config, count_query, tuple(doc_ids))
-    valid_count = int(counts.iloc[0]["valid_count"] or 0) if not counts.empty else 0
-    empty_count = int(counts.iloc[0]["empty_count"] or 0) if not counts.empty else 0
-    covered_documents = int(counts.iloc[0]["document_count"] or 0) if not counts.empty else 0
+    _ek = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(d) for d in doc_ids))}"
+    if st.session_state.get("_p2_emb_count_key") == _ek:
+        valid_count, empty_count, covered_documents = st.session_state["_p2_emb_counts"]
+    else:
+        counts = execute_query(config, count_query, tuple(doc_ids))
+        valid_count = int(counts.iloc[0]["valid_count"] or 0) if not counts.empty else 0
+        empty_count = int(counts.iloc[0]["empty_count"] or 0) if not counts.empty else 0
+        covered_documents = int(counts.iloc[0]["document_count"] or 0) if not counts.empty else 0
+        st.session_state["_p2_emb_count_key"] = _ek
+        st.session_state["_p2_emb_counts"] = (
+            valid_count,
+            empty_count,
+            covered_documents,
+        )
+    st.caption(
+        f"{valid_count:,} valid chunk row(s) across {covered_documents:,} document(s); "
+        f"{empty_count:,} row(s) have no vector."
+    )
+    st.session_state["selected_embedding_ids"] = None
+    if valid_count == 0:
+        st.info("No embeddings found for selected documents.")
+        return None
+    if not st.toggle(
+        "Load chunk preview",
+        value=False,
+        key="_p2_show_embedding_details",
+        help="Migration always includes every chunk for selected documents.",
+        on_change=_activate_dependency_detail,
+        args=("_p2_show_embedding_details",),
+    ):
+        st.caption("The bounded row preview is loaded only on request.")
+        return None
 
     query = f"""
         SELECT id, external_id, collection, metadata
@@ -770,7 +1015,6 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
         ORDER BY id
         LIMIT {DEPENDENCY_PREVIEW_LIMIT}
     """
-    _ek = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(d) for d in doc_ids))}"
     if st.session_state.get("_p2_emb_df_key") == _ek:
         emb_df = st.session_state["_p2_emb_df"]
     else:
@@ -782,10 +1026,6 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
         st.info("No embeddings found for selected documents.")
         st.session_state["selected_embedding_ids"] = None
         return None
-    st.caption(
-        f"{valid_count:,} valid chunk row(s) across {covered_documents:,} document(s); "
-        f"{empty_count:,} row(s) have no vector."
-    )
     if valid_count > DEPENDENCY_PREVIEW_LIMIT:
         st.info(
             f"Showing the first {DEPENDENCY_PREVIEW_LIMIT:,} rows only. "
@@ -796,10 +1036,10 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
     filtered_df = emb_df.copy()
     if search:
         mask = (
-            filtered_df["id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["external_id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["collection"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["doc_id"].astype(str).str.contains(search, case=False, na=False)
+            _contains_literal(filtered_df["id"], search)
+            | _contains_literal(filtered_df["external_id"], search)
+            | _contains_literal(filtered_df["collection"], search)
+            | _contains_literal(filtered_df["doc_id"], search)
         )
         filtered_df = filtered_df[mask]
     st.caption(
@@ -819,17 +1059,22 @@ def render_embeddings_selection(config: ConnectionConfig, prefix: str, doc_ids: 
     st.metric("Chunks to migrate", valid_count)
     return None
 
+@st.fragment
 def render_conversations_selection(config: ConnectionConfig, prefix: str, user_ids: list):
-    """Render selectable conversations list with date/retention filters."""
+    """Render conversation-level filters and an optional unique-chat preview."""
     st.markdown("---")
     st.subheader("💬 Select Conversations")
     if not user_ids:
         st.info("No selected users, so no conversations to select.")
-        st.session_state["selected_conversation_ids"] = []
+        st.session_state["selected_conversation_chat_ids"] = []
+        st.session_state["_p2_conv_scope"] = {
+            "conversation_count": 0,
+            "log_row_count": 0,
+            "per_user": {},
+        }
         return []
 
     logs_table = get_table_name("logs", prefix)
-    placeholders = ", ".join(["%s"] * len(user_ids))
 
     # ── Filters ──────────────────────────────────────────────────────────────
     if "conv_date_from" not in st.session_state:
@@ -837,30 +1082,32 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
     if "conv_date_to" not in st.session_state:
         st.session_state["conv_date_to"] = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        conv_date_from_raw = st.text_input(
-            "Created After",
-            key="conv_date_from",
-            placeholder="YYYY-MM-DD",
-            help="Only migrate conversations created on or after this date. Type freely, e.g. 2024-01-01",
-        )
-    with col2:
-        conv_date_to_raw = st.text_input(
-            "Created Before",
-            key="conv_date_to",
-            placeholder="YYYY-MM-DD",
-            help="Only migrate conversations created on or before this date. Type freely, e.g. 2025-12-31",
-        )
-    with col3:
-        conv_max_per_user = st.number_input(
-            "Max per user (0 = no limit)",
-            min_value=0,
-            value=0,
-            step=100,
-            key="conv_max_per_user",
-            help="Keep only the N most recent conversations per user. Useful for trimming large log tables (e.g. 500K records).",
-        )
+    with st.form("conversation_filters_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            conv_date_from_raw = st.text_input(
+                "Created After",
+                key="conv_date_from",
+                placeholder="YYYY-MM-DD",
+                help="Only migrate conversations created on or after this date.",
+            )
+        with col2:
+            conv_date_to_raw = st.text_input(
+                "Created Before",
+                key="conv_date_to",
+                placeholder="YYYY-MM-DD",
+                help="Only migrate conversations created on or before this date.",
+            )
+        with col3:
+            conv_max_per_user = st.number_input(
+                "Max per user (0 = no limit)",
+                min_value=0,
+                value=0,
+                step=100,
+                key="conv_max_per_user",
+                help="Keep only the N most recently created unique conversations per user.",
+            )
+        st.form_submit_button("Apply conversation filters", use_container_width=True)
 
     def _parse_conv_date(raw: str, end_of_day: bool = False):
         raw = (raw or "").strip()
@@ -890,104 +1137,161 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
         f"|{tuple(sorted(str(u) for u in user_ids))}"
         f"|{conv_date_from_raw}|{conv_date_to_raw}|{conv_max_per_user}"
     )
-    if st.session_state.get("_p2_conv_df_key") == _ck:
-        convs_df = st.session_state["_p2_conv_df"]
-        total_count = st.session_state.get("_p2_conv_total", len(convs_df))
+    if st.session_state.get("_p2_conv_count_key") == _ck:
+        scope_rows = st.session_state.get("_p2_conv_scope_rows", [])
     else:
-        # COUNT first (fast)
-        count_where = f"WHERE user_id IN ({placeholders})"
-        count_params = list(user_ids)
-        if conv_date_from_dt:
-            count_where += " AND created_at >= %s"
-            count_params.append(conv_date_from_dt)
-        if conv_date_to_dt:
-            count_where += " AND created_at <= %s"
-            count_params.append(conv_date_to_dt)
+        scope_cte, scope_params = build_conversation_scope_cte(
+            logs_table,
+            user_ids,
+            date_from=conv_date_from_dt,
+            date_to=conv_date_to_dt,
+            max_per_user=conv_max_per_user_val,
+        )
         count_df = execute_query(
             config,
-            f"SELECT COUNT(*) AS cnt FROM public.{logs_table} {count_where}",
-            tuple(count_params),
+            f"""
+            {scope_cte}
+            SELECT
+                user_id,
+                COUNT(*)::bigint AS conversation_count,
+                COALESCE(SUM(log_row_count), 0)::bigint AS log_row_count
+            FROM selected_conversations
+            GROUP BY user_id
+            ORDER BY user_id
+            """,
+            scope_params,
         )
-        total_count = int(count_df["cnt"].iloc[0]) if not count_df.empty else 0
+        scope_rows = [
+            {
+                "user_id": str(row["user_id"]),
+                "conversation_count": int(row["conversation_count"]),
+                "log_row_count": int(row["log_row_count"]),
+            }
+            for _, row in count_df.iterrows()
+        ]
+        st.session_state["_p2_conv_count_key"] = _ck
+        st.session_state["_p2_conv_scope_rows"] = scope_rows
 
-        # Fetch display rows with filters applied
-        fetch_params = list(user_ids)
-        date_where = ""
-        if conv_date_from_dt:
-            date_where += " AND created_at >= %s"
-            fetch_params.append(conv_date_from_dt)
-        if conv_date_to_dt:
-            date_where += " AND created_at <= %s"
-            fetch_params.append(conv_date_to_dt)
+    total_count = sum(row["conversation_count"] for row in scope_rows)
+    total_log_rows = sum(row["log_row_count"] for row in scope_rows)
+    scope = {
+        "conversation_count": total_count,
+        "log_row_count": total_log_rows,
+        "date_from": conv_date_from_raw,
+        "date_to": conv_date_to_raw,
+        "max_per_user": conv_max_per_user_val,
+        "per_user": {
+            row["user_id"]: {
+                "conversation_count": row["conversation_count"],
+                "log_row_count": row["log_row_count"],
+            }
+            for row in scope_rows
+        },
+    }
+    st.session_state["_p2_conv_scope"] = scope
 
-        if conv_max_per_user_val:
-            query = f"""
-                SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id
-                FROM (
-                    SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id,
-                           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS _rn
-                    FROM public.{logs_table}
-                    WHERE user_id IN ({placeholders}){date_where}
-                ) _r
-                WHERE _rn <= %s
-                ORDER BY created_at DESC
-                LIMIT 5000
-            """
-            fetch_params.append(conv_max_per_user_val)
-        else:
-            query = f"""
-                SELECT id, user_id, chat_id, question, answer, created_at, type, bot_id
-                FROM public.{logs_table}
-                WHERE user_id IN ({placeholders}){date_where}
-                ORDER BY created_at DESC
-                LIMIT 5000
-            """
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric(
+        "📊 Matching Conversations",
+        f"{total_count:,}",
+        help="Unique valid chat IDs matching the current conversation-level filters.",
+    )
+    mc2.metric(
+        "💬 Source Turns",
+        f"{total_log_rows:,}",
+        help="V4 log rows inside the matching conversations.",
+    )
+    if total_count > 5000:
+        mc3.info("Preview is capped at 5,000 conversations; extraction is not capped.")
+    if total_count == 0:
+        st.info("No conversations found for selected users with current filters.")
+        st.session_state["selected_conversation_chat_ids"] = []
+        return []
+    if not st.toggle(
+        "Load conversation preview",
+        value=False,
+        key="_p2_show_conversation_details",
+        help="The migration count above does not depend on loading preview rows.",
+        on_change=_activate_dependency_detail,
+        args=("_p2_show_conversation_details",),
+    ):
+        st.session_state["selected_conversation_chat_ids"] = None
+        return None
+
+    if st.session_state.get("_p2_conv_df_key") == _ck:
+        convs_df = st.session_state["_p2_conv_df"]
+    else:
+        scope_cte, scope_params = build_conversation_scope_cte(
+            logs_table,
+            user_ids,
+            date_from=conv_date_from_dt,
+            date_to=conv_date_to_dt,
+            max_per_user=conv_max_per_user_val,
+        )
+        query = f"""
+            {scope_cte}
+            SELECT
+                user_id,
+                chat_id,
+                conversation_created_at AS created_at,
+                conversation_updated_at AS last_interacted_at,
+                log_row_count
+            FROM selected_conversations
+            ORDER BY conversation_created_at DESC, chat_id
+            LIMIT 5000
+        """
 
         with st.spinner("Loading conversations..."):
-            convs_df = execute_query(config, query, tuple(fetch_params))
+            convs_df = execute_query(config, query, scope_params)
         st.session_state["_p2_conv_df_key"] = _ck
         st.session_state["_p2_conv_df"] = convs_df.copy()
-        st.session_state["_p2_conv_total"] = total_count
 
     if not convs_df.empty and "created_at" in convs_df.columns:
-        convs_df["created_at"] = pd.to_datetime(convs_df["created_at"], unit="s", errors="coerce")
-
-    # ── Count metrics ─────────────────────────────────────────────────────────
-    mc1, mc2 = st.columns(2)
-    mc1.metric("📊 Matching Conversations", f"{total_count:,}",
-               help="Total matching current filters — this is what will be migrated.")
-    if total_count > 5000:
-        mc2.warning(f"Showing first 5,000 of {total_count:,} for preview — all matching records will be extracted.")
+        convs_df["created_at"] = pd.to_datetime(
+            convs_df["created_at"], errors="coerce"
+        )
+        convs_df["last_interacted_at"] = pd.to_datetime(
+            convs_df["last_interacted_at"], errors="coerce"
+        )
 
     if convs_df.empty:
         st.info("No conversations found for selected users with current filters.")
-        st.session_state["selected_conversation_ids"] = []
+        st.session_state["selected_conversation_chat_ids"] = []
         return []
 
-    # Truncate question/answer for display
-    convs_df["question_preview"] = convs_df["question"].astype(str).str[:100] + "..."
-    convs_df["answer_preview"] = convs_df["answer"].astype(str).str[:100] + "..."
-
-    search = st.text_input("🔍 Search conversations", placeholder="Search by id/user_id/question...", key="conv_search")
+    search = st.text_input(
+        "🔍 Search conversations",
+        placeholder="Search by chat ID or user ID...",
+        key="conv_search",
+    )
     filtered_df = convs_df.copy()
     if search:
         mask = (
-            filtered_df["id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["user_id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["chat_id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["question"].astype(str).str.contains(search, case=False, na=False)
+            _contains_literal(filtered_df["user_id"], search)
+            | _contains_literal(filtered_df["chat_id"], search)
         )
         filtered_df = filtered_df[mask]
-    select_all_convs = st.checkbox("Select all conversations in current list", value=True, key="select_all_convs")
-    previous = st.session_state.get("selected_conversation_ids")
+    select_all_convs = st.checkbox(
+        "Migrate all conversations matching these filters",
+        value=True,
+        key="select_all_convs",
+    )
+    previous = st.session_state.get("selected_conversation_chat_ids")
     if select_all_convs:
         filtered_df["selected"] = True
     else:
         if isinstance(previous, list):
-            filtered_df["selected"] = filtered_df["id"].isin(previous)
+            filtered_df["selected"] = filtered_df["chat_id"].isin(previous)
         else:
             filtered_df["selected"] = True
-    filtered_df = filtered_df[["selected", "id", "user_id", "chat_id", "type", "question_preview", "answer_preview", "created_at"]]
+    filtered_df = filtered_df[[
+        "selected",
+        "user_id",
+        "chat_id",
+        "log_row_count",
+        "created_at",
+        "last_interacted_at",
+    ]]
     edited_df = st.data_editor(
         filtered_df,
         hide_index=True,
@@ -995,19 +1299,40 @@ def render_conversations_selection(config: ConnectionConfig, prefix: str, user_i
         height=320,
         column_config={
             "created_at": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD"),
-            "question_preview": st.column_config.TextColumn("Question"),
-            "answer_preview": st.column_config.TextColumn("Answer"),
+            "last_interacted_at": st.column_config.DatetimeColumn(
+                "Last activity", format="YYYY-MM-DD"
+            ),
             "chat_id": st.column_config.TextColumn("Chat ID"),
-            "type": st.column_config.TextColumn("Type"),
+            "log_row_count": st.column_config.NumberColumn("Source turns"),
         },
-        key="conversations_editor",
+        key=f"conversations_editor_{uuid.uuid5(uuid.NAMESPACE_URL, _ck)}",
     )
-    selected_conversation_ids = edited_df[edited_df["selected"] == True]["id"].astype(str).tolist()
-    st.session_state["selected_conversation_ids"] = selected_conversation_ids
-    st.metric("Selected Conversations", len(selected_conversation_ids))
-    return selected_conversation_ids
+    if select_all_convs:
+        st.session_state["selected_conversation_chat_ids"] = None
+        st.metric("Selected Conversations", total_count)
+        return None
+
+    selected_rows = edited_df[edited_df["selected"] == True]
+    selected_chat_ids = selected_rows["chat_id"].astype(str).tolist()
+    st.session_state["selected_conversation_chat_ids"] = selected_chat_ids
+    selected_per_user = {}
+    for user_id, rows in selected_rows.groupby("user_id"):
+        selected_per_user[str(user_id)] = {
+            "conversation_count": len(rows),
+            "log_row_count": int(rows["log_row_count"].sum()),
+        }
+    st.session_state["_p2_conv_scope"] = {
+        **scope,
+        "conversation_count": len(selected_chat_ids),
+        "log_row_count": int(selected_rows["log_row_count"].sum()),
+        "per_user": selected_per_user,
+        "explicit_selection": True,
+    }
+    st.metric("Selected Conversations", len(selected_chat_ids))
+    return selected_chat_ids
 
 
+@st.fragment
 def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: list):
     """Preview agents without allowing the preview limit to cap extraction."""
     st.markdown("---")
@@ -1028,9 +1353,33 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         WHERE user_id IN ({placeholders})
           AND deleted_at IS NULL
     """
-    counts = execute_query(config, count_query, tuple(user_ids))
-    total_count = int(counts.iloc[0]["total_count"] or 0) if not counts.empty else 0
-    active_count = int(counts.iloc[0]["active_count"] or 0) if not counts.empty else 0
+    _ak = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}"
+    if st.session_state.get("_p2_agents_count_key") == _ak:
+        total_count, active_count = st.session_state["_p2_agents_counts"]
+    else:
+        counts = execute_query(config, count_query, tuple(user_ids))
+        total_count = int(counts.iloc[0]["total_count"] or 0) if not counts.empty else 0
+        active_count = int(counts.iloc[0]["active_count"] or 0) if not counts.empty else 0
+        st.session_state["_p2_agents_count_key"] = _ak
+        st.session_state["_p2_agents_counts"] = (total_count, active_count)
+    st.caption(
+        f"{total_count:,} agent(s): {active_count:,} active and "
+        f"{total_count - active_count:,} inactive."
+    )
+    if total_count == 0:
+        st.info("No agents found for selected users.")
+        st.session_state["selected_agent_ids"] = []
+        return []
+    if not st.toggle(
+        "Customize agent selection",
+        value=False,
+        key="_p2_show_agent_details",
+        help="All agents are migrated by default; the table is only a bounded preview.",
+        on_change=_activate_dependency_detail,
+        args=("_p2_show_agent_details",),
+    ):
+        st.session_state["selected_agent_ids"] = None
+        return None
     query = f"""
         SELECT bot_id, user_id, folder_id, created_at,
                COALESCE(NULLIF(bot_data->>'bot_name', ''), NULLIF(bot_data->>'botName', ''), '') AS agent_name,
@@ -1048,7 +1397,6 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         ORDER BY created_at DESC
         LIMIT {DEPENDENCY_PREVIEW_LIMIT}
     """
-    _ak = f"{_source_scope_key(config, prefix)}|{tuple(sorted(str(u) for u in user_ids))}"
     if st.session_state.get("_p2_agents_df_key") == _ak:
         agents_df = st.session_state["_p2_agents_df"]
     else:
@@ -1063,11 +1411,7 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
         st.session_state["selected_agent_ids"] = []
         return []
     _wf_total = int(agents_df["uses_workflow"].sum()) if "uses_workflow" in agents_df.columns else 0
-    st.caption(
-        f"{total_count:,} agent(s): {active_count:,} active and "
-        f"{total_count - active_count:,} inactive. "
-        f"{_wf_total} in the preview reference a Langflow workflow."
-    )
+    st.caption(f"{_wf_total} in the preview reference a Langflow workflow.")
     if total_count > DEPENDENCY_PREVIEW_LIMIT:
         st.info(
             f"Showing the first {DEPENDENCY_PREVIEW_LIMIT:,} agents only. "
@@ -1078,11 +1422,11 @@ def render_agents_selection(config: ConnectionConfig, prefix: str, user_ids: lis
     filtered_df = agents_df.copy()
     if search:
         mask = (
-            filtered_df["agent_name"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["bot_id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["user_id"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["agent_name"].astype(str).str.contains(search, case=False, na=False)
-            | filtered_df["folder_id"].astype(str).str.contains(search, case=False, na=False)
+            _contains_literal(filtered_df["agent_name"], search)
+            | _contains_literal(filtered_df["bot_id"], search)
+            | _contains_literal(filtered_df["user_id"], search)
+            | _contains_literal(filtered_df["agent_name"], search)
+            | _contains_literal(filtered_df["folder_id"], search)
         )
         filtered_df = filtered_df[mask]
     if only_workflow:
@@ -1151,7 +1495,7 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
     
     if not user_ids:
         st.info("Select users to see related data counts.")
-        return
+        return False
     
     filters = st.session_state.get(SessionKeys.DOCUMENT_FILTERS, {})
     _rk = (
@@ -1161,48 +1505,22 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
         f"{st.session_state.get('include_chunkless_documents', False)}"
     )
     if st.session_state.get("_p2_related_key") == _rk:
-        doc_ids = st.session_state["_p2_related_doc_ids"]
         counts = st.session_state["_p2_related_counts"]
         est_size = st.session_state.get("_p2_related_est_size", 0.0)
     else:
         with st.spinner("Calculating related data..."):
-            doc_table = get_table_name("custom_documents", prefix)
-            embeddings_table = get_table_name("embeddings", prefix)
-            placeholders = ", ".join(["%s"] * len(user_ids))
-
-            query = f"SELECT doc_id FROM public.{doc_table} WHERE owner_id IN ({placeholders})"
-            params = list(user_ids)
-
-            if not st.session_state.get("include_chunkless_documents", False):
-                query += f"""
-                    AND EXISTS (
-                        SELECT 1
-                        FROM public.{embeddings_table} e
-                        WHERE e.metadata->>'doc_id' = public.{doc_table}.doc_id
-                          AND e.metadata->>'type' = 'chunk-data'
-                    )
-                """
-
-            if filters.get("date_from"):
-                query += " AND created_at >= %s"
-                params.append(filters["date_from"])
-            if filters.get("date_to"):
-                query += " AND created_at <= %s"
-                params.append(filters["date_to"])
-            if filters.get("max_size"):
-                query += " AND doc_size <= %s"
-                params.append(filters["max_size"])
-
-            doc_ids_df = execute_query(config, query, tuple(params))
-            doc_ids = doc_ids_df["doc_id"].tolist() if not doc_ids_df.empty else []
-
-            counts = get_related_counts(config, prefix, user_ids, doc_ids)
-            est_size = (
-                estimate_embeddings_size(config, prefix, doc_ids) if doc_ids else 0.0
+            counts = get_selection_summary(
+                config,
+                prefix,
+                user_ids,
+                filters=filters,
+                include_chunkless_documents=st.session_state.get(
+                    "include_chunkless_documents", False
+                ),
             )
+            est_size = counts.get("embedding_bytes", 0) / (1024 * 1024)
 
         st.session_state["_p2_related_key"] = _rk
-        st.session_state["_p2_related_doc_ids"] = doc_ids
         st.session_state["_p2_related_counts"] = counts
         st.session_state["_p2_related_est_size"] = est_size
     
@@ -1212,7 +1530,7 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
     with col1:
         st.metric("👥 Users", len(user_ids))
     with col2:
-        st.metric("📄 Documents", f"{doc_count:,}")
+        st.metric("📄 Documents", f"{counts.get('documents', doc_count):,}")
     with col3:
         st.metric("📁 Folders", f"{counts.get('folders', 0):,}")
     with col4:
@@ -1223,15 +1541,99 @@ def render_related_counts(config: ConnectionConfig, prefix: str, user_ids: list,
         st.metric("💬 Conversations", f"{counts.get('logs', 0):,}")
     
     # Embedding size warning
-    if doc_ids and est_size > 500:
+    if counts.get("embeddings", 0) and est_size > 500:
         st.warning(
             f"⚠️ Estimated embeddings size: {est_size:.1f} MB. "
             "Consider batched extraction for large datasets."
         )
+
+    embedding_bytes = int(counts.get("embedding_bytes", 0))
+    override = st.checkbox(
+        "Override workload safety limit",
+        value=False,
+        key="_p2_workload_override",
+        help=(
+            "Use only after reviewing target database capacity and intentionally "
+            "accepting a larger or mixed-heavy batch."
+        ),
+    )
+    blocked, guardrail_messages = _evaluate_workload_guardrails(
+        len(user_ids),
+        embedding_bytes,
+        override=override,
+    )
+    for level, message in guardrail_messages:
+        if level == "error":
+            st.error(message)
+        else:
+            st.warning(message)
     
     # Summary bar
-    total_items = len(user_ids) + doc_count + counts.get("folders", 0) + counts.get("embeddings", 0) + counts.get("agents", 0) + counts.get("logs", 0)
-    st.success(f"**Ready to migrate:** {len(user_ids)} users, {doc_count:,} documents, {counts.get('embeddings', 0):,} embeddings, {counts.get('folders', 0):,} folders, {counts.get('agents', 0):,} agents, {counts.get('logs', 0):,} conversations")
+    summary_doc_count = counts.get("documents", doc_count)
+    total_items = len(user_ids) + summary_doc_count + counts.get("folders", 0) + counts.get("embeddings", 0) + counts.get("agents", 0) + counts.get("logs", 0)
+    st.success(f"**Ready to migrate:** {len(user_ids)} users, {summary_doc_count:,} documents, {counts.get('embeddings', 0):,} embeddings, {counts.get('folders', 0):,} folders, {counts.get('agents', 0):,} agents, {counts.get('logs', 0):,} conversations")
+    return blocked
+
+
+def _evaluate_workload_guardrails(
+    user_count: int,
+    embedding_bytes: int,
+    *,
+    override: bool,
+):
+    """Return (blocked, messages) for workload-aware batch safety."""
+    def _positive_env_int(name: str, default: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    max_safe_bytes = _positive_env_int(
+        "MIGRATION_MAX_SAFE_EMBEDDING_BYTES",
+        2 * 1024 * 1024 * 1024,
+    )
+    heavy_average_bytes = _positive_env_int(
+        "MIGRATION_HEAVY_USER_AVG_EMBEDDING_BYTES",
+        250 * 1024 * 1024,
+    )
+    messages = []
+    if user_count > 50:
+        messages.append(
+            (
+                "warning",
+                f"Batch contains {user_count} users. The recommended default is "
+                "25–50; split larger batches unless they are known to be light.",
+            )
+        )
+
+    blocking_reasons = []
+    if embedding_bytes > max_safe_bytes:
+        blocking_reasons.append(
+            f"estimated embedding payload is "
+            f"{embedding_bytes / (1024 ** 3):.2f} GiB, above the configured "
+            f"{max_safe_bytes / (1024 ** 3):.2f} GiB safety limit"
+        )
+    average_bytes = embedding_bytes / user_count if user_count else 0
+    if user_count > 1 and average_bytes > heavy_average_bytes:
+        blocking_reasons.append(
+            "the average embedding payload indicates heavy users are mixed in "
+            "this batch; isolate them into smaller runs"
+        )
+
+    if blocking_reasons:
+        message = "Workload safety check: " + "; ".join(blocking_reasons) + "."
+        if override:
+            messages.append(("warning", message + " Explicit override accepted."))
+        else:
+            messages.append(
+                (
+                    "error",
+                    message
+                    + " Extraction is blocked unless the explicit override is enabled.",
+                )
+            )
+    return bool(blocking_reasons and not override), messages
 
 def render_copy_preview(config: ConnectionConfig, prefix: str, user_ids: list):
     """Optional preview of folders and embeddings that will be copied."""
@@ -1252,8 +1654,13 @@ def render_copy_preview(config: ConnectionConfig, prefix: str, user_ids: list):
     embeddings_table = get_table_name("embeddings", prefix)
 
     placeholders = ", ".join(["%s"] * len(user_ids))
-    doc_query = f"SELECT doc_id FROM public.{doc_table} WHERE owner_id IN ({placeholders})"
-    doc_params = list(user_ids)
+    doc_query = f"""
+        SELECT doc_id
+        FROM public.{doc_table}
+        WHERE owner_id IN ({placeholders})
+          AND COALESCE(blob_source, '') <> %s
+    """
+    doc_params = list(user_ids) + [SHAREPOINT_DOCUMENT_BLOB_SOURCE]
 
     if not st.session_state.get("include_chunkless_documents", False):
         doc_query += f"""
@@ -1312,7 +1719,12 @@ def render_copy_preview(config: ConnectionConfig, prefix: str, user_ids: list):
                 st.dataframe(embeddings_df, use_container_width=True, hide_index=True)
 
 
-def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails: list):
+def render_extraction_section(
+    config: ConnectionConfig,
+    prefix: str,
+    user_emails: list,
+    workload_blocked: bool = False,
+):
     """Render the extraction section."""
     st.markdown("---")
     st.subheader("📥 Extract Data")
@@ -1591,8 +2003,65 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         target_embedding_dim = None
         user_id_overrides = {}
         cross_owner_policy = "block"
-    
-    if st.button("🚀 Start Extraction", type="primary", use_container_width=True):
+
+    conversation_scope = st.session_state.get("_p2_conv_scope", {})
+    email_by_user_id = st.session_state.get(
+        "_p2_selected_user_email_by_id", {}
+    )
+    per_user_scope = conversation_scope.get("per_user", {})
+    confirmation_rows = []
+    scoped_emails = set()
+    for user_id, counts in per_user_scope.items():
+        email = email_by_user_id.get(str(user_id), str(user_id))
+        scoped_emails.add(email)
+        confirmation_rows.append({
+            "Email": email,
+            "Conversations": int(counts.get("conversation_count", 0)),
+            "Source turns": int(counts.get("log_row_count", 0)),
+        })
+    for email in user_emails:
+        if email not in scoped_emails:
+            confirmation_rows.append({
+                "Email": email,
+                "Conversations": 0,
+                "Source turns": 0,
+            })
+    confirmation_rows.sort(key=lambda row: row["Email"].lower())
+
+    st.markdown("#### Confirm migration scope")
+    st.caption(
+        f"Conversation creation range: "
+        f"{conversation_scope.get('date_from') or 'no lower bound'} → "
+        f"{conversation_scope.get('date_to') or 'no upper bound'} · "
+        f"{len(user_emails)} user(s) · "
+        f"{int(conversation_scope.get('conversation_count', 0)):,} unique conversations · "
+        f"{int(conversation_scope.get('log_row_count', 0)):,} source turns"
+    )
+    st.dataframe(
+        pd.DataFrame(confirmation_rows),
+        hide_index=True,
+        use_container_width=True,
+    )
+    scope_fingerprint = json.dumps(
+        {
+            "emails": sorted(str(email).strip().lower() for email in user_emails),
+            "conversation_scope": conversation_scope,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    scope_confirmation = st.checkbox(
+        "I confirm these users, conversation dates, and per-user counts.",
+        value=False,
+        key=f"_p2_scope_confirm_{uuid.uuid5(uuid.NAMESPACE_URL, scope_fingerprint)}",
+    )
+
+    if st.button(
+        "🚀 Start Extraction",
+        type="primary",
+        use_container_width=True,
+        disabled=workload_blocked or not scope_confirmation,
+    ):
         if generate_sql and not org_id:
             st.error("Please select an organization before starting extraction.")
             st.stop()
@@ -1627,6 +2096,17 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                         "port": config.port,
                         "database": config.database,
                         "prefix": prefix,
+                        "conversation_scope": {
+                            "date_from": conversation_scope.get("date_from"),
+                            "date_to": conversation_scope.get("date_to"),
+                            "max_per_user": conversation_scope.get("max_per_user"),
+                            "conversation_count": conversation_scope.get(
+                                "conversation_count", 0
+                            ),
+                            "log_row_count": conversation_scope.get(
+                                "log_row_count", 0
+                            ),
+                        },
                     },
                     source_config=config,
                 )
@@ -1675,6 +2155,9 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 selected_doc_ids=st.session_state.get("selected_doc_ids"),
                 selected_embedding_ids=st.session_state.get("selected_embedding_ids"),
                 selected_agent_ids=st.session_state.get("selected_agent_ids"),
+                selected_conversation_chat_ids=st.session_state.get(
+                    "selected_conversation_chat_ids"
+                ),
                 extract_conversions=extract_conversions,
                 conv_date_from=st.session_state.get("conv_date_from_parsed"),
                 conv_date_to=st.session_state.get("conv_date_to_parsed"),
@@ -1924,13 +2407,21 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
         for i, (table, filepath) in enumerate(results.get("files", {}).items()):
             if os.path.exists(filepath):
                 with cols[i % 3]:
-                    with open(filepath, "rb") as f:
+                    file_size = os.path.getsize(filepath)
+                    download_data = read_inline_download(filepath)
+                    if download_data is not None:
                         st.download_button(
                             label=f"📄 {table}.csv",
-                            data=f,
+                            data=download_data,
                             file_name=os.path.basename(filepath),
                             mime="text/csv",
-                            key=f"dl_csv_{table}"
+                            key=f"dl_csv_{table}",
+                            on_click="ignore",
+                        )
+                    else:
+                        st.caption(
+                            f"`{os.path.basename(filepath)}` · "
+                            f"{human_file_size(file_size)} · server-side only"
                         )
         
         # Download buttons for SQL files (if generated)
@@ -1947,16 +2438,23 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
             for i, (table, filepath) in enumerate(results.get("sql_files", {}).items()):
                 if os.path.exists(filepath):
                     with cols_sql[i % 3]:
-                        with open(filepath, "rb") as f:
-                            # Use actual filename with numbered prefix
-                            display_name = os.path.basename(filepath)
+                        display_name = os.path.basename(filepath)
+                        file_size = os.path.getsize(filepath)
+                        download_data = read_inline_download(filepath)
+                        if download_data is not None:
                             st.download_button(
                                 label=f"🗃️ {display_name}",
-                                data=f,
+                                data=download_data,
                                 file_name=display_name,
                                 mime="text/plain",
-                                key=f"dl_sql_{table}"
+                                key=f"dl_sql_{table}",
+                                on_click="ignore",
                             )
+                        else:
+                            st.caption(
+                                f"`{display_name}` · {human_file_size(file_size)}"
+                            )
+                            st.caption(f"Server path: `{filepath}`")
             
             # SQL file preview expanders — show all expected steps in order
             st.subheader("👁️ SQL Files Preview")
@@ -1974,28 +2472,35 @@ def render_extraction_section(config: ConnectionConfig, prefix: str, user_emails
                 filepath = sql_files.get(table_key)
                 if filepath and os.path.exists(filepath):
                     file_size = os.path.getsize(filepath)
-                    size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024 * 1024):.1f} MB"
+                    size_str = human_file_size(file_size)
                     display_name = os.path.basename(filepath)
 
-                    col_exp, col_btn = st.columns([10, 1])
-                    with col_exp:
-                        expander_label = f"🗃️ {display_name} ({size_str})"
-                    with col_btn:
-                        with open(filepath, "rb") as f:
+                    expander_label = f"🗃️ {display_name} ({size_str})"
+                    if file_size <= INLINE_DOWNLOAD_BYTES:
+                        col_exp, col_btn = st.columns([10, 1])
+                        with col_exp:
+                            st.caption(expander_label)
+                        with col_btn:
+                            download_data = read_inline_download(filepath)
                             st.download_button(
                                 label="💾",
-                                data=f,
+                                data=download_data,
                                 file_name=display_name,
                                 mime="text/plain",
                                 key=f"save_sql_{table_key}",
-                                help="Save SQL file"
+                                help="Save SQL file",
+                                on_click="ignore",
                             )
+                    else:
+                        st.caption(
+                            f"{expander_label} · browser download disabled · "
+                            f"`{filepath}`"
+                        )
 
                     with st.expander(expander_label):
-                        with open(filepath, "r", encoding="utf-8") as f:
-                            content = f.read(50000)
-                            if file_size > 50000:
-                                content += "\n\n-- [TRUNCATED - File too large for full preview] --"
+                        content, truncated = read_text_preview(filepath)
+                        if truncated:
+                            content += "\n\n-- [TRUNCATED - File too large for full preview] --"
                         st.code(content, language="sql")
                 else:
                     st.markdown(
@@ -2055,13 +2560,20 @@ def main():
         doc_count = len(selected_doc_ids)
     
     # Related counts
-    render_related_counts(config, prefix, selected_user_ids, doc_count)
+    workload_blocked = render_related_counts(
+        config, prefix, selected_user_ids, doc_count
+    )
     
     # Optional preview of folders/embeddings that will be copied
     render_copy_preview(config, prefix, selected_user_ids)
     
     # Extraction
-    render_extraction_section(config, prefix, selected_emails)
+    render_extraction_section(
+        config,
+        prefix,
+        selected_emails,
+        workload_blocked=workload_blocked,
+    )
     
     # Next step hint
     if SessionKeys.EXTRACTED_DATA in st.session_state:

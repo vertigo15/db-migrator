@@ -13,8 +13,15 @@ import pandas as pd
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
 
-from utils.db import ConnectionConfig, get_connection, test_connection
+from utils.db import (
+    ConnectionConfig,
+    execute_query,
+    get_connection,
+    pooled_read_connection,
+    test_connection,
+)
 from utils.config import SessionKeys, get_env_target_defaults
+from utils.ui_performance import resolve_lazy_value
 
 # Page config
 st.set_page_config(page_title="Erase User Data V5", page_icon="🗑️", layout="wide")
@@ -260,17 +267,37 @@ def _scan_relations(
     }
     availability: Dict[Tuple[str, str], bool] = {}
     blockers: List[str] = []
-    for db_name, relation_name in sorted(relation_keys):
-        exists, error = _relation_exists(base_config, db_name, relation_name)
-        availability[(db_name, relation_name)] = exists
-        if error:
-            blockers.append(
-                f"Could not inspect {db_name}.{relation_name}: {error}"
-            )
-        elif not exists and (db_name, relation_name) not in OPTIONAL_RELATIONS:
-            blockers.append(
-                f"Required relation {db_name}.{relation_name} does not exist"
-            )
+    for db_name in V5_DATABASES:
+        relations = sorted(
+            relation_name
+            for relation_db, relation_name in relation_keys
+            if relation_db == db_name
+        )
+        try:
+            with pooled_read_connection(_make_config(base_config, db_name)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT relation_name, to_regclass(relation_name)::text
+                        FROM unnest(%s::text[]) relation_name
+                        """,
+                        (relations,),
+                    )
+                    found = {name: regclass is not None for name, regclass in cur.fetchall()}
+            for relation_name in relations:
+                exists = found.get(relation_name, False)
+                availability[(db_name, relation_name)] = exists
+                if (
+                    not exists
+                    and (db_name, relation_name) not in OPTIONAL_RELATIONS
+                ):
+                    blockers.append(
+                        f"Required relation {db_name}.{relation_name} does not exist"
+                    )
+        except Exception as exc:
+            for relation_name in relations:
+                availability[(db_name, relation_name)] = False
+            blockers.append(f"Could not inspect {db_name} relations: {exc}")
     return availability, blockers
 
 
@@ -284,22 +311,13 @@ def _run_count(
     placeholders = ", ".join(["%s"] * len(user_ids))
     query = query_template.format(placeholders=placeholders)
     config = _make_config(base_config, db_name)
-    conn = None
     try:
-        conn = get_connection(config)
-        cur = conn.cursor()
-        cur.execute(query, tuple(user_ids))
-        count = cur.fetchone()[0]
-        cur.close()
-        conn.close()
+        with pooled_read_connection(config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(user_ids))
+                count = cur.fetchone()[0]
         return count, None
     except Exception as exc:
-        if conn is not None:
-            try:
-                conn.rollback()
-                conn.close()
-            except Exception:
-                pass
         return None, str(exc)
 
 
@@ -428,6 +446,71 @@ def _build_deletion_plan(
 # ─────────────────────────────────────────────────────────────────────────────
 # UI Sections
 # ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_v5_users(host, port, username, password, refresh_token):
+    config = ConnectionConfig(host, int(port), "user_db", username, password)
+    return execute_query(
+        config,
+        """
+        SELECT id, first_name, last_name, email, organization_id, created_at
+        FROM public.users
+        ORDER BY email
+        """,
+    )
+
+
+def _available_users_fingerprint(
+    config: ConnectionConfig,
+    users_df: pd.DataFrame,
+) -> Tuple:
+    """Identify the exact connection and user dataset shown to the operator."""
+    columns = [
+        column
+        for column in ("id", "email", "organization_id", "created_at")
+        if column in users_df.columns
+    ]
+    rows = tuple(
+        tuple("" if pd.isna(value) else str(value) for value in row)
+        for row in users_df[columns].itertuples(index=False, name=None)
+    )
+    return (
+        config.host,
+        config.port,
+        config.username,
+        rows,
+    )
+
+
+def _deletion_plan_fingerprint(
+    base: ConnectionConfig,
+    user_ids: List[str],
+    dataset_fingerprint=None,
+) -> Tuple:
+    """Bind a deletion plan to one connection, dataset, and exact ID set."""
+    return (
+        base.host,
+        base.port,
+        base.username,
+        dataset_fingerprint,
+        tuple(sorted(str(user_id) for user_id in user_ids)),
+    )
+
+
+def _invalidate_deletion_plan() -> None:
+    """Remove every confirmation derived from an older selection."""
+    st.session_state.pop("v5_erase_plan", None)
+    st.session_state.pop("v5_erase_plan_key", None)
+
+
+def _clear_active_erasure_selection() -> None:
+    """Clear active destructive state while retaining last-delete verification."""
+    st.session_state.pop("v5_erase_selected_ids", None)
+    _invalidate_deletion_plan()
+    st.session_state["_v5_erase_editor_epoch"] = (
+        st.session_state.get("_v5_erase_editor_epoch", 0) + 1
+    )
+
+
 def render_connection_form():
     """Render connection form for the V5 instance."""
     st.subheader("🔌 Connect to V5 Instance")
@@ -480,6 +563,9 @@ def render_connection_form():
             if all_ok:
                 st.session_state["v5_erase_config"] = base
                 st.session_state["v5_erase_results"] = results
+                st.session_state["_v5_erase_refresh_token"] = (
+                    st.session_state.get("_v5_erase_refresh_token", 0) + 1
+                )
                 st.rerun()
             else:
                 for db, (ok, msg) in results.items():
@@ -509,26 +595,43 @@ def render_user_selection():
     config = _make_config(base, "user_db")
 
     try:
-        conn = get_connection(config)
-        df = pd.read_sql_query(
-            "SELECT id, first_name, last_name, email, organization_id, created_at "
-            "FROM public.users ORDER BY email",
-            conn,
+        df = _load_v5_users(
+            config.host,
+            config.port,
+            config.username,
+            config.password,
+            st.session_state.get("_v5_erase_refresh_token", 0),
         )
-        conn.close()
     except Exception as e:
         st.error(f"Failed to load users from user_db: {e}")
         return None
 
     if df.empty:
         st.warning("No users found in user_db.users.")
+        _clear_active_erasure_selection()
         return None
 
     st.caption(f"Found **{len(df)}** users in `user_db.users`")
 
-    # Search
-    search = st.text_input("🔍 Search users", placeholder="Search by name or email...",
-                           key="erase_user_search")
+    dataset_fingerprint = _available_users_fingerprint(config, df)
+    previous_dataset = st.session_state.get("_v5_erase_dataset_fingerprint")
+    if (
+        previous_dataset is not None
+        and previous_dataset != dataset_fingerprint
+    ):
+        _clear_active_erasure_selection()
+        st.info(
+            "The available-user dataset changed. The prior selection and "
+            "deletion plan were cleared."
+        )
+    st.session_state["_v5_erase_dataset_fingerprint"] = dataset_fingerprint
+
+    prev_ids = st.session_state.get("v5_erase_selected_ids", [])
+    search = st.text_input(
+        "🔍 Search users",
+        placeholder="Search by name or email...",
+        key="erase_user_search",
+    )
     filtered = df.copy()
     if search:
         mask = (
@@ -538,12 +641,9 @@ def render_user_selection():
         )
         filtered = filtered[mask]
 
-    # Selection column
-    prev_ids = st.session_state.get("v5_erase_selected_ids", [])
     filtered["selected"] = filtered["id"].astype(str).isin(prev_ids)
     display_cols = ["selected", "id", "first_name", "last_name", "email", "organization_id", "created_at"]
     filtered = filtered[display_cols]
-
     edited = st.data_editor(
         filtered,
         column_config={
@@ -554,10 +654,17 @@ def render_user_selection():
         hide_index=True,
         use_container_width=True,
         height=400,
-        key="erase_users_editor",
+        key=(
+            "erase_users_editor_"
+            f"{st.session_state.get('_v5_erase_editor_epoch', 0)}"
+        ),
+        disabled=[column for column in display_cols if column != "selected"],
     )
-
-    selected_ids = edited[edited["selected"] == True]["id"].astype(str).tolist()
+    selected_ids = (
+        edited[edited["selected"] == True]["id"].astype(str).tolist()
+    )
+    if selected_ids != prev_ids:
+        _invalidate_deletion_plan()
     st.session_state["v5_erase_selected_ids"] = selected_ids
     st.metric("Selected for Erasure", len(selected_ids))
     return selected_ids
@@ -580,9 +687,35 @@ def render_deletion_plan(user_ids: List[str]):
     )
 
     base = st.session_state["v5_erase_config"]
+    plan_key = _deletion_plan_fingerprint(
+        base,
+        user_ids,
+        st.session_state.get("_v5_erase_dataset_fingerprint"),
+    )
+    requested = st.button(
+        "Build / Refresh deletion plan",
+        type="secondary",
+        use_container_width=True,
+    )
 
-    with st.spinner("Scanning tables..."):
-        plan = _build_deletion_plan(base, user_ids)
+    def _build():
+        with st.spinner("Scanning tables..."):
+            return _build_deletion_plan(base, user_ids)
+
+    plan = resolve_lazy_value(
+        st.session_state,
+        value_key="v5_erase_plan",
+        fingerprint_key="v5_erase_plan_key",
+        fingerprint=plan_key,
+        requested=requested,
+        builder=_build,
+    )
+
+    if plan is None:
+        st.info(
+            "The expensive cross-database deletion plan is generated only on request."
+        )
+        return None
 
     plan_df = pd.DataFrame(plan["rows"])
     st.dataframe(plan_df, hide_index=True, use_container_width=True)
@@ -603,8 +736,6 @@ def render_deletion_plan(user_ids: List[str]):
                 "because their tracking relations are absent or incompatible."
             )
 
-    # Store plan for reference
-    st.session_state["v5_erase_plan"] = plan
     return plan
 
 
@@ -616,6 +747,19 @@ def render_execute_deletion(user_ids: List[str]):
     st.markdown("---")
     st.subheader("⚡ Execute Deletion")
 
+    base = st.session_state["v5_erase_config"]
+    expected_plan_key = _deletion_plan_fingerprint(
+        base,
+        user_ids,
+        st.session_state.get("_v5_erase_dataset_fingerprint"),
+    )
+    if st.session_state.get("v5_erase_plan_key") != expected_plan_key:
+        st.error(
+            "The deletion plan does not match the currently displayed "
+            "selection. Build a fresh plan before execution."
+        )
+        return
+
     plan = st.session_state["v5_erase_plan"]
     if plan.get("blockers"):
         st.error("Execution is disabled because the deletion preflight is blocked.")
@@ -624,7 +768,7 @@ def render_execute_deletion(user_ids: List[str]):
     confirmed = st.checkbox(
         "I understand this erases the complete V5 user and pre-existing data, "
         "not only migration-created records.",
-        key="confirm_full_v5_erasure",
+        key=f"confirm_full_v5_erasure_{abs(hash(expected_plan_key))}",
     )
     if not st.button(
         "🗑️ DELETE ALL SELECTED USER DATA",
@@ -634,7 +778,6 @@ def render_execute_deletion(user_ids: List[str]):
     ):
         return
 
-    base = st.session_state["v5_erase_config"]
     # Re-run preflight immediately before opening mutation transactions.
     plan = _build_deletion_plan(base, user_ids)
     st.session_state["v5_erase_plan"] = plan
@@ -734,10 +877,14 @@ def render_execute_deletion(user_ids: List[str]):
     progress.progress(1.0)
     if all_ok:
         st.success("✅ Complete V5 user erasure committed successfully.")
+        st.session_state["_v5_erase_last_deleted_ids"] = list(user_ids)
+        st.session_state["v5_erase_executed"] = True
+        st.session_state["_v5_erase_refresh_token"] = (
+            st.session_state.get("_v5_erase_refresh_token", 0) + 1
+        )
+        _clear_active_erasure_selection()
     else:
         st.error("Deletion failed. See the transaction log above.")
-
-    st.session_state["v5_erase_executed"] = True
 
 
 def render_verification(user_ids: List[str]):
@@ -795,12 +942,12 @@ def main():
     render_connection_form()
 
     selected_ids = render_user_selection()
-    if not selected_ids:
-        return
+    if selected_ids:
+        render_deletion_plan(selected_ids)
+        render_execute_deletion(selected_ids)
 
-    plan = render_deletion_plan(selected_ids)
-    render_execute_deletion(selected_ids)
-    render_verification(selected_ids)
+    last_deleted_ids = st.session_state.get("_v5_erase_last_deleted_ids", [])
+    render_verification(last_deleted_ids)
 
 
 main()
