@@ -107,6 +107,30 @@ def test_live_selection_merge_drops_ids_missing_from_current_dataset():
     assert selected == ["still-present"]
 
 
+def test_selected_users_move_first_without_changing_active_sort_order():
+    frame = pd.DataFrame(
+        {
+            "email": [
+                "highest-docs@example.com",
+                "selected-first@example.com",
+                "selected-second@example.com",
+                "lowest-docs@example.com",
+            ],
+            "doc_count": [100, 80, 60, 40],
+            "selected": [False, True, True, False],
+        }
+    )
+
+    prioritized = select_page._prioritize_selected_rows(frame)
+
+    assert prioritized["email"].tolist() == [
+        "selected-first@example.com",
+        "selected-second@example.com",
+        "highest-docs@example.com",
+        "lowest-docs@example.com",
+    ]
+
+
 def test_audit_summary_ignores_cached_verification_counts(monkeypatch):
     table_status = {
         "users": {

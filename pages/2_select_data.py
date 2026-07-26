@@ -8,6 +8,7 @@ Features:
 - Extraction with progress
 - CSV preview and download
 """
+import hashlib
 import os
 import json
 import uuid
@@ -424,6 +425,17 @@ def _merge_visible_selection(
     return list(dict.fromkeys(merged))
 
 
+def _prioritize_selected_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Move selected rows first while preserving the active sort within groups."""
+    if frame.empty or "selected" not in frame.columns:
+        return frame
+    return frame.sort_values(
+        by="selected",
+        ascending=False,
+        kind="stable",
+    ).reset_index(drop=True)
+
+
 def render_user_selection(config: ConnectionConfig, prefix: str):
     """Render the user selection section with sorting, batch select, and file import."""
     st.subheader("👥 Select Users")
@@ -574,32 +586,70 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
                 key="_p2_user_upload",
             )
             if uploaded_file is not None:
-                try:
-                    if uploaded_file.name.endswith(".xlsx"):
-                        import openpyxl  # noqa: F401
-                        upload_df = pd.read_excel(uploaded_file)
-                    else:
-                        upload_df = pd.read_csv(uploaded_file)
-                    col_map = {c.lower().strip(): c for c in upload_df.columns}
-                    if "email" not in col_map:
-                        st.error("File must contain an 'email' column.")
-                    else:
-                        uploaded_emails = upload_df[col_map["email"]].dropna().str.strip().str.lower().tolist()
-                        matched, unmatched = _match_user_emails(
-                            users_df["email"].tolist(),
-                            uploaded_emails,
-                        )
-                        saved_emails = list(dict.fromkeys(saved_emails + matched))
-                        _queue_bulk_user_selection(saved_emails)
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Matched", len(matched))
-                        c2.metric("Unmatched", len(unmatched))
-                        c3.metric("Total in file", len(uploaded_emails))
-                        if unmatched:
-                            with st.expander("Unmatched emails"):
-                                st.write(unmatched)
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
+                upload_fingerprint = hashlib.sha256(
+                    uploaded_file.getvalue()
+                ).hexdigest()
+                upload_result = st.session_state.get("_p2_user_upload_result")
+                if (
+                    not isinstance(upload_result, dict)
+                    or upload_result.get("fingerprint") != upload_fingerprint
+                ):
+                    try:
+                        if uploaded_file.name.endswith(".xlsx"):
+                            import openpyxl  # noqa: F401
+                            upload_df = pd.read_excel(uploaded_file)
+                        else:
+                            upload_df = pd.read_csv(uploaded_file)
+                        col_map = {c.lower().strip(): c for c in upload_df.columns}
+                        if "email" not in col_map:
+                            upload_result = {
+                                "fingerprint": upload_fingerprint,
+                                "error": "File must contain an 'email' column.",
+                            }
+                        else:
+                            uploaded_emails = (
+                                upload_df[col_map["email"]]
+                                .dropna()
+                                .astype(str)
+                                .str.strip()
+                                .str.lower()
+                                .tolist()
+                            )
+                            matched, unmatched = _match_user_emails(
+                                users_df["email"].tolist(),
+                                uploaded_emails,
+                            )
+                            saved_emails = list(
+                                dict.fromkeys(saved_emails + matched)
+                            )
+                            _queue_bulk_user_selection(saved_emails)
+                            upload_result = {
+                                "fingerprint": upload_fingerprint,
+                                "matched": matched,
+                                "unmatched": unmatched,
+                                "total": len(uploaded_emails),
+                            }
+                    except Exception as e:
+                        upload_result = {
+                            "fingerprint": upload_fingerprint,
+                            "error": f"Error reading file: {e}",
+                        }
+                    st.session_state["_p2_user_upload_result"] = upload_result
+
+                if upload_result.get("error"):
+                    st.error(upload_result["error"])
+                else:
+                    matched = upload_result["matched"]
+                    unmatched = upload_result["unmatched"]
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Matched", len(matched))
+                    c2.metric("Unmatched", len(unmatched))
+                    c3.metric("Total in file", upload_result["total"])
+                    if unmatched:
+                        with st.expander("Unmatched emails"):
+                            st.write(unmatched)
+            else:
+                st.session_state.pop("_p2_user_upload_result", None)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Apply pending batch selection
@@ -617,7 +667,7 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     # ─────────────────────────────────────────────────────────────────────────
     display_cols = ["selected", "name", "email", "company_name", "doc_count", "agent_count", "created_at", "last_connected"]
     filtered_df["selected"] = filtered_df["email"].isin(saved_emails)
-    filtered_df = filtered_df[display_cols]
+    filtered_df = _prioritize_selected_rows(filtered_df[display_cols])
     select_all = st.checkbox(
         "Select all filtered users",
         value=False,
@@ -659,6 +709,11 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
         selected_visible,
         users_df["email"].astype(str).tolist(),
     )
+    if selected_emails != saved_emails:
+        # Recreate the editor before reordering rows so its positional widget
+        # state cannot apply a checkbox value to a different user.
+        _queue_bulk_user_selection(selected_emails)
+        st.rerun()
     _persist_saved_emails(selected_emails)
 
     st.session_state[SessionKeys.SELECTED_USERS] = selected_emails
