@@ -650,6 +650,10 @@ def test_documents_start_pending_and_step_four_reconciles_readiness(tmp_path):
     assert "v_document_processing_id," in chunk_sql
     assert "c.document_processing_id = dp.id" in chunk_sql
     assert "c.document_processing_id IS DISTINCT FROM dp.id" in chunk_sql
+    assert "Missing run-scoped document tracking" in chunk_sql
+    assert "'04_chunks_embeddings', 'chunks'" in chunk_sql
+    assert "'04_chunks_embeddings', 'embeddings'" in chunk_sql
+    assert "resume its owning run instead" in chunk_sql
 
     readiness = ExtractionEngine.evaluate_document_readiness(
         pd.DataFrame([{"doc_id": "doc-1"}, {"doc_id": "doc-without-chunks"}]),
@@ -684,6 +688,11 @@ def test_user_sql_records_explicit_created_and_reused_actions():
     assert "v_action VARCHAR := 'created'" in created_sql
     assert "record_action" in created_sql
     assert "'reused'" in reused_sql
+    assert "migration.migration_step_entities" in created_sql
+    assert "migration.migration_step_entities" in reused_sql
+    assert "WHEN m.migration_run_id =" in reused_sql
+    assert "ELSE 'reused'" in reused_sql
+    assert "Canonical users mapping mismatch" in reused_sql
     assert run_id in created_sql and run_id in reused_sql
 
 
@@ -779,7 +788,8 @@ def test_folder_insert_normalizes_float_loaded_ids_and_tracks_current_run():
     assert "'reused'" in sql
     assert "'created'" in sql
     assert "mapped.user_id = v_user_id" in sql
-    assert "AND new_id = v_mapped_folder_id" in sql
+    assert "Canonical folder owner mismatch" in sql
+    assert "DELETE FROM migration.id_mappings" not in sql
     assert str(deterministic_uuid_v4_py(
         "0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b",
         "1105",
@@ -886,6 +896,8 @@ def test_conversation_generator_skips_blank_and_invalid_chat_ids(tmp_path):
     assert "not-a-uuid" not in sql
     assert "migration.migration_step_entities" in sql
     assert "ELSE 'reused' END" in sql
+    assert "m.migration_run_id = '33333333-3333-4333-8333-333333333333'::uuid" in sql
+    assert "m.record_action = 'created'" in sql
 
 
 def test_conversation_scope_filters_and_limits_unique_chat_ids():

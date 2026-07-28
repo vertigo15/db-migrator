@@ -46,7 +46,21 @@ def verify_step(cursor, step_key: str, migration_run_id: str) -> Tuple[int, dict
     if step_key == "04_chunks_embeddings":
         cursor.execute(
             """
-            WITH run_docs AS (
+            WITH tracked_chunks AS (
+                SELECT old_id, new_id
+                FROM migration.migration_step_entities
+                WHERE migration_run_id = %s::uuid
+                  AND step_key = '04_chunks_embeddings'
+                  AND table_name = 'chunks'
+            ),
+            tracked_embeddings AS (
+                SELECT old_id, new_id
+                FROM migration.migration_step_entities
+                WHERE migration_run_id = %s::uuid
+                  AND step_key = '04_chunks_embeddings'
+                  AND table_name = 'embeddings'
+            ),
+            run_docs AS (
                 SELECT m.new_id AS document_id, dp.id AS processing_id
                 FROM migration.id_mappings m
                 LEFT JOIN public.document_processing dp
@@ -55,38 +69,79 @@ def verify_step(cursor, step_key: str, migration_run_id: str) -> Tuple[int, dict
                 WHERE m.table_name = 'documents'
                   AND m.migration_run_id = %s::uuid
                   AND m.record_action = 'created'
+            ),
+            verified_chunks AS (
+                SELECT c.id, c.document_id, c.document_processing_id
+                FROM tracked_chunks tracked
+                JOIN public.chunks c ON c.id = tracked.new_id
+                WHERE EXISTS (SELECT 1 FROM tracked_chunks)
+
+                UNION ALL
+
+                SELECT c.id, c.document_id, c.document_processing_id
+                FROM run_docs d
+                JOIN public.chunks c
+                  ON c.document_id = d.document_id
+                 AND c.document_processing_id = d.processing_id
+                WHERE NOT EXISTS (SELECT 1 FROM tracked_chunks)
+            ),
+            verified_embeddings AS (
+                SELECT e.id
+                FROM tracked_embeddings tracked
+                JOIN public.embeddings e ON e.id = tracked.new_id
+                JOIN tracked_chunks chunk_tracking
+                  ON chunk_tracking.old_id = tracked.old_id
+                JOIN public.chunks c ON c.id = chunk_tracking.new_id
+                WHERE EXISTS (SELECT 1 FROM tracked_chunks)
+                  AND e.chunk_id = c.id
+                  AND e.document_id = c.document_id
+
+                UNION ALL
+
+                SELECT e.id
+                FROM run_docs d
+                JOIN public.chunks c
+                  ON c.document_id = d.document_id
+                 AND c.document_processing_id = d.processing_id
+                JOIN public.embeddings e
+                  ON e.document_id = d.document_id
+                 AND e.chunk_id = c.id
+                WHERE NOT EXISTS (SELECT 1 FROM tracked_chunks)
             )
             SELECT
                 (
                     SELECT COUNT(DISTINCT c.id)
-                    FROM run_docs d
-                    JOIN public.chunks c
-                      ON c.document_id = d.document_id
-                     AND c.document_processing_id = d.processing_id
+                    FROM verified_chunks c
+                    JOIN public.document_processing dp
+                      ON dp.id = c.document_processing_id
+                     AND dp.document_id = c.document_id
+                     AND dp.deleted_at IS NULL
                 ),
                 (
-                    SELECT COUNT(DISTINCT e.id)
-                    FROM run_docs d
-                    JOIN public.chunks c
-                      ON c.document_id = d.document_id
-                     AND c.document_processing_id = d.processing_id
-                    JOIN public.embeddings e
-                      ON e.document_id = d.document_id
-                     AND e.chunk_id = c.id
+                    SELECT COUNT(DISTINCT id)
+                    FROM verified_embeddings
                 ),
                 (
                     SELECT COUNT(DISTINCT c.id)
-                    FROM run_docs d
-                    JOIN public.chunks c ON c.document_id = d.document_id
-                    WHERE c.document_processing_id IS DISTINCT FROM d.processing_id
+                    FROM verified_chunks c
+                    LEFT JOIN public.document_processing dp
+                      ON dp.id = c.document_processing_id
+                     AND dp.document_id = c.document_id
+                     AND dp.deleted_at IS NULL
+                    WHERE dp.id IS NULL
                 ),
                 (
-                    SELECT COUNT(*)
-                    FROM run_docs
-                    WHERE processing_id IS NULL
+                    SELECT COUNT(DISTINCT c.document_id)
+                    FROM verified_chunks c
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM public.document_processing dp
+                        WHERE dp.document_id = c.document_id
+                          AND dp.deleted_at IS NULL
+                    )
                 )
             """,
-            (migration_run_id,),
+            (migration_run_id, migration_run_id, migration_run_id),
         )
         (
             chunk_count,

@@ -62,6 +62,61 @@ def _migration_run_sql(migration_run_id: Optional[str]) -> str:
     return f"'{migration_run_id}'::uuid" if migration_run_id else "NULL::uuid"
 
 
+def _record_primary_step_entity_sql(
+    migration_run_id: Optional[str],
+    step_key: str,
+    table_name: str,
+    old_id_sql: str,
+    new_id_sql: str,
+) -> str:
+    """Track run-scoped reuse without changing canonical mapping ownership.
+
+    ``migration.id_mappings`` has one canonical row per source entity, so a
+    later run cannot own a second mapping for the same ``old_id``. The
+    run-scoped ``migration_step_entities`` table records that the later run
+    verified/reused the canonical target while preserving rollback ownership
+    on the original mapping.
+
+    The returned SQL is intended for use inside a PL/pgSQL block.
+    """
+    if not migration_run_id:
+        return ""
+    run_sql = _migration_run_sql(migration_run_id)
+    return f"""
+    IF NOT EXISTS (
+        SELECT 1
+        FROM migration.id_mappings
+        WHERE table_name = '{table_name}'
+          AND old_id = {old_id_sql}
+          AND new_id = {new_id_sql}
+    ) THEN
+        RAISE EXCEPTION
+            'Canonical {table_name} mapping mismatch for legacy id %',
+            {old_id_sql};
+    END IF;
+
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    SELECT
+        {run_sql}, '{step_key}', '{table_name}', {old_id_sql}, {new_id_sql},
+        CASE
+            WHEN m.migration_run_id = {run_sql} THEN m.record_action
+            ELSE 'reused'
+        END
+    FROM migration.id_mappings m
+    WHERE m.table_name = '{table_name}'
+      AND m.old_id = {old_id_sql}
+      AND m.new_id = {new_id_sql}
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET
+        new_id = EXCLUDED.new_id,
+        record_action = EXCLUDED.record_action,
+        recorded_at = now();
+"""
+
+
 def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None) -> str:
     """
     Return a SQL expression that resolves a V4 user hash ID to a V5 user UUID.
@@ -572,6 +627,13 @@ def generate_user_insert(
     # --- OVERRIDE PATH: user already exists in V5 with a known UUID ---
     if user_id_overrides and old_id and old_id in user_id_overrides:
         v5_uuid = user_id_overrides[old_id]
+        override_tracking_sql = _record_primary_step_entity_sql(
+            migration_run_id,
+            "01_users",
+            "users",
+            escape_sql_string(old_id),
+            f"'{v5_uuid}'::uuid",
+        )
         return f"""
 -- User: {email} (OVERRIDE — already exists in V5)
 -- V4 old_id: {old_id}  →  V5 UUID: {v5_uuid}
@@ -587,6 +649,7 @@ BEGIN
             '{migration_run_id or "user_overrides"}', {_migration_run_sql(migration_run_id)},
             'reused', 'Pre-existing V5 user — resolved before migration')
     ON CONFLICT (table_name, old_id) DO NOTHING;
+{override_tracking_sql}
     RAISE NOTICE 'Skipped INSERT for user % — already exists in V5 as %',
                  {escape_sql_string(email)}, '{v5_uuid}';
 END $$;
@@ -684,6 +747,13 @@ END $$;
     }
     
     metadata_sql = escape_json_for_sql(metadata)
+    mapped_user_tracking_sql = _record_primary_step_entity_sql(
+        migration_run_id,
+        "01_users",
+        "users",
+        "v_old_id",
+        "v_new_id",
+    )
     
     # Generate SQL with mapping table integration
     sql = f"""
@@ -697,8 +767,11 @@ DECLARE
     v_match_count INTEGER;
     v_action VARCHAR := 'created';
 BEGIN
-    -- 1. Skip if already migrated in a previous run
+    -- 1. Reuse a valid canonical mapping from a previous run without
+    -- transferring its rollback ownership to this run.
     IF migration.is_migrated('users', v_old_id) THEN
+        v_new_id := migration.get_new_id('users', v_old_id);
+{mapped_user_tracking_sql}
         RAISE NOTICE 'User % already migrated (old_id: %)', v_email, v_old_id;
         RETURN;
     END IF;
@@ -717,6 +790,7 @@ BEGIN
         WHERE lower(trim(email)) = lower(trim(v_email));
     END IF;
     IF v_existing_id IS NOT NULL THEN
+        v_new_id := v_existing_id;
         -- Link only — do NOT modify existing user data
         INSERT INTO migration.id_mappings (
             table_name, old_id, new_id, migration_batch,
@@ -726,6 +800,7 @@ BEGIN
                 {_migration_run_sql(migration_run_id)}, 'reused',
                 'Linked to pre-existing V5 user (normalized email match, no data overwrite)')
         ON CONFLICT (table_name, old_id) DO NOTHING;
+{mapped_user_tracking_sql}
         RAISE NOTICE 'User % already exists in V5 (id: %), linked without modification', v_email, v_existing_id;
         RETURN;
     END IF;
@@ -798,6 +873,7 @@ BEGIN
         'Migrated from V4 users table'
     )
     ON CONFLICT (table_name, old_id) DO NOTHING;
+{mapped_user_tracking_sql}
 
     RAISE NOTICE 'Migrated user %: % → %', v_email, v_old_id, v_new_id;
 END $$;
@@ -1060,17 +1136,11 @@ BEGIN
             RETURN;
         END IF;
 
-        -- Legacy migrations could map a folder to a deterministic user UUID
-        -- that is not the currently resolved V5 account. Preserve that old
-        -- row, but release the invalid canonical mapping so this run creates
-        -- a correctly owned folder under the current deterministic UUID.
-        DELETE FROM migration.id_mappings
-        WHERE table_name = 'folders'
-          AND old_id = v_old_folder_id
-          AND new_id = v_mapped_folder_id;
-        RAISE NOTICE
-            'Released folder mapping % because target owner does not match %',
-            v_old_folder_id, v_user_id;
+        -- Never delete or reassign another run's canonical mapping. The
+        -- owning run must be rolled back or explicitly repaired first.
+        RAISE EXCEPTION
+            'Canonical folder owner mismatch for legacy folder %: mapped folder % is not owned by user %',
+            v_old_folder_id, v_mapped_folder_id, v_user_id;
     END IF;
     IF EXISTS (SELECT 1 FROM public.folders WHERE id = v_folder_id) THEN
         RAISE EXCEPTION
@@ -1450,6 +1520,13 @@ def generate_document_insert(
     
     # Build optional agent-topup annotation
     topup_comment = f'\n-- [agent-topup] Auto-added: required by {source_label}' if source_label else ''
+    document_tracking_sql = _record_primary_step_entity_sql(
+        migration_run_id,
+        "03_documents",
+        "documents",
+        "v_old_doc_id",
+        "v_new_doc_id",
+    )
 
     # Generate SQL with mapping table integration
     sql = f"""
@@ -1463,8 +1540,11 @@ DECLARE
     v_user_id UUID := {resolve_user_id_sql(owner_id, user_id_overrides)};
     v_folder_id UUID;
 BEGIN
-    -- Check if document already migrated using mapping table (FAST)
+    -- Reuse an older canonical document without transferring rollback
+    -- ownership to this run.
     IF migration.is_migrated('documents', v_old_doc_id) THEN
+        v_new_doc_id := migration.get_new_id('documents', v_old_doc_id);
+{document_tracking_sql}
         RAISE NOTICE 'Document % already migrated', v_old_doc_id;
         RETURN;
     END IF;
@@ -1568,6 +1648,7 @@ BEGIN
         {_migration_run_sql(migration_run_id)},
         'created'
     );
+{document_tracking_sql}
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -1808,7 +1889,8 @@ def generate_chunk_and_embedding_inserts(
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     default_embedding_model: str = 'text-embedding-ada-002',
     skip_empty_embeddings: bool = False,
-    target_embedding_dim: Optional[int] = None
+    target_embedding_dim: Optional[int] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statements for BOTH chunk and embedding from a single source row.
@@ -1932,6 +2014,40 @@ def generate_chunk_and_embedding_inserts(
     while f'${outer_tag}$' in all_content:
         outer_tag = outer_tag + '_'
     
+    chunk_run_setup_sql = ""
+    chunk_tracking_sql = ""
+    if migration_run_id:
+        run_sql = _migration_run_sql(migration_run_id)
+        chunk_run_setup_sql = f"""
+    SELECT record_action INTO v_document_action
+    FROM migration.migration_step_entities
+    WHERE migration_run_id = {run_sql}
+      AND step_key = '03_documents'
+      AND table_name = 'documents'
+      AND old_id = v_old_doc_id;
+
+    IF v_document_action IS NULL THEN
+        RAISE EXCEPTION
+            'Missing run-scoped document tracking for legacy document %',
+            v_old_doc_id;
+    END IF;
+"""
+        chunk_tracking_sql = f"""
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    VALUES (
+        {run_sql}, '04_chunks_embeddings', 'chunks', {escape_sql_string(legacy_id)},
+        v_chunk_id, CASE WHEN v_chunk_existed THEN 'reused' ELSE 'created' END
+    )
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET
+        new_id = EXCLUDED.new_id,
+        record_action = EXCLUDED.record_action,
+        recorded_at = now();
+"""
+
     # Generate chunk INSERT
     chunk_sql = f"""
 -- Chunk from legacy ID: {legacy_id} (doc_id: {doc_id})
@@ -1941,6 +2057,8 @@ DECLARE
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
     v_document_processing_id uuid;
+    v_document_action VARCHAR := 'created';
+    v_chunk_existed BOOLEAN;
 BEGIN
     -- Lookup document_id from migration mapping table (FAST)
     v_document_id := migration.get_new_id('documents', v_old_doc_id);
@@ -1956,6 +2074,7 @@ BEGIN
         RAISE NOTICE 'Skipping chunk % - document % has stale mapping (not in documents table)', '{legacy_id}', v_old_doc_id;
         RETURN;
     END IF;
+{chunk_run_setup_sql}
 
     -- The chunks API scopes rows by both document_id and
     -- document_processing_id. Resolve the actual processing row instead of
@@ -1973,11 +2092,18 @@ BEGIN
             '{legacy_id}', v_document_id;
     END IF;
     
-    -- Insert chunk if not exists
-    IF NOT EXISTS (
+    v_chunk_existed := EXISTS (
         SELECT 1 FROM chunks
         WHERE id = v_chunk_id
-    ) THEN
+    );
+    IF v_document_action = 'reused' AND NOT v_chunk_existed THEN
+        RAISE EXCEPTION
+            'Reused document % is missing canonical chunk %; resume its owning run instead',
+            v_old_doc_id, {escape_sql_string(legacy_id)};
+    END IF;
+
+    -- Insert chunk if not exists
+    IF NOT v_chunk_existed THEN
         INSERT INTO chunks (
             id,
             document_id,
@@ -2029,6 +2155,7 @@ BEGIN
                 '{legacy_id}';
         END IF;
     END IF;
+{chunk_tracking_sql}
 END ${outer_tag}$;
 """
     
@@ -2050,6 +2177,41 @@ END ${outer_tag}$;
         # Use a named tag for the outer DO block (consistent with chunk block)
         emb_tag = 'emb_fn'
         
+        embedding_run_setup_sql = ""
+        embedding_tracking_sql = ""
+        if migration_run_id:
+            run_sql = _migration_run_sql(migration_run_id)
+            embedding_run_setup_sql = f"""
+    SELECT record_action INTO v_document_action
+    FROM migration.migration_step_entities
+    WHERE migration_run_id = {run_sql}
+      AND step_key = '03_documents'
+      AND table_name = 'documents'
+      AND old_id = v_old_doc_id;
+
+    IF v_document_action IS NULL THEN
+        RAISE EXCEPTION
+            'Missing run-scoped document tracking for legacy document %',
+            v_old_doc_id;
+    END IF;
+"""
+            embedding_tracking_sql = f"""
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    VALUES (
+        {run_sql}, '04_chunks_embeddings', 'embeddings',
+        {escape_sql_string(legacy_id)}, v_embedding_id,
+        CASE WHEN v_embedding_existed THEN 'reused' ELSE 'created' END
+    )
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET
+        new_id = EXCLUDED.new_id,
+        record_action = EXCLUDED.record_action,
+        recorded_at = now();
+"""
+
         embedding_sql = f"""
 -- Embedding for chunk {legacy_id}
 DO ${emb_tag}$
@@ -2057,6 +2219,9 @@ DECLARE
     v_chunk_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}');
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
+    v_document_action VARCHAR := 'created';
+    v_embedding_id uuid;
+    v_embedding_existed BOOLEAN;
 BEGIN
     -- Lookup document_id from migration mapping table (FAST)
     v_document_id := migration.get_new_id('documents', v_old_doc_id);
@@ -2069,12 +2234,21 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM documents WHERE id = v_document_id) THEN
         RETURN;
     END IF;
+{embedding_run_setup_sql}
     
+    SELECT id INTO v_embedding_id
+    FROM embeddings
+    WHERE chunk_id = v_chunk_id
+    LIMIT 1;
+    v_embedding_existed := v_embedding_id IS NOT NULL;
+    IF v_document_action = 'reused' AND NOT v_embedding_existed THEN
+        RAISE EXCEPTION
+            'Reused document % is missing the embedding for chunk %; resume its owning run instead',
+            v_old_doc_id, {escape_sql_string(legacy_id)};
+    END IF;
+
     -- Insert embedding if not exists
-    IF NOT EXISTS (
-        SELECT 1 FROM embeddings
-        WHERE chunk_id = v_chunk_id
-    ) THEN
+    IF NOT v_embedding_existed THEN
         INSERT INTO embeddings (
             id,
             chunk_id,
@@ -2091,8 +2265,18 @@ BEGIN
             vector_dims('{embeddings_value}'::vector),
             '{default_embedding_model}',
             {created_at_sql}
-        );
+        )
+        RETURNING id INTO v_embedding_id;
+    ELSIF EXISTS (
+        SELECT 1 FROM embeddings
+        WHERE id = v_embedding_id
+          AND (chunk_id <> v_chunk_id OR document_id <> v_document_id)
+    ) THEN
+        RAISE EXCEPTION
+            'Embedding collision for legacy chunk %',
+            {escape_sql_string(legacy_id)};
     END IF;
+{embedding_tracking_sql}
 END ${emb_tag}$;
 """
     
@@ -2257,7 +2441,8 @@ END $$;
                 namespace_uuid=namespace_uuid,
                 default_embedding_model=default_embedding_model,
                 skip_empty_embeddings=skip_empty_embeddings,
-                target_embedding_dim=target_embedding_dim
+                target_embedding_dim=target_embedding_dim,
+                migration_run_id=migration_run_id,
             )
             if sql:
                 owner_id = _owner_id_from_metadata(row.get('metadata'))
@@ -2607,6 +2792,30 @@ END $$;
         max_rows_per_shard=SHARD_MAX_ROWS['05_conversations'],
         max_bytes_per_shard=SHARD_MAX_BYTES['05_conversations'],
     )
+    message_owner_scope_sql = ""
+    block_owner_scope_sql = ""
+    if migration_run_id:
+        run_sql = _migration_run_sql(migration_run_id)
+        message_owner_scope_sql = f"""
+  AND EXISTS (
+      SELECT 1
+      FROM migration.id_mappings m
+      WHERE m.table_name = 'conversations'
+        AND m.new_id = v.conversation_id
+        AND m.migration_run_id = {run_sql}
+        AND m.record_action = 'created'
+  )"""
+        block_owner_scope_sql = f"""
+  AND EXISTS (
+      SELECT 1
+      FROM messages owned_message
+      JOIN migration.id_mappings m
+        ON m.table_name = 'conversations'
+       AND m.new_id = owned_message.conversation_id
+       AND m.migration_run_id = {run_sql}
+       AND m.record_action = 'created'
+      WHERE owned_message.id = v.message_id
+  )"""
 
     with contextlib.nullcontext(ShardWriterFileAdapter(shard_writer)) as sql_file:
         # Group by user_id
@@ -2862,7 +3071,7 @@ SELECT * FROM (
   VALUES
 {msg_values_joined}
 ) AS v(id, conversation_id, parent_message_id, role, has_tool_calls, iteration_count, content_block_count, finish_reason, created_at, updated_at, deleted_at, user_id, metadata)
-WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id);
+WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id){message_owner_scope_sql};
 
 """)
                 
@@ -2875,7 +3084,7 @@ SELECT * FROM (
   VALUES
 {block_values_joined}
 ) AS v(id, message_id, sequence, type, content, execution_time_ms, created_at)
-WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
+WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id){block_owner_scope_sql};
 
 """)
                 sql_file.end_unit()
@@ -3373,6 +3582,13 @@ def generate_agent_insert(
         kb_declare = f"""
     v_kb_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb');
     v_kb_assignment_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-assignment');"""
+    agent_tracking_sql = _record_primary_step_entity_sql(
+        migration_run_id,
+        "06_agents",
+        "agents",
+        escape_sql_string(bot_id),
+        "v_agent_id",
+    )
 
     sql = f"""
 -- Agent: {bot_name[:60]} (bot_id: {bot_id})
@@ -3382,6 +3598,15 @@ DECLARE
     v_settings_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-settings');
     v_user_id uuid := {resolve_user_id_sql(str(user_id), user_id_overrides)};{kb_declare}
 BEGIN
+    -- A valid canonical agent from an older run is append-only. Record reuse
+    -- for this run, but do not mutate the older agent or its helper rows.
+    IF migration.is_migrated('agents', {escape_sql_string(bot_id)}) THEN
+        v_agent_id := migration.get_new_id('agents', {escape_sql_string(bot_id)});
+{agent_tracking_sql}
+        RAISE NOTICE 'Agent % already migrated', {escape_sql_string(bot_id)};
+        RETURN;
+    END IF;
+
     IF EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id)
        AND NOT EXISTS (
            SELECT 1 FROM migration.id_mappings
@@ -3457,6 +3682,7 @@ BEGIN
             {_migration_run_sql(migration_run_id)}, 'created',
             'Type: {agent_type}. KB items: {len(docs_chosen) + len(folders_chosen)}')
     ON CONFLICT (table_name, old_id) DO NOTHING;
+{agent_tracking_sql}
     
     -- Track in legacy mapping table
     INSERT INTO legacy_bot_to_agent_mapping (old_bot_id, new_agent_id, agent_type, bot_name)
@@ -3767,6 +3993,13 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
         conv_id_input = f"conv-{source_id}-{bot_id}"
         user_id_sql = resolve_user_id_sql(str(user_id), user_id_overrides)
+        conversion_tracking_sql = _record_primary_step_entity_sql(
+            migration_run_id,
+            "07_conversions",
+            "conversions",
+            escape_sql_string(conv_id_input),
+            "v_conversion_id",
+        )
 
         is_active_val = 'true'
         raw_active = row.get('is_active')
@@ -3780,6 +4013,17 @@ DECLARE
     v_user_id uuid := {user_id_sql};
     v_agent_id uuid := migration.deterministic_uuid_v4('{NAMESPACE_UUID}'::uuid, '{bot_id}-agent');
 BEGIN
+    IF migration.is_migrated(
+        'conversions', {escape_sql_string(conv_id_input)}
+    ) THEN
+        v_conversion_id := migration.get_new_id(
+            'conversions', {escape_sql_string(conv_id_input)}
+        );
+{conversion_tracking_sql}
+        RAISE NOTICE 'Conversion % already migrated', v_conversion_id;
+        RETURN;
+    END IF;
+
     IF EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id)
        AND NOT EXISTS (
        SELECT 1 FROM migration.id_mappings
@@ -3828,6 +4072,7 @@ BEGIN
     {_migration_run_sql(migration_run_id)}, 'created', 'Migrated conversion'
     )
     ON CONFLICT (table_name, old_id) DO NOTHING;
+{conversion_tracking_sql}
 END $$;
 """, owner_legacy_ids=[str(user_id)])
         rows_processed += 1

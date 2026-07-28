@@ -2,6 +2,7 @@
 import json
 import os
 
+import pandas as pd
 import psycopg2
 import pytest
 
@@ -17,12 +18,14 @@ from utils.rollback import (
     rollback_tracked_user,
 )
 from utils.shard_queue import enqueue_shards
+from utils.step_verification import verify_step
 from utils.sql_generator import (
     CONVERSIONS_NAMESPACE_UUID,
     DOC_NAMESPACE_UUID,
     NAMESPACE_UUID,
     deterministic_uuid_v4_py,
     generate_migration_schema_setup,
+    generate_user_insert,
 )
 
 
@@ -109,6 +112,90 @@ def _setup_databases(base):
                 cursor.execute(database_ddl)
         finally:
             conn.close()
+
+
+def test_cross_run_user_reuse_is_tracked_without_reassigning_mapping(
+    prepared_cluster,
+):
+    base = prepared_cluster
+    old_run_id = "81000000-0000-4000-8000-000000000001"
+    current_run_id = "81000000-0000-4000-8000-000000000002"
+    user_id = "82000000-0000-4000-8000-000000000001"
+    legacy_user_id = "legacy-cross-run-user"
+    email = "cross-run@example.com"
+    selected_user = {
+        "email": email,
+        "legacy_user_id": legacy_user_id,
+        "v5_user_id": user_id,
+        "action": "reused",
+    }
+    create_distributed_run(base, old_run_id, [selected_user], {"database": "v4"})
+    create_distributed_run(
+        base, current_run_id, [selected_user], {"database": "v4"}
+    )
+
+    conn = _connect(base, "user_db")
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO users (id, email, payload) "
+                    "VALUES (%s::uuid, %s, '{}'::jsonb)",
+                    (user_id, email),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO migration.id_mappings (
+                        table_name, old_id, new_id, migration_batch,
+                        migration_run_id, record_action
+                    )
+                    VALUES (
+                        'users', %s, %s::uuid, 'older-run',
+                        %s::uuid, 'reused'
+                    )
+                    """,
+                    (legacy_user_id, user_id, old_run_id),
+                )
+                sql = generate_user_insert(
+                    pd.Series({
+                        "id": legacy_user_id,
+                        "email": email,
+                        "name": "Cross Run",
+                    }),
+                    user_id_overrides={legacy_user_id: user_id},
+                    migration_run_id=current_run_id,
+                )
+                cursor.execute(sql)
+                cursor.execute(
+                    """
+                    UPDATE migration.migration_steps
+                    SET expected_count = 1
+                    WHERE migration_run_id = %s::uuid
+                      AND step_key = '01_users'
+                    """,
+                    (current_run_id,),
+                )
+
+                affected, details = verify_step(
+                    cursor, "01_users", current_run_id
+                )
+                assert affected == 1
+                assert details["created_entities"] == 0
+                assert details["reused_entities"] == 1
+
+                cursor.execute(
+                    """
+                    SELECT migration_run_id, record_action
+                    FROM migration.id_mappings
+                    WHERE table_name = 'users' AND old_id = %s
+                    """,
+                    (legacy_user_id,),
+                )
+                mapping_run_id, action = cursor.fetchone()
+                assert str(mapping_run_id) == old_run_id
+                assert action == "reused"
+    finally:
+        conn.close()
 
 
 def test_force_removes_cross_database_kb_item_before_document(

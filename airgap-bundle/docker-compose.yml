@@ -1,0 +1,64 @@
+services:
+    db-migrator:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        image: jeen-db-migrator:latest
+        container_name: db-migrator
+        ports:
+            - '8501:8501'
+        env_file:
+            - .env
+        volumes:
+            # Mount external .env so the app reads customer config without rebuilding
+            - ./.env:/app/.env:ro
+            # Persist output files
+            - ./output:/app/output
+            # Persist saved configurations
+            - ./configs:/app/configs
+            # Persist backups
+            - ./backups:/app/backups
+        environment:
+            - STREAMLIT_SERVER_HEADLESS=true
+            - STREAMLIT_SERVER_ENABLE_CORS=false
+            - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true
+        restart: unless-stopped
+        networks:
+            - db-migrator-network
+
+    migration-worker:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        image: jeen-db-migrator:latest
+        # No container_name/ports: this service is meant to be horizontally
+        # scaled, e.g. `docker compose up -d --scale migration-worker=2`.
+        # The image's ENTRYPOINT runs Streamlit, so it must be overridden here
+        # too -- `command:` alone would just be appended as args to Streamlit.
+        entrypoint: ['python', 'worker.py']
+        command: []
+        env_file:
+            - .env
+        volumes:
+            - ./.env:/app/.env:ro
+            # Shares the same output volume as db-migrator so it can read the
+            # SQL shards the UI enqueues.
+            - ./output:/app/output
+        environment:
+            - WORKER_POLL_INTERVAL_SECONDS=2
+            - WORKER_LEASE_SECONDS=300
+            - WORKER_RECOVERY_INTERVAL_SECONDS=30
+            - WORKER_LOG_LEVEL=INFO
+        # The image's HEALTHCHECK probes the Streamlit HTTP port, which this
+        # service doesn't run -- disable it so workers aren't misreported unhealthy.
+        healthcheck:
+            disable: true
+        restart: unless-stopped
+        networks:
+            - db-migrator-network
+        depends_on:
+            - db-migrator
+
+networks:
+    db-migrator-network:
+        driver: bridge
