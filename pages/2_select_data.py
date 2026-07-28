@@ -54,6 +54,10 @@ from utils.migration_tracking import (
     update_local_run,
     update_source_run,
 )
+from utils.user_batching import (
+    select_user_letter_batch,
+    user_bucket_counts,
+)
 
 # Page config
 st.set_page_config(page_title="Select Data", page_icon="📋", layout="wide")
@@ -523,7 +527,9 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
     # SECTION 2: Bulk Selection Tools
     # ─────────────────────────────────────────────────────────────────────────
     with st.expander("Bulk Selection Tools", expanded=False):
-        tab_batch, tab_paste, tab_file = st.tabs(["Next Batch", "Paste Emails", "Import File"])
+        tab_batch, tab_letters, tab_paste, tab_file = st.tabs(
+            ["Next Batch", "By Letter", "Paste Emails", "Import File"]
+        )
 
         with tab_batch:
             b_col1, b_col2 = st.columns([2, 3])
@@ -550,6 +556,93 @@ def render_user_selection(config: ConnectionConfig, prefix: str):
                             count += 1
                     _queue_bulk_user_selection(new_selection)
                     st.rerun()
+
+        with tab_letters:
+            letter_col1, letter_col2 = st.columns([2, 3])
+            with letter_col1:
+                letter_field_label = st.radio(
+                    "Group and sort by",
+                    ["Email", "Name"],
+                    horizontal=True,
+                    key="_p2_letter_batch_field",
+                )
+            letter_field = letter_field_label.lower()
+            letter_records = filtered_df[["name", "email"]].to_dict("records")
+            bucket_counts = user_bucket_counts(letter_records, letter_field)
+            bucket_options = list(bucket_counts)
+            with letter_col2:
+                selected_buckets = st.multiselect(
+                    "Starting letters or digits",
+                    options=bucket_options,
+                    format_func=lambda bucket: (
+                        f"{bucket} ({bucket_counts[bucket]:,})"
+                    ),
+                    key=f"_p2_letter_batch_buckets_{letter_field}",
+                    help=(
+                        "Choose one or more first-character buckets. Email "
+                        "buckets use the local-part before @."
+                    ),
+                )
+
+            size_col, action_col = st.columns([2, 3])
+            with size_col:
+                letter_batch_size = st.number_input(
+                    "Maximum users in this letter batch",
+                    min_value=1,
+                    value=get_env_batch_size(),
+                    step=10,
+                    key="_p2_letter_batch_size",
+                    help=(
+                        "Large letter or digit groups are split into manageable "
+                        "batches. Already completed users are skipped."
+                    ),
+                )
+            matching_count = sum(
+                bucket_counts.get(bucket, 0) for bucket in selected_buckets
+            )
+            with action_col:
+                st.write("")
+                st.caption(
+                    f"{matching_count:,} user(s) match the selected buckets "
+                    "within the active filters."
+                )
+                if st.button(
+                    "Select Letter Batch",
+                    type="primary",
+                    disabled=not selected_buckets,
+                    key="_p2_select_letter_batch",
+                ):
+                    try:
+                        already_migrated = _get_already_migrated_emails()
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                        st.stop()
+                    new_selection = select_user_letter_batch(
+                        letter_records,
+                        field=letter_field,
+                        buckets=selected_buckets,
+                        limit=int(letter_batch_size),
+                        excluded_emails=already_migrated,
+                    )
+                    _queue_bulk_user_selection(new_selection)
+                    if new_selection:
+                        st.session_state["_p2_bulk_selection_notice"] = (
+                            f"Selected {len(new_selection)} user"
+                            f"{'s' if len(new_selection) != 1 else ''} by "
+                            f"{letter_field} bucket."
+                        )
+                    else:
+                        st.session_state["_p2_bulk_selection_warning"] = (
+                            "No unmigrated users matched the selected buckets."
+                        )
+                    st.rerun()
+
+            st.caption(
+                "Letter matching is case-insensitive. Numeric email local-parts "
+                "are grouped by first digit and sorted numerically within each "
+                "digit bucket. Switching Email/Name does not change the current "
+                "selection until you click Select Letter Batch."
+            )
 
         with tab_paste:
             pasted = st.text_area(
