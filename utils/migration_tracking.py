@@ -6,6 +6,8 @@ import threading
 from typing import Iterable, Mapping, Optional
 
 from utils.db import ConnectionConfig, get_connection
+from utils.migration_diagnostic_store import insert_diagnostic_event
+from utils.migration_diagnostics import classify_error
 from utils.migration_steps import STEP_TARGET_DB as STEP_TARGETS
 
 
@@ -56,6 +58,24 @@ CREATE TABLE IF NOT EXISTS migration.migration_step_entities (
 
 CREATE INDEX IF NOT EXISTS idx_migration_step_entities_new_id
     ON migration.migration_step_entities(table_name, new_id);
+
+CREATE TABLE IF NOT EXISTS migration.migration_diagnostic_events (
+    id BIGSERIAL PRIMARY KEY,
+    migration_run_id UUID NOT NULL,
+    step_key VARCHAR(50),
+    shard_id UUID,
+    phase VARCHAR(40) NOT NULL,
+    severity VARCHAR(20) NOT NULL DEFAULT 'error',
+    code VARCHAR(80) NOT NULL,
+    message TEXT NOT NULL,
+    context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_migration_diagnostics_run
+    ON migration.migration_diagnostic_events(migration_run_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_migration_diagnostics_step
+    ON migration.migration_diagnostic_events(migration_run_id, step_key);
 """
 
 # Durable job/shard queue. Lives in whichever database a step's shards
@@ -565,6 +585,19 @@ def update_local_run(
                     """,
                     (status, status, run_id),
                 )
+                if error_message and status in {"failed", "partial"}:
+                    classification = classify_error(
+                        error_message,
+                        phase="extraction",
+                    )
+                    insert_diagnostic_event(
+                        cursor,
+                        run_id,
+                        phase="extraction",
+                        code=classification["code"],
+                        message=error_message,
+                        context={"run_status": status},
+                    )
     finally:
         conn.close()
 
@@ -789,6 +822,7 @@ def record_step_result(
     owner_emails: Optional[Iterable[str]] = None,
 ) -> None:
     """Store the local fact and update the canonical per-user summary."""
+    scoped_owner_emails = list(owner_emails) if owner_emails else None
     target = config_for_database(base_config, target_database)
     ensure_tracking_schema(target)
     conn = get_connection(target)
@@ -829,6 +863,27 @@ def record_step_result(
                 """,
                 ("running" if success else "partial", error_message, run_id),
             )
+            if not success and error_message:
+                classification = classify_error(
+                    error_message,
+                    phase="step",
+                    step_key=step_key,
+                )
+                insert_diagnostic_event(
+                    cursor,
+                    run_id,
+                    phase="step_verify",
+                    code=classification["code"],
+                    message=error_message,
+                    step_key=step_key,
+                    context={
+                        "target_database": target_database,
+                        "affected_count": affected_count,
+                        "owner_emails": scoped_owner_emails or [],
+                        "verification_details": dict(verification_details or {}),
+                        **classification.get("facts", {}),
+                    },
+                )
     finally:
         conn.close()
 
@@ -839,7 +894,7 @@ def record_step_result(
         conn.autocommit = True
         with conn.cursor() as cursor:
             step_value = "success" if success else "failed"
-            scoped_emails = list(owner_emails) if owner_emails else None
+            scoped_emails = scoped_owner_emails
             cursor.execute(
                 """
                 UPDATE migration.migration_user_results
@@ -920,7 +975,7 @@ def record_step_result(
             success,
             affected_count,
             error_message,
-            owner_emails,
+            scoped_owner_emails,
         )
 
 

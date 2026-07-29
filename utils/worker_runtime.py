@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from utils.db import ConnectionConfig, get_connection
+from utils.migration_diagnostics import exception_context
 from utils.migration_steps import STEP_TARGET_DB, normalize_step_key
 from utils.migration_tracking import (
     config_for_database,
@@ -252,6 +253,7 @@ def _fail_claimed_shard(
     worker_id: str,
     error: str,
     source_config: Optional[ConnectionConfig],
+    diagnostic_context: Optional[dict] = None,
 ) -> None:
     status = fail_shard(
         base_config,
@@ -259,6 +261,7 @@ def _fail_claimed_shard(
         claimed.id,
         worker_id,
         error,
+        diagnostic_context=diagnostic_context,
     )
     if status == "failed":
         _record_terminal_failure(base_config, claimed, error, source_config)
@@ -366,7 +369,12 @@ def execute_claimed_shard(
         error = str(exc)
         logger.error("Shard %s failed: %s", claimed.file_path, error)
         _fail_claimed_shard(
-            base_config, claimed, worker_id, error, source_config
+            base_config,
+            claimed,
+            worker_id,
+            error,
+            source_config,
+            diagnostic_context=exception_context(exc),
         )
         return ShardOutcome(claimed.id, claimed.step_key, False, 0, error)
     finally:

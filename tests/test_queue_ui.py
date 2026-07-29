@@ -8,6 +8,7 @@ import pytest
 
 from utils import shard_queue
 from utils.db import ConnectionConfig
+from utils.migration_diagnostic_store import list_diagnostic_events
 from utils.migration_tracking import config_for_database, ensure_tracking_schema
 from utils.queue_ui import (
     enqueue_step,
@@ -197,6 +198,14 @@ def test_resume_run_requeues_failed_shards_for_workers(
     assert len(details) == 1
     assert details[0]["error_message"] == "boom"
     assert details[0]["step_key"] == "01_users"
+    events = list_diagnostic_events(
+        config_for_database(postgres_cluster, "user_db"),
+        run_id,
+    )
+    assert len(events) == 3
+    assert {event["code"] for event in events} == {"SHARD_FAILED"}
+    assert events[-1]["context"]["status"] == "failed"
+    assert events[-1]["context"]["attempt"] == 3
 
     resumed = resume_run(postgres_cluster, run_id)
     assert resumed == 1

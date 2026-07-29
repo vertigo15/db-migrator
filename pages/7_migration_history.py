@@ -4,11 +4,22 @@ Page 7: Migration History
 Displays migration batch history and per-user results with per-step details,
 CSV export, and the ability to re-run failed users.
 """
+import json
+
 import streamlit as st
 import pandas as pd
 
 from utils.db import ConnectionConfig, execute_query
 from utils.config import get_env_target_defaults
+from utils.migration_diagnostic_store import (
+    list_diagnostic_events,
+    record_diagnostic_event,
+)
+from utils.migration_diagnostics import (
+    build_history_issues,
+    build_support_report,
+    classify_error,
+)
 from utils.migration_tracking import (
     TARGET_DATABASES,
     config_for_database,
@@ -130,6 +141,27 @@ def _cached_distributed_steps(
     return _load_distributed_steps(config, migration_run_id)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_diagnostic_events(
+    host, port, database, username, password, migration_run_id, refresh_token
+) -> list:
+    config = _config_from_cache_args(host, port, database, username, password)
+    events = []
+    for target_database in TARGET_DATABASES:
+        try:
+            database_events = list_diagnostic_events(
+                config_for_database(config, target_database),
+                migration_run_id,
+            )
+            for event in database_events:
+                event["target_database"] = target_database
+            events.extend(database_events)
+        except Exception:
+            # Older databases may not have the additive diagnostics table yet.
+            continue
+    return sorted(events, key=lambda event: str(event.get("created_at") or ""))
+
+
 def _cache_args(config: ConnectionConfig):
     return (
         config.host,
@@ -163,8 +195,15 @@ def _load_user_results(config: ConnectionConfig, batch_id: str = None) -> pd.Dat
         query = """
             SELECT r.email, r.result, r.failed_step, r.error_message,
                    r.legacy_user_id, r.v5_user_id, r.user_action,
-                   r.steps_completed, r.started_at, r.completed_at
+                   r.steps_completed, r.started_at, r.completed_at,
+                   m.migration_run_id::text AS mapping_owner_run,
+                   m.record_action AS mapping_action,
+                   (mapped_user.id IS NOT NULL) AS mapped_target_exists
             FROM migration.migration_user_results r
+            LEFT JOIN migration.id_mappings m
+              ON m.table_name = 'users'
+             AND m.old_id = r.legacy_user_id
+            LEFT JOIN public.users mapped_user ON mapped_user.id = m.new_id
             WHERE r.batch_id = %s
             ORDER BY r.email
         """
@@ -177,9 +216,16 @@ def _load_user_results(config: ConnectionConfig, batch_id: str = None) -> pd.Dat
             SELECT r.email, r.result, r.failed_step, r.error_message,
                    r.legacy_user_id, r.v5_user_id, r.user_action,
                    r.steps_completed, r.started_at, r.completed_at,
-                   b.started_at AS batch_started, b.id AS batch_id
+                   b.started_at AS batch_started, b.id AS batch_id,
+                   m.migration_run_id::text AS mapping_owner_run,
+                   m.record_action AS mapping_action,
+                   (mapped_user.id IS NOT NULL) AS mapped_target_exists
             FROM migration.migration_user_results r
             JOIN migration.migration_batches b ON r.batch_id = b.id
+            LEFT JOIN migration.id_mappings m
+              ON m.table_name = 'users'
+             AND m.old_id = r.legacy_user_id
+            LEFT JOIN public.users mapped_user ON mapped_user.id = m.new_id
             ORDER BY r.started_at DESC
             LIMIT 500
         """
@@ -350,7 +396,111 @@ def render_batch_overview(base_config, batch_row, step_statuses):
     st.caption(f"Batch ID: `{batch_row['id']}`")
 
 
-def render_shard_queue_status(base_config, batch_id: str):
+def _dataframe_records(frame: pd.DataFrame) -> list:
+    if frame.empty:
+        return []
+    normalized = frame.astype(object).where(pd.notna(frame), None)
+    return normalized.to_dict("records")
+
+
+def render_problem_diagnostics(
+    batch_id: str,
+    batch_status: str,
+    step_results: pd.DataFrame,
+    user_results: pd.DataFrame,
+    failures: list,
+    events: list,
+) -> None:
+    """Render actionable, plain-language explanations for a selected run."""
+    issues = build_history_issues(
+        batch_id,
+        step_rows=_dataframe_records(step_results),
+        shard_rows=failures,
+        user_rows=_dataframe_records(user_results),
+        event_rows=events,
+        run_status=batch_status,
+    )
+    if not issues:
+        return
+
+    st.markdown("#### 🧭 Problems & guidance")
+    st.error(
+        f"{len(issues)} problem{'s' if len(issues) != 1 else ''} need attention. "
+        "The explanations below are built from migration tracking data; no manual "
+        "database queries are required."
+    )
+
+    for issue in issues:
+        with st.container(border=True):
+            step_label = (
+                STEP_LABELS.get(issue.step_key, issue.step_key)
+                if issue.step_key
+                else "Migration run"
+            )
+            st.markdown(f"**❌ {step_label}: {issue.title}**")
+            st.write(issue.cause)
+            st.markdown(f"**Recommended next step:** {issue.recommendation}")
+            if issue.summary:
+                displayed_error = (
+                    issue.summary
+                    if len(issue.summary) <= 500
+                    else issue.summary[:497] + "..."
+                )
+                st.caption(f"Recorded error: {displayed_error}")
+            st.caption(f"Diagnostic code: `{issue.code}`")
+
+            affected_key = f"hist_diag_users_{batch_id}_{issue.key}"
+            technical_key = f"hist_diag_technical_{batch_id}_{issue.key}"
+            users_col, technical_col, _ = st.columns([1.2, 1.2, 3])
+            with users_col:
+                if st.button(
+                    f"👥 Affected users ({len(issue.affected_users)})",
+                    key=f"{affected_key}_button",
+                    disabled=not issue.affected_users,
+                    use_container_width=True,
+                ):
+                    st.session_state[affected_key] = not st.session_state.get(
+                        affected_key, False
+                    )
+            with technical_col:
+                if st.button(
+                    "🔧 Technical details",
+                    key=f"{technical_key}_button",
+                    use_container_width=True,
+                ):
+                    st.session_state[technical_key] = not st.session_state.get(
+                        technical_key, False
+                    )
+
+            if st.session_state.get(affected_key):
+                st.code("\n".join(issue.affected_users), language=None)
+            if st.session_state.get(technical_key):
+                st.json(
+                    json.loads(
+                        json.dumps(
+                            issue.technical_details,
+                            default=str,
+                            ensure_ascii=False,
+                        )
+                    ),
+                    expanded=False,
+                )
+
+    st.download_button(
+        "📥 Download complete diagnostic report",
+        data=build_support_report(batch_id, issues, events=events),
+        file_name=f"migration-diagnostics-{batch_id}.json",
+        mime="application/json",
+        key=f"hist_download_diagnostics_{batch_id}",
+        help=(
+            "Contains error codes, original errors, counts, affected users, shard "
+            "attempts, mapping evidence, and database diagnostics. Passwords are "
+            "never included."
+        ),
+    )
+
+
+def render_shard_queue_status(base_config, batch_id: str, failures=None):
     """Queued/running/failed/cancelled shard state for the background workers.
 
     Read-only progress plus cancel/resume controls; actually executing
@@ -392,7 +542,11 @@ def render_shard_queue_status(base_config, batch_id: str):
                 )
             )
 
-    failures = failed_shard_details(base_config, batch_id)
+    failures = (
+        failed_shard_details(base_config, batch_id)
+        if failures is None
+        else failures
+    )
     if failures:
         with st.expander(
             f"Failed shard diagnostics ({len(failures)})",
@@ -601,6 +755,28 @@ def render_rollback_panel(base_config, batch_row, step_statuses):
                 force=force,
             )
 
+        if not success:
+            try:
+                classification = classify_error(message, phase="rollback")
+                record_diagnostic_event(
+                    config_for_database(base_config, "user_db"),
+                    batch_id,
+                    phase="rollback",
+                    code=classification["code"],
+                    message=message,
+                    severity="error",
+                    context={
+                        "scope": target_kind,
+                        "target": target_value,
+                        "force": force,
+                        "details": details,
+                    },
+                )
+            except Exception:
+                # The rollback result remains visible even if diagnostics cannot
+                # be persisted (for example, during a database outage).
+                pass
+
         st.session_state["hist_rollback_result"] = {
             "success": success,
             "message": message,
@@ -659,7 +835,14 @@ def render_user_results(config, batch_id, step_results):
             display_df["email"].str.contains(email_search, case=False, na=False)
         ]
 
-    display_df = _expand_steps_columns(display_df.copy())
+    display_df = _expand_steps_columns(display_df.copy()).drop(
+        columns=[
+            "mapping_owner_run",
+            "mapping_action",
+            "mapped_target_exists",
+        ],
+        errors="ignore",
+    )
 
     step_col_config = {}
     for step in STEP_KEYS:
@@ -800,6 +983,17 @@ def main():
         if not step_results.empty
         else {}
     )
+    selected_user_results = _cached_user_results(
+        *_cache_args(config)[:-1],
+        str(selected_batch),
+        _cache_args(config)[-1],
+    )
+    diagnostic_events = _cached_diagnostic_events(
+        *step_cache_args[:-1],
+        str(selected_batch),
+        step_cache_args[-1],
+    )
+    shard_failures = failed_shard_details(base_config, str(selected_batch))
 
     # ── Selected batch: overview + rollback, side by side ─────────────────
     overview_col, rollback_col = st.columns([1.15, 1], gap="large")
@@ -809,8 +1003,21 @@ def main():
     with rollback_col:
         render_rollback_panel(base_config, batch_row, step_statuses)
 
+    render_problem_diagnostics(
+        str(selected_batch),
+        str(batch_row.get("status") or ""),
+        step_results,
+        selected_user_results,
+        shard_failures,
+        diagnostic_events,
+    )
+
     st.markdown("---")
-    render_shard_queue_status(base_config, str(selected_batch))
+    render_shard_queue_status(
+        base_config,
+        str(selected_batch),
+        failures=shard_failures,
+    )
     st.markdown("---")
 
     # ── Per-user results for the selected batch ───────────────────────────

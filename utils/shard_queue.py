@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence
 
 from utils.db import ConnectionConfig, get_connection
+from utils.migration_diagnostic_store import insert_diagnostic_event
+from utils.migration_diagnostics import classify_error
 from utils.migration_steps import (
     STEP_INDEX,
     STEP_TARGET_DB,
@@ -411,6 +413,7 @@ def fail_shard(
     shard_id: str,
     worker_id: str,
     error_message: str,
+    diagnostic_context: Optional[Mapping[str, object]] = None,
 ) -> str:
     """Record a shard failure. Returns 'retrying' or 'failed' (terminal)."""
     config = config_for_database(base_config, target_database)
@@ -426,11 +429,38 @@ def fail_shard(
                     lease_expires_at = NULL,
                     owner = NULL
                 WHERE id = %s AND owner = %s AND status = 'running'
-                RETURNING status
+                RETURNING status, migration_run_id, step_key, attempts,
+                          max_attempts, file_path, owner_emails
                 """,
                 (error_message[:2000] if error_message else None, shard_id, worker_id),
             )
             row = cursor.fetchone()
+            if row and error_message:
+                classification = classify_error(
+                    error_message,
+                    phase="shard",
+                    step_key=row[2],
+                )
+                insert_diagnostic_event(
+                    cursor,
+                    str(row[1]),
+                    phase="shard_execute",
+                    code=classification["code"],
+                    message=error_message,
+                    step_key=row[2],
+                    shard_id=shard_id,
+                    context={
+                        "target_database": target_database,
+                        "status": row[0],
+                        "attempt": row[3],
+                        "max_attempts": row[4],
+                        "file_path": row[5],
+                        "owner_emails": list(row[6] or []),
+                        "worker_id": worker_id,
+                        **classification.get("facts", {}),
+                        **dict(diagnostic_context or {}),
+                    },
+                )
             return row[0] if row else "unknown"
     finally:
         conn.close()
@@ -453,10 +483,32 @@ def recover_stale_leases(base_config: ConnectionConfig, target_database: str) ->
                 WHERE target_database = %s
                   AND status = 'running'
                   AND lease_expires_at < now()
+                RETURNING migration_run_id, step_key, id, status, attempts,
+                          max_attempts, file_path, owner_emails
                 """,
                 (target_database,),
             )
-            return cursor.rowcount
+            recovered = cursor.fetchall()
+            for row in recovered:
+                insert_diagnostic_event(
+                    cursor,
+                    str(row[0]),
+                    phase="worker_lease",
+                    code="SHARD_STALE_LEASE",
+                    message="Worker lease expired before the shard completed.",
+                    step_key=row[1],
+                    shard_id=str(row[2]),
+                    severity="warning" if row[3] == "retrying" else "error",
+                    context={
+                        "target_database": target_database,
+                        "status": row[3],
+                        "attempt": row[4],
+                        "max_attempts": row[5],
+                        "file_path": row[6],
+                        "owner_emails": list(row[7] or []),
+                    },
+                )
+            return len(recovered)
     finally:
         conn.close()
 
@@ -686,7 +738,8 @@ def get_failed_shard_details(
                     """
                     SELECT id, step_key, shard_index, total_shards, file_path,
                            status, attempts, max_attempts, error_message,
-                           owner_emails
+                           owner_emails, expected_rows, driver_rowcount,
+                           started_at, completed_at
                     FROM migration.migration_shards
                     WHERE migration_run_id = %s::uuid
                       AND status IN ('failed', 'retrying')
@@ -709,6 +762,10 @@ def get_failed_shard_details(
                             "max_attempts": row[7],
                             "error_message": row[8],
                             "owner_emails": list(row[9] or []),
+                            "expected_rows": row[10],
+                            "driver_rowcount": row[11],
+                            "started_at": row[12],
+                            "completed_at": row[13],
                         }
                     )
         finally:

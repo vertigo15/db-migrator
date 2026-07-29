@@ -9,6 +9,7 @@ import pytest
 
 from utils import shard_queue
 from utils.db import ConnectionConfig
+from utils.migration_diagnostic_store import list_diagnostic_events
 from utils.migration_tracking import config_for_database, ensure_tracking_schema
 from utils.shard_queue import (
     cancel_run_shards,
@@ -380,6 +381,13 @@ def test_stale_lease_is_recovered_for_retry(postgres_cluster):
     # only while it still owns the shard, and recovery should reclaim it once expired.
     recovered = recover_stale_leases(postgres_cluster, "user_db")
     assert recovered == 1
+    events = list_diagnostic_events(
+        config_for_database(postgres_cluster, "user_db"),
+        run_id,
+    )
+    assert len(events) == 1
+    assert events[0]["code"] == "SHARD_STALE_LEASE"
+    assert events[0]["severity"] == "warning"
 
     claimed_again = claim_shard(postgres_cluster, "user_db", worker_id="worker-b")
     assert claimed_again is not None
