@@ -325,7 +325,10 @@ def test_agent_stale_refs_drop_and_cross_owner_content_is_reassigned(monkeypatch
     assert report["reassigned_folder_ids"] == ["99"]
 
 
-def test_cross_owner_agent_dependency_blocks_by_default(monkeypatch, tmp_path):
+def test_cross_owner_agent_dependency_is_dropped_by_default(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.setattr(
         "utils.extraction.execute_query",
         lambda _config, query, _params=None: (
@@ -366,14 +369,103 @@ def test_cross_owner_agent_dependency_blocks_by_default(monkeypatch, tmp_path):
     agents.at[0, "chosen_docs_folders"] = []
     agents.at[0, "folder_id"] = None
 
-    with pytest.raises(ValueError, match="outside the selected batch"):
-        engine._topup_agent_documents(
-            agents,
-            pd.DataFrame(columns=["doc_id", "owner_id"]),
-            pd.DataFrame(columns=["metadata"]),
-            pd.DataFrame(columns=["id", "owner_id"]),
-            selected_user_ids=["owner-1"],
-        )
+    docs, _, _, report = engine._topup_agent_documents(
+        agents,
+        pd.DataFrame(columns=["doc_id", "owner_id"]),
+        pd.DataFrame(columns=["metadata"]),
+        pd.DataFrame(columns=["id", "owner_id"]),
+        selected_user_ids=["owner-1"],
+    )
+
+    assert docs.empty
+    assert agents.iloc[0]["docs_chosen"] == []
+    assert report["dropped_cross_owner_doc_ids"] == ["cross-doc"]
+    assert "cross-doc" in report["removed_doc_ids"]
+
+
+def test_owned_only_strips_existing_cross_owner_agent_references(tmp_path):
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path),
+        generate_sql=False,
+        export_csv=False,
+    )
+    agents = pd.DataFrame([{
+        "bot_id": "bot-1",
+        "user_id": "owner-1",
+        "docs_chosen": ["cross-doc"],
+        "chosen_docs_folders": [99],
+        "folder_id": 99,
+    }])
+
+    docs, embeddings, folders, report = engine._topup_agent_documents(
+        agents,
+        pd.DataFrame([{
+            "doc_id": "cross-doc",
+            "owner_id": "owner-2",
+            "folder_id": 99,
+        }]),
+        pd.DataFrame(columns=["metadata"]),
+        pd.DataFrame([{
+            "id": 99,
+            "owner_id": "owner-2",
+            "parent_id": None,
+        }]),
+        selected_user_ids=["owner-1"],
+    )
+
+    assert docs.empty
+    assert embeddings.empty
+    assert folders.empty
+    assert agents.iloc[0]["docs_chosen"] == []
+    assert agents.iloc[0]["chosen_docs_folders"] == []
+    assert pd.isna(agents.iloc[0]["folder_id"])
+    assert report["dropped_cross_owner_doc_ids"] == ["cross-doc"]
+    assert report["dropped_cross_owner_folder_ids"] == ["99"]
+
+
+def test_agent_csv_is_written_after_owned_only_sanitization(
+    monkeypatch,
+    tmp_path,
+):
+    def fake_query(_config, query, _params=None):
+        if "playground_bot_generator_config" in query:
+            return pd.DataFrame([{
+                "bot_id": "bot-1",
+                "user_id": "owner-1",
+                "docs_chosen": ["cross-doc"],
+                "chosen_docs_folders": [],
+                "folder_id": None,
+            }])
+        if "custom_documents" in query:
+            return pd.DataFrame([{
+                "doc_id": "cross-doc",
+                "owner_id": "owner-2",
+                "blob_source": None,
+            }])
+        raise AssertionError(query)
+
+    monkeypatch.setattr("utils.extraction.execute_query", fake_query)
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path),
+        generate_sql=False,
+        export_csv=True,
+        include_chunkless_documents=True,
+    )
+
+    agents, csv_path = engine.extract_agents(
+        ["owner-1"],
+        docs_df=pd.DataFrame(columns=["doc_id", "owner_id"]),
+        folders_df=pd.DataFrame(columns=["id", "owner_id"]),
+        embeddings_df=pd.DataFrame(columns=["metadata"]),
+    )
+
+    assert agents.iloc[0]["docs_chosen"] == []
+    with open(csv_path, encoding="utf-8") as handle:
+        assert "cross-doc" not in handle.read()
 
 
 def test_chunkless_agent_document_is_excluded_and_reference_removed(
@@ -522,8 +614,35 @@ def test_document_extraction_enforces_sharepoint_exclusion(monkeypatch, tmp_path
     )
 
     assert "COALESCE(blob_source, '') <> %s" in captured["query"]
+    assert "owner_id IN" in captured["query"]
     assert captured["params"][0] == "application_sharepoint"
     assert "sharepoint-doc" in captured["params"]
+    assert "owner-1" in captured["params"]
+
+
+def test_owned_document_is_detached_from_unmigrated_folder(tmp_path):
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path),
+        generate_sql=False,
+        export_csv=False,
+    )
+
+    documents, detached = engine._detach_unmigrated_document_folders(
+        pd.DataFrame([{
+            "doc_id": "owned-doc",
+            "owner_id": "owner-1",
+            "folder_id": 99,
+        }]),
+        pd.DataFrame([{
+            "id": 1,
+            "owner_id": "owner-1",
+        }]),
+    )
+
+    assert pd.isna(documents.iloc[0]["folder_id"])
+    assert detached == ["owned-doc"]
 
 
 def test_full_extraction_excludes_selected_chunkless_document(
@@ -625,6 +744,8 @@ def test_documents_start_pending_and_step_four_reconciles_readiness(tmp_path):
     assert "'PENDING'::public.document_processing_status_enum" in document_sql
     assert "migration_run_id" in document_sql
     assert "record_action" in document_sql
+    assert "mapped.user_id = v_user_id" in document_sql
+    assert "Canonical document owner mismatch" in document_sql
 
     chunks = pd.DataFrame([{
         "id": "chunk-1",
@@ -832,6 +953,49 @@ def test_folder_ancestor_closure_fetches_and_reassigns_parent(monkeypatch, tmp_p
     assert set(result["id"].astype(str)) == {"1", "2"}
     assert result.loc[result["id"] == 2, "owner_id"].iloc[0] == "selected-owner"
     assert engine._folder_hierarchy_report["reassigned_ancestor_ids"] == ["2"]
+
+
+def test_folder_ancestor_owned_by_other_user_is_detached_by_default(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        "utils.extraction.execute_query",
+        lambda _config, query, params=None: pd.DataFrame([{
+            "id": 2,
+            "folder_name": "shared-parent",
+            "owner_id": "other-owner",
+            "parent_id": None,
+            "created_at": None,
+            "folder_type": "default",
+        }]),
+    )
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path),
+        generate_sql=False,
+        export_csv=False,
+    )
+
+    result = engine._resolve_folder_ancestor_closure(
+        pd.DataFrame([{
+            "id": 1,
+            "folder_name": "owned-child",
+            "owner_id": "selected-owner",
+            "parent_id": 2,
+            "created_at": None,
+            "folder_type": "default",
+        }]),
+        ["selected-owner"],
+    )
+
+    assert result["id"].astype(str).tolist() == ["1"]
+    assert pd.isna(result.iloc[0]["parent_id"])
+    assert engine._folder_hierarchy_report["detached_folder_ids"] == ["1"]
+    assert engine._folder_hierarchy_report[
+        "dropped_cross_owner_parent_ids"
+    ] == ["2"]
 
 
 def test_missing_folder_parent_is_detached_and_reported(monkeypatch, tmp_path):

@@ -116,8 +116,56 @@ def classify_error(
                 "an invalid hierarchy."
             ),
             "recommendation": (
-                "Include the parent folder's owner in the batch, or enable the "
-                "cross-owner dependency reassignment option and create a fresh batch."
+                "Create a fresh owned-data-only batch. Parents owned by another "
+                "user will be excluded and the selected user's child folder will "
+                "be migrated as a root folder."
+            ),
+            "facts": count_facts,
+        }
+
+    if "canonical folder owner mismatch" in lower:
+        return {
+            "code": "CANONICAL_FOLDER_OWNER_MISMATCH",
+            "title": "An older migration mapped this folder to another user",
+            "cause": (
+                "The V4 folder is owned by the selected user, but its existing "
+                "canonical V5 mapping points to a live folder owned by someone "
+                "else. This is commonly left by an older cross-owner reassign run."
+            ),
+            "recommendation": (
+                "Do not resume this shard. Roll back or clean the older shared "
+                "copy and mapping, then create a fresh owned-data-only batch."
+            ),
+            "facts": count_facts,
+        }
+
+    if "canonical document owner mismatch" in lower:
+        return {
+            "code": "CANONICAL_DOCUMENT_OWNER_MISMATCH",
+            "title": "An older migration mapped this document to another user",
+            "cause": (
+                "The V4 document is owned by the selected user, but its existing "
+                "canonical V5 mapping points to a live document owned by someone "
+                "else. This is commonly left by an older cross-owner reassign run."
+            ),
+            "recommendation": (
+                "Do not resume this shard. Roll back or clean the older shared "
+                "copy and mapping, then create a fresh owned-data-only batch."
+            ),
+            "facts": count_facts,
+        }
+
+    if "owned-data preflight found" in lower:
+        return {
+            "code": "OWNERSHIP_PREFLIGHT_CONFLICT",
+            "title": "Older shared copies conflict with owned data",
+            "cause": (
+                "One or more existing V5 mappings point to entities owned by a "
+                "different user than their authoritative V4 owner."
+            ),
+            "recommendation": (
+                "Clean or roll back the listed older mapping-owner runs, then "
+                "create a fresh batch. No migration shards ran for this attempt."
             ),
             "facts": count_facts,
         }

@@ -259,7 +259,7 @@ class ExtractionEngine:
         target_embedding_dim: Optional[int] = None,
         user_id_overrides: Optional[Dict[str, str]] = None,
         migration_run_id: Optional[str] = None,
-        cross_owner_policy: str = "block",
+        cross_owner_policy: str = "owned_only",
         include_chunkless_documents: bool = False,
     ):
         """
@@ -293,8 +293,10 @@ class ExtractionEngine:
         self.target_embedding_dim = target_embedding_dim
         self.user_id_overrides = user_id_overrides or {}
         self.migration_run_id = migration_run_id or str(uuid.uuid4())
-        if cross_owner_policy not in {"block", "reassign"}:
-            raise ValueError("cross_owner_policy must be 'block' or 'reassign'")
+        if cross_owner_policy not in {"owned_only", "block", "reassign"}:
+            raise ValueError(
+                "cross_owner_policy must be 'owned_only', 'block', or 'reassign'"
+            )
         self.cross_owner_policy = cross_owner_policy
         self.include_chunkless_documents = include_chunkless_documents
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -546,6 +548,10 @@ class ExtractionEngine:
             placeholders = ", ".join(["%s"] * len(selected_doc_ids))
             query += f" AND doc_id IN ({placeholders})"
             params.extend(selected_doc_ids)
+            if self.cross_owner_policy == "owned_only":
+                owner_placeholders = ", ".join(["%s"] * len(user_ids))
+                query += f" AND owner_id IN ({owner_placeholders})"
+                params.extend(user_ids)
         else:
             placeholders = ", ".join(["%s"] * len(user_ids))
             query += f" AND owner_id IN ({placeholders})"
@@ -723,6 +729,10 @@ class ExtractionEngine:
             placeholders = ", ".join(["%s"] * len(selected_agent_ids))
             query += f" AND bot_id IN ({placeholders})"
             params.extend(selected_agent_ids)
+            if self.cross_owner_policy == "owned_only":
+                owner_placeholders = ", ".join(["%s"] * len(user_ids))
+                query += f" AND user_id IN ({owner_placeholders})"
+                params.extend(user_ids)
         else:
             placeholders = ", ".join(["%s"] * len(user_ids))
             query += f" AND user_id IN ({placeholders})"
@@ -730,8 +740,6 @@ class ExtractionEngine:
         df = execute_query(self.config, query, tuple(params))
 
         output_path = os.path.join(self.output_dir, f"agents_{self.timestamp}.csv")
-        if self.export_csv:
-            df.to_csv(output_path, index=False)
         
         # If dependent DataFrames are supplied, run topup before generating SQL
         # so that all agent-referenced documents/folders are guaranteed to be
@@ -797,6 +805,9 @@ class ExtractionEngine:
                             raise RuntimeError(
                                 f"Failed to regenerate embeddings SQL after topup: {e}"
                             ) from e
+
+        if self.export_csv:
+            df.to_csv(output_path, index=False)
 
         # Expose topup_report for run_full_extraction to collect
         self._last_topup_report = topup_report
@@ -881,6 +892,54 @@ class ExtractionEngine:
             v = str(val).strip()
             return v if v else None
 
+    def _detach_unmigrated_document_folders(
+        self,
+        documents_df: pd.DataFrame,
+        folders_df: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, List[str]]:
+        """Detach owned documents from folders outside the migration scope."""
+        if documents_df.empty or "folder_id" not in documents_df.columns:
+            return documents_df, []
+        migrated_folder_ids = {
+            folder_id
+            for folder_id in (
+                self._normalise_folder_id(value)
+                for value in folders_df.get("id", pd.Series(dtype=object))
+            )
+            if folder_id
+        }
+        result = documents_df.copy()
+        detached = []
+        for index, row in result.iterrows():
+            folder_id = self._normalise_folder_id(row.get("folder_id"))
+            if folder_id and folder_id not in migrated_folder_ids:
+                result.at[index, "folder_id"] = None
+                detached.append(str(row.get("doc_id")))
+        return result, sorted(set(detached))
+
+    def _build_ownership_manifest(
+        self,
+        documents_df: pd.DataFrame,
+        folders_df: pd.DataFrame,
+    ) -> Dict[str, List[Dict[str, str]]]:
+        """Return the source owner expected for each planned primary entity."""
+        folders = []
+        for _, row in folders_df.iterrows():
+            old_id = self._normalise_folder_id(row.get("id"))
+            owner_id = str(row.get("owner_id") or "").strip()
+            if old_id and owner_id:
+                folders.append({"old_id": old_id, "owner_id": owner_id})
+        documents = []
+        for _, row in documents_df.iterrows():
+            old_id = str(row.get("doc_id") or "").strip()
+            owner_id = str(row.get("owner_id") or "").strip()
+            if old_id and owner_id:
+                documents.append({"old_id": old_id, "owner_id": owner_id})
+        return {
+            "folders": folders,
+            "documents": documents,
+        }
+
     def _resolve_folder_ancestor_closure(
         self,
         folders_df: pd.DataFrame,
@@ -891,6 +950,7 @@ class ExtractionEngine:
             self._folder_hierarchy_report = {
                 "added_ancestor_ids": [],
                 "reassigned_ancestor_ids": [],
+                "dropped_cross_owner_parent_ids": [],
                 "stale_parent_ids": [],
                 "detached_folder_ids": [],
             }
@@ -901,6 +961,7 @@ class ExtractionEngine:
         selected_owners = {str(value) for value in selected_user_ids}
         added: List[str] = []
         reassigned: List[str] = []
+        dropped_cross_owner_parents: List[str] = []
         stale_parents: List[str] = []
         detached_folders: List[str] = []
 
@@ -947,10 +1008,16 @@ class ExtractionEngine:
                         if folder_id:
                             detached_folders.append(folder_id)
 
+            cross_owner_parent_ids = set()
             for index, row in ancestors.iterrows():
                 folder_id = self._normalise_folder_id(row.get("id"))
                 owner_id = str(row.get("owner_id"))
                 if owner_id in selected_owners:
+                    continue
+                if self.cross_owner_policy == "owned_only":
+                    if folder_id:
+                        cross_owner_parent_ids.add(folder_id)
+                        dropped_cross_owner_parents.append(folder_id)
                     continue
                 if self.cross_owner_policy == "block":
                     raise ValueError(
@@ -968,7 +1035,26 @@ class ExtractionEngine:
                 ancestors.at[index, "owner_id"] = next(iter(candidate_owners))
                 reassigned.append(folder_id)
 
-            added.extend(sorted(fetched))
+            if cross_owner_parent_ids:
+                for index, row in result.iterrows():
+                    parent_id = self._normalise_folder_id(row.get("parent_id"))
+                    if parent_id in cross_owner_parent_ids:
+                        result.at[index, "parent_id"] = None
+                        folder_id = self._normalise_folder_id(row.get("id"))
+                        if folder_id:
+                            detached_folders.append(folder_id)
+                ancestors = ancestors[
+                    ~ancestors["id"].apply(self._normalise_folder_id).isin(
+                        cross_owner_parent_ids
+                    )
+                ].copy()
+
+            accepted_ids = {
+                self._normalise_folder_id(value)
+                for value in ancestors.get("id", [])
+            }
+            accepted_ids.discard(None)
+            added.extend(sorted(accepted_ids))
             result = pd.concat([result, ancestors], ignore_index=True)
             result = result.drop_duplicates(subset=["id"], keep="first")
 
@@ -991,6 +1077,9 @@ class ExtractionEngine:
         self._folder_hierarchy_report = {
             "added_ancestor_ids": sorted(set(added)),
             "reassigned_ancestor_ids": sorted(set(reassigned)),
+            "dropped_cross_owner_parent_ids": sorted(
+                set(dropped_cross_owner_parents)
+            ),
             "stale_parent_ids": sorted(set(stale_parents)),
             "detached_folder_ids": sorted(set(detached_folders)),
         }
@@ -1265,29 +1354,53 @@ class ExtractionEngine:
         # ------------------------------------------------------------------ #
         # 2. Topup: missing documents                                          #
         # ------------------------------------------------------------------ #
-        existing_doc_ids = set(docs_df["doc_id"].astype(str).tolist()) if len(docs_df) > 0 else set()
-        missing_doc_ids = agent_doc_ids - existing_doc_ids
         selected_set = {str(user_id) for user_id in (selected_user_ids or [])}
-
         added_doc_ids: List[str] = []
         stale_doc_ids: List[str] = []
         chunkless_doc_ids: List[str] = []
         excluded_sharepoint_doc_ids: List[str] = []
         out_of_scope_owner_doc_ids: List[str] = []
         doc_source_labels: Dict[str, str] = {}
+        known_cross_owner_doc_ids: set[str] = set()
 
         if selected_set and len(docs_df) > 0:
-            for index, doc_row in docs_df.iterrows():
-                doc_id = str(doc_row.get("doc_id"))
-                if doc_id in agent_doc_ids and str(doc_row.get("owner_id")) not in selected_set:
-                    out_of_scope_owner_doc_ids.append(doc_id)
-                    if self.cross_owner_policy == "reassign":
-                        owner = agent_owners.get(doc_to_agent.get(doc_id, ""))
-                        if not owner:
-                            raise ValueError(
-                                f"Cannot determine reassignment owner for document {doc_id}"
-                            )
-                        docs_df.at[index, "owner_id"] = owner
+            foreign_doc_mask = ~docs_df["owner_id"].astype(str).isin(selected_set)
+            foreign_doc_ids = set(
+                docs_df.loc[foreign_doc_mask, "doc_id"].astype(str).tolist()
+            )
+            known_cross_owner_doc_ids.update(foreign_doc_ids)
+            out_of_scope_owner_doc_ids.extend(
+                sorted(foreign_doc_ids & agent_doc_ids)
+            )
+            if self.cross_owner_policy == "owned_only" and foreign_doc_ids:
+                docs_df = docs_df.loc[~foreign_doc_mask].copy()
+                if "metadata" in embeddings_df.columns:
+                    embeddings_df = embeddings_df[
+                        ~embeddings_df["metadata"].apply(
+                            lambda value: str((value or {}).get("doc_id"))
+                            in foreign_doc_ids
+                            if isinstance(value, dict)
+                            else False
+                        )
+                    ].copy()
+            elif self.cross_owner_policy == "reassign":
+                for index, doc_row in docs_df.loc[foreign_doc_mask].iterrows():
+                    doc_id = str(doc_row.get("doc_id"))
+                    owner = agent_owners.get(doc_to_agent.get(doc_id, ""))
+                    if not owner:
+                        raise ValueError(
+                            f"Cannot determine reassignment owner for document {doc_id}"
+                        )
+                    docs_df.at[index, "owner_id"] = owner
+
+        existing_doc_ids = (
+            set(docs_df["doc_id"].astype(str).tolist())
+            if len(docs_df) > 0
+            else set()
+        )
+        missing_doc_ids = (
+            agent_doc_ids - existing_doc_ids - known_cross_owner_doc_ids
+        )
 
         if missing_doc_ids:
             print(f"[topup] Fetching {len(missing_doc_ids)} agent-referenced document(s) not in selection...")
@@ -1308,6 +1421,33 @@ class ExtractionEngine:
                 if len(new_docs_df) > 0
                 else set()
             )
+            if selected_set and len(new_docs_df) > 0:
+                foreign_new_doc_mask = ~new_docs_df["owner_id"].astype(str).isin(
+                    selected_set
+                )
+                out_of_scope_owner_doc_ids.extend(
+                    new_docs_df.loc[
+                        foreign_new_doc_mask, "doc_id"
+                    ].astype(str).tolist()
+                )
+                out_of_scope_owner_doc_ids = sorted(
+                    set(out_of_scope_owner_doc_ids)
+                )
+                if self.cross_owner_policy == "owned_only":
+                    new_docs_df = new_docs_df.loc[~foreign_new_doc_mask].copy()
+                elif self.cross_owner_policy == "reassign":
+                    for index, doc_row in new_docs_df.loc[
+                        foreign_new_doc_mask
+                    ].iterrows():
+                        doc_id = str(doc_row["doc_id"])
+                        owner = agent_owners.get(doc_to_agent.get(doc_id, ""))
+                        if not owner:
+                            raise ValueError(
+                                "Cannot determine reassignment owner for "
+                                f"document {doc_id}"
+                            )
+                        new_docs_df.at[index, "owner_id"] = owner
+
             if len(new_docs_df) > 0:
                 sharepoint_mask = (
                     new_docs_df["blob_source"].fillna("")
@@ -1323,24 +1463,6 @@ class ExtractionEngine:
                 else set()
             )
             stale_doc_ids = list(missing_doc_ids - source_found_ids)
-            if selected_set and len(new_docs_df) > 0:
-                out_of_scope_owner_doc_ids.extend(
-                    str(row["doc_id"])
-                    for _, row in new_docs_df.iterrows()
-                    if str(row.get("owner_id")) not in selected_set
-                )
-                out_of_scope_owner_doc_ids = sorted(set(out_of_scope_owner_doc_ids))
-                if self.cross_owner_policy == "reassign" and out_of_scope_owner_doc_ids:
-                    for index, doc_row in new_docs_df.iterrows():
-                        doc_id = str(doc_row["doc_id"])
-                        if doc_id not in out_of_scope_owner_doc_ids:
-                            continue
-                        owner = agent_owners.get(doc_to_agent.get(doc_id, ""))
-                        if not owner:
-                            raise ValueError(
-                                f"Cannot determine reassignment owner for document {doc_id}"
-                            )
-                        new_docs_df.at[index, "owner_id"] = owner
 
             if len(new_docs_df) == 0:
                 print(
@@ -1406,30 +1528,53 @@ class ExtractionEngine:
         # ------------------------------------------------------------------ #
         # 3. Topup: missing folders (with recursive ancestor resolution)       #
         # ------------------------------------------------------------------ #
+        added_folder_ids: List[str] = []
+        stale_folder_ids: List[str] = []
+        out_of_scope_owner_folder_ids: List[str] = []
+        detached_topup_folder_ids: List[str] = []
+        all_new_folder_rows: List[pd.DataFrame] = []
+        known_cross_owner_folder_ids: set[str] = set()
+        if selected_set and len(folders_df) > 0:
+            foreign_folder_mask = ~folders_df["owner_id"].astype(str).isin(
+                selected_set
+            )
+            foreign_folder_ids = {
+                folder_id
+                for folder_id in (
+                    self._normalise_folder_id(value)
+                    for value in folders_df.loc[foreign_folder_mask, "id"]
+                )
+                if folder_id
+            }
+            known_cross_owner_folder_ids.update(foreign_folder_ids)
+            out_of_scope_owner_folder_ids.extend(
+                sorted(foreign_folder_ids & agent_folder_ids)
+            )
+            if self.cross_owner_policy == "owned_only" and foreign_folder_ids:
+                folders_df = folders_df.loc[~foreign_folder_mask].copy()
+            elif self.cross_owner_policy == "reassign":
+                for index, folder_row in folders_df.loc[
+                    foreign_folder_mask
+                ].iterrows():
+                    folder_id = self._normalise_folder_id(folder_row.get("id"))
+                    owner = agent_owners.get(
+                        folder_to_agent.get(folder_id or "", "")
+                    )
+                    if not owner:
+                        raise ValueError(
+                            f"Cannot determine reassignment owner for folder {folder_id}"
+                        )
+                    folders_df.at[index, "owner_id"] = owner
+
         existing_folder_ids = (
             set(folders_df["id"].apply(self._normalise_folder_id).dropna().tolist())
             if len(folders_df) > 0 else set()
         )
-        missing_folder_ids = agent_folder_ids - existing_folder_ids
-        added_folder_ids: List[str] = []
-        stale_folder_ids: List[str] = []
-        out_of_scope_owner_folder_ids: List[str] = []
-        all_new_folder_rows: List[pd.DataFrame] = []
-        if selected_set and len(folders_df) > 0:
-            for index, folder_row in folders_df.iterrows():
-                folder_id = self._normalise_folder_id(folder_row.get("id"))
-                if (
-                    folder_id in agent_folder_ids
-                    and str(folder_row.get("owner_id")) not in selected_set
-                ):
-                    out_of_scope_owner_folder_ids.append(folder_id)
-                    if self.cross_owner_policy == "reassign":
-                        owner = agent_owners.get(folder_to_agent.get(folder_id, ""))
-                        if not owner:
-                            raise ValueError(
-                                f"Cannot determine reassignment owner for folder {folder_id}"
-                            )
-                        folders_df.at[index, "owner_id"] = owner
+        missing_folder_ids = (
+            agent_folder_ids
+            - existing_folder_ids
+            - known_cross_owner_folder_ids
+        )
 
         if missing_folder_ids:
             print(f"[topup] Fetching {len(missing_folder_ids)} agent-referenced folder(s) not in selection "
@@ -1452,24 +1597,38 @@ class ExtractionEngine:
                     stale_folder_ids.extend(list(to_fetch - known_ids))
                     break
 
-                all_new_folder_rows.append(batch_df)
                 fetched_ids = set(batch_df["id"].apply(self._normalise_folder_id).dropna().tolist())
                 # Any of to_fetch not returned are stale
                 stale_folder_ids.extend(list(to_fetch - fetched_ids - known_ids))
                 known_ids.update(fetched_ids)
 
                 # Check out-of-scope owners
-                if selected_user_ids:
-                    sel_set = set(str(u) for u in selected_user_ids)
+                foreign_batch_ids = set()
+                if selected_set:
                     for _, frow in batch_df.iterrows():
-                        if str(frow.get('owner_id', '')) not in sel_set:
-                            fid = self._normalise_folder_id(frow['id'])
-                            if fid and fid not in out_of_scope_owner_folder_ids:
-                                out_of_scope_owner_folder_ids.append(fid)
+                        if str(frow.get("owner_id", "")) not in selected_set:
+                            fid = self._normalise_folder_id(frow["id"])
+                            if fid:
+                                foreign_batch_ids.add(fid)
+                                if fid not in out_of_scope_owner_folder_ids:
+                                    out_of_scope_owner_folder_ids.append(fid)
+
+                accepted_batch = batch_df
+                if (
+                    self.cross_owner_policy == "owned_only"
+                    and foreign_batch_ids
+                ):
+                    accepted_batch = batch_df[
+                        ~batch_df["id"].apply(self._normalise_folder_id).isin(
+                            foreign_batch_ids
+                        )
+                    ].copy()
+                if len(accepted_batch) > 0:
+                    all_new_folder_rows.append(accepted_batch)
 
                 # Collect parent IDs that we don't have yet
                 next_batch: set = set()
-                for _, frow in batch_df.iterrows():
+                for _, frow in accepted_batch.iterrows():
                     p = self._normalise_folder_id(frow.get('parent_id'))
                     if p and p not in known_ids:
                         next_batch.add(p)
@@ -1494,6 +1653,22 @@ class ExtractionEngine:
                                 "include its owner in the batch instead."
                             )
                         new_folders_df.at[index, "owner_id"] = owner
+                if self.cross_owner_policy == "owned_only":
+                    unavailable_parents = (
+                        set(out_of_scope_owner_folder_ids)
+                        | set(stale_folder_ids)
+                    )
+                    for index, folder_row in new_folders_df.iterrows():
+                        parent_id = self._normalise_folder_id(
+                            folder_row.get("parent_id")
+                        )
+                        if parent_id in unavailable_parents:
+                            new_folders_df.at[index, "parent_id"] = None
+                            folder_id = self._normalise_folder_id(
+                                folder_row.get("id")
+                            )
+                            if folder_id:
+                                detached_topup_folder_ids.append(folder_id)
                 added_folder_ids = new_folders_df["id"].apply(self._normalise_folder_id).dropna().tolist()
                 folders_df = pd.concat([folders_df, new_folders_df], ignore_index=True)
                 print(f"[topup] Added {len(added_folder_ids)} folder(s) (including ancestors).")
@@ -1501,7 +1676,13 @@ class ExtractionEngine:
                     print(f"[topup] Warning: {len(out_of_scope_owner_folder_ids)} added folder(s) are owned by "
                           f"users not in the selected migration set.")
             elif missing_folder_ids:
-                stale_folder_ids = list(missing_folder_ids)
+                stale_folder_ids = sorted(
+                    set(stale_folder_ids)
+                    | (
+                        set(missing_folder_ids)
+                        - set(out_of_scope_owner_folder_ids)
+                    )
+                )
 
         cross_owner_doc_set = set(out_of_scope_owner_doc_ids) - set(chunkless_doc_ids)
         cross_owner_folder_set = set(out_of_scope_owner_folder_ids)
@@ -1522,12 +1703,18 @@ class ExtractionEngine:
             | set(excluded_sharepoint_doc_ids)
         )
         removed_folder_ids = set(stale_folder_ids)
+        if self.cross_owner_policy == "owned_only":
+            removed_doc_ids |= cross_owner_doc_set
+            removed_folder_ids |= cross_owner_folder_set
         sanitized_agents = self._sanitize_agent_refs(
             agents_df, removed_doc_ids, removed_folder_ids
         )
         for column in ("docs_chosen", "chosen_docs_folders", "folder_id"):
             agents_df[column] = sanitized_agents[column]
 
+        docs_df, detached_document_folder_ids = (
+            self._detach_unmigrated_document_folders(docs_df, folders_df)
+        )
         report: Dict = {
             'added_doc_ids': added_doc_ids,
             'stale_doc_ids': stale_doc_ids,
@@ -1547,9 +1734,27 @@ class ExtractionEngine:
                 if self.cross_owner_policy == "reassign"
                 else []
             ),
+            'dropped_cross_owner_doc_ids': (
+                sorted(cross_owner_doc_set)
+                if self.cross_owner_policy == "owned_only"
+                else []
+            ),
+            'dropped_cross_owner_folder_ids': (
+                sorted(cross_owner_folder_set)
+                if self.cross_owner_policy == "owned_only"
+                else []
+            ),
+            'detached_topup_folder_ids': sorted(
+                set(detached_topup_folder_ids)
+            ),
+            'detached_document_folder_ids': detached_document_folder_ids,
             'removed_doc_ids': sorted(removed_doc_ids),
             'removed_folder_ids': sorted(removed_folder_ids),
             'doc_source_labels': doc_source_labels,
+            'ownership_manifest': self._build_ownership_manifest(
+                docs_df,
+                folders_df,
+            ),
             'total_document_rows': len(docs_df),
             'total_folder_rows': len(folders_df),
             'total_chunk_rows': len(embeddings_df),
@@ -1784,6 +1989,12 @@ class ExtractionEngine:
                 selected_doc_ids,
                 generate_sql_now=False,
             )
+            docs_df, detached_document_folder_ids = (
+                self._detach_unmigrated_document_folders(
+                    docs_df,
+                    folders_df,
+                )
+            )
             results["files"]["documents"] = docs_path
             
             # Get doc_ids for embeddings
@@ -1829,6 +2040,7 @@ class ExtractionEngine:
             results["document_filter_report"] = {
                 "chunkless_doc_ids": chunkless_doc_ids,
                 "include_chunkless_documents": self.include_chunkless_documents,
+                "detached_document_folder_ids": detached_document_folder_ids,
             }
             if self.export_csv:
                 docs_df.to_csv(docs_path, index=False)
@@ -1860,6 +2072,10 @@ class ExtractionEngine:
 
             results["document_readiness"] = self.evaluate_document_readiness(
                 docs_df, embeddings_df
+            )
+            results["ownership_manifest"] = self._build_ownership_manifest(
+                docs_df,
+                folders_df,
             )
             
             # 6. Extract agents — pass current docs/folders/embeddings so topup
@@ -1903,6 +2119,24 @@ class ExtractionEngine:
                 ]
                 results["document_readiness"] = topup_report.get(
                     "document_readiness", results["document_readiness"]
+                )
+                results["ownership_manifest"] = topup_report.get(
+                    "ownership_manifest",
+                    results["ownership_manifest"],
+                )
+                results["document_filter_report"][
+                    "detached_document_folder_ids"
+                ] = sorted(
+                    set(
+                        results["document_filter_report"].get(
+                            "detached_document_folder_ids", []
+                        )
+                    )
+                    | set(
+                        topup_report.get(
+                            "detached_document_folder_ids", []
+                        )
+                    )
                 )
                 source_info_base = f"{self.config.host}:{self.config.port}/{self.config.database} (prefix: {self.prefix})"
 

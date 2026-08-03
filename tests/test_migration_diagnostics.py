@@ -39,7 +39,34 @@ def test_folder_parent_error_has_selection_guidance():
     )
 
     assert result["code"] == "FOLDER_PARENT_NOT_MIGRATED"
-    assert "parent folder's owner" in result["recommendation"]
+    assert "owned-data-only batch" in result["recommendation"]
+
+
+def test_canonical_folder_owner_mismatch_identifies_old_reassign():
+    result = classify_error(
+        "Canonical folder owner mismatch for legacy folder 202: mapped folder "
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa is not owned by user "
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        phase="shard",
+        step_key="02_folders",
+    )
+
+    assert result["code"] == "CANONICAL_FOLDER_OWNER_MISMATCH"
+    assert "older migration" in result["title"].lower()
+    assert "Do not resume" in result["recommendation"]
+
+
+def test_canonical_document_owner_mismatch_identifies_old_reassign():
+    result = classify_error(
+        "Canonical document owner mismatch for legacy document doc-1: mapped "
+        "document aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa is not owned by user "
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        phase="shard",
+        step_key="03_documents",
+    )
+
+    assert result["code"] == "CANONICAL_DOCUMENT_OWNER_MISMATCH"
+    assert "older migration" in result["title"].lower()
 
 
 def test_history_issue_combines_step_shards_users_and_mapping_evidence():

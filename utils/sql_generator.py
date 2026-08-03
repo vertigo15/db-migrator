@@ -1544,9 +1544,19 @@ BEGIN
     -- ownership to this run.
     IF migration.is_migrated('documents', v_old_doc_id) THEN
         v_new_doc_id := migration.get_new_id('documents', v_old_doc_id);
+        IF EXISTS (
+            SELECT 1
+            FROM public.documents mapped
+            WHERE mapped.id = v_new_doc_id
+              AND mapped.user_id = v_user_id
+        ) THEN
 {document_tracking_sql}
-        RAISE NOTICE 'Document % already migrated', v_old_doc_id;
-        RETURN;
+            RAISE NOTICE 'Document % already migrated', v_old_doc_id;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION
+            'Canonical document owner mismatch for legacy document %: mapped document % is not owned by user %',
+            v_old_doc_id, v_new_doc_id, v_user_id;
     END IF;
     IF EXISTS (SELECT 1 FROM public.documents WHERE id = v_new_doc_id) THEN
         RAISE EXCEPTION

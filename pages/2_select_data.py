@@ -54,6 +54,10 @@ from utils.migration_tracking import (
     update_local_run,
     update_source_run,
 )
+from utils.ownership_preflight import (
+    find_canonical_ownership_conflicts,
+    ownership_conflict_message,
+)
 from utils.user_batching import (
     select_user_letter_batch,
     user_bucket_counts,
@@ -2130,19 +2134,11 @@ def render_extraction_section(
                             user_id_overrides[_v4] = _v5
             if user_id_overrides:
                 st.info(f"🔀 {len(user_id_overrides)} user ID override(s) configured.")
-        cross_owner_policy = st.selectbox(
-            "Cross-owner agent dependencies",
-            options=["block", "reassign"],
-            format_func=lambda value: (
-                "Block extraction (recommended)"
-                if value == "block"
-                else "Copy and reassign to the referencing agent owner"
-            ),
-            help=(
-                "Agent links to documents or folders owned by an unselected user "
-                "are blocked by default. Reassign is an explicit copy/ownership "
-                "decision; the source database is never changed."
-            ),
+        cross_owner_policy = "owned_only"
+        st.info(
+            "**Owned data only:** documents and folders owned by other users are "
+            "not migrated. Agent links to them are removed, and owned folders "
+            "below an unowned parent are migrated as root folders."
         )
     else:
         org_id = get_env_org_id()
@@ -2150,7 +2146,7 @@ def render_extraction_section(
         skip_empty_embeddings = False
         target_embedding_dim = None
         user_id_overrides = {}
-        cross_owner_policy = "block"
+        cross_owner_policy = "owned_only"
 
     conversation_scope = st.session_state.get("_p2_conv_scope", {})
     email_by_user_id = st.session_state.get(
@@ -2311,6 +2307,46 @@ def render_extraction_section(
                 conv_date_to=st.session_state.get("conv_date_to_parsed"),
                 conv_max_per_user=st.session_state.get("conv_max_per_user_parsed"),
             )
+
+        if generate_sql and not results.get("errors"):
+            ownership_preflight_stopped = False
+            try:
+                ownership_conflicts = find_canonical_ownership_conflicts(
+                    target_user_config,
+                    results.get("ownership_manifest", {}),
+                    user_id_overrides,
+                )
+            except Exception as exc:
+                ownership_preflight_stopped = True
+                results.setdefault("errors", []).append(
+                    "Could not validate existing V5 entity ownership: "
+                    + str(exc)
+                )
+            else:
+                if ownership_conflicts:
+                    ownership_preflight_stopped = True
+                    results["ownership_conflicts"] = ownership_conflicts
+                    results.setdefault("errors", []).append(
+                        ownership_conflict_message(ownership_conflicts)
+                    )
+            if ownership_preflight_stopped:
+                undeleted_files = []
+                for filename in os.listdir(engine.sql_output_dir):
+                    if engine.timestamp not in filename:
+                        continue
+                    try:
+                        os.remove(
+                            os.path.join(engine.sql_output_dir, filename)
+                        )
+                    except OSError:
+                        undeleted_files.append(filename)
+                results["sql_files"] = {}
+                if undeleted_files:
+                    results.setdefault("errors", []).append(
+                        "The blocked SQL files were detached from this batch but "
+                        "could not be deleted from disk: "
+                        + ", ".join(sorted(undeleted_files))
+                    )
         
         progress_bar.progress(1.0)
         status_text.text("Extraction complete!")
@@ -2409,6 +2445,22 @@ def render_extraction_section(
         if results.get("errors"):
             for error in results["errors"]:
                 st.error(error)
+            ownership_conflicts = results.get("ownership_conflicts", [])
+            if ownership_conflicts:
+                with st.expander(
+                    "Existing V5 ownership conflicts",
+                    expanded=True,
+                ):
+                    st.warning(
+                        "These rows were created or reassigned by an older "
+                        "migration. This extraction produced no runnable SQL. "
+                        "Clean or roll back the older mappings before retrying."
+                    )
+                    st.dataframe(
+                        pd.DataFrame(ownership_conflicts),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
         else:
             st.success(f"✅ Extraction complete! Timestamp: {results['timestamp']}")
 
@@ -2431,6 +2483,18 @@ def render_extraction_section(
             with st.expander("Excluded chunkless documents"):
                 st.code("\n".join(excluded_chunkless))
 
+        detached_document_folders = document_filter_report.get(
+            "detached_document_folder_ids", []
+        )
+        if detached_document_folders:
+            st.info(
+                f"{len(detached_document_folders)} owned document(s) belonged "
+                "to folders outside the owned migration scope and will be "
+                "migrated without a folder."
+            )
+            with st.expander("Documents detached from shared folders"):
+                st.code("\n".join(detached_document_folders))
+
         readiness = results.get("document_readiness", {})
         needs_reprocessing = readiness.get(
             "documents_requiring_reprocessing", []
@@ -2447,13 +2511,20 @@ def render_extraction_section(
         folder_report = results.get("folder_hierarchy_report", {})
         detached_folders = folder_report.get("detached_folder_ids", [])
         stale_parents = folder_report.get("stale_parent_ids", [])
+        cross_owner_parents = folder_report.get(
+            "dropped_cross_owner_parent_ids", []
+        )
         if detached_folders:
             st.warning(
-                f"{len(detached_folders)} folder(s) referenced missing V4 "
-                "parents and were safely migrated as root folders."
+                f"{len(detached_folders)} owned folder(s) referenced missing or "
+                "other-user parents and were safely migrated as root folders."
             )
             with st.expander("Detached folder hierarchy details"):
-                st.write({"folders": detached_folders, "missing_parents": stale_parents})
+                st.write({
+                    "folders": detached_folders,
+                    "missing_parents": stale_parents,
+                    "other_user_parents": cross_owner_parents,
+                })
 
         # ── Agent-document topup report ──────────────────────────────────────
         topup = results.get("topup_report")
@@ -2463,10 +2534,12 @@ def render_extraction_section(
             added_folders = topup.get("added_folder_ids", [])
             stale_folders = topup.get("stale_folder_ids", [])
             chunkless_docs = topup.get("chunkless_doc_ids", [])
-            oos_docs      = topup.get("out_of_scope_owner_doc_ids", [])
-            oos_folders   = topup.get("out_of_scope_owner_folder_ids", [])
-            reassigned_docs = topup.get("reassigned_doc_ids", [])
-            reassigned_folders = topup.get("reassigned_folder_ids", [])
+            dropped_cross_owner_docs = topup.get(
+                "dropped_cross_owner_doc_ids", []
+            )
+            dropped_cross_owner_folders = topup.get(
+                "dropped_cross_owner_folder_ids", []
+            )
 
             st.subheader("🤖 Agent Document Coverage")
 
@@ -2521,22 +2594,27 @@ def render_extraction_section(
                         hide_index=True, use_container_width=True
                     )
 
-            if oos_docs or oos_folders:
+            if dropped_cross_owner_docs or dropped_cross_owner_folders:
                 with st.expander(
-                    "Cross-owner dependencies explicitly reassigned"
+                    "Shared dependencies excluded (owned data only)"
                 ):
-                    st.warning(
-                        "The operator selected copy/reassign. These target copies "
-                        "will be owned by the referencing agent owner; V4 is unchanged."
+                    st.info(
+                        "These documents and folders belong to other V4 users. "
+                        "They were not migrated and all selected-agent links to "
+                        "them were removed."
                     )
-                    if reassigned_docs:
+                    if dropped_cross_owner_docs:
                         st.dataframe(
-                            pd.DataFrame({"Reassigned doc_id": reassigned_docs}),
+                            pd.DataFrame({
+                                "Excluded document": dropped_cross_owner_docs
+                            }),
                             hide_index=True, use_container_width=True
                         )
-                    if reassigned_folders:
+                    if dropped_cross_owner_folders:
                         st.dataframe(
-                            pd.DataFrame({"Reassigned folder_id": reassigned_folders}),
+                            pd.DataFrame({
+                                "Excluded folder": dropped_cross_owner_folders
+                            }),
                             hide_index=True, use_container_width=True
                         )
 
