@@ -50,6 +50,9 @@ USER_NAMESPACE_UUID        = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'   # Users (s
 DOC_NAMESPACE_UUID         = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step 03)
 NAMESPACE_UUID             = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'   # Folders, agents, chunks, embeddings
 CONVERSIONS_NAMESPACE_UUID = 'c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f'   # Conversions (step 07)
+CONVERSATION_MESSAGES_NAMESPACE_UUID = (
+    '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+)
 
 
 def deterministic_uuid_v4_py(namespace: str, value: str) -> uuid.UUID:
@@ -126,16 +129,15 @@ def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None)
     1. **Override path** — if old_id is in the overrides dict the literal V5 UUID
        is embedded at generation time; no runtime lookup needed.
 
-    2. **id_mappings path** — checks migration.id_mappings at runtime.
-       Step 01 (users) always inserts a row there for every processed user.
+    2. **id_mappings path** — compatibility fallback for older/manual SQL.
        For fresh migrations the mapped UUID equals the deterministic value.
        For pre-existing V5 users the ON CONFLICT path in Step 01 captures their
        *real* V5 UUID (which may differ from the deterministic one) and stores it
        in id_mappings — so this lookup returns the correct UUID automatically,
        with no manual override required.
 
-    3. **Deterministic fallback** — used only when id_mappings has no entry yet
-       (e.g. Steps 06/05 are generated before Step 01 has run).
+    3. **Deterministic fallback** — used only for standalone SQL generated
+       without the distributed run's complete user-resolution overrides.
 
     Args:
         old_id:    V4 legacy hash ID (e.g. 'de0ff05457533c93fdf3e0d1cdd0f808')
@@ -635,8 +637,8 @@ def generate_user_insert(
             f"'{v5_uuid}'::uuid",
         )
         return f"""
--- User: {email} (OVERRIDE — already exists in V5)
--- V4 old_id: {old_id}  →  V5 UUID: {v5_uuid}
+-- User: {email} (OVERRIDE - already exists in V5)
+-- V4 old_id: {old_id} -> V5 UUID: {v5_uuid}
 DO $$
 BEGIN
     -- User already exists in V5; skip INSERT.
@@ -647,10 +649,10 @@ BEGIN
     )
     VALUES ('users', {escape_sql_string(old_id)}, '{v5_uuid}'::uuid,
             '{migration_run_id or "user_overrides"}', {_migration_run_sql(migration_run_id)},
-            'reused', 'Pre-existing V5 user — resolved before migration')
+            'reused', 'Pre-existing V5 user - resolved before migration')
     ON CONFLICT (table_name, old_id) DO NOTHING;
 {override_tracking_sql}
-    RAISE NOTICE 'Skipped INSERT for user % — already exists in V5 as %',
+    RAISE NOTICE 'Skipped INSERT for user % - already exists in V5 as %',
                  {escape_sql_string(email)}, '{v5_uuid}';
 END $$;
 """
@@ -791,7 +793,7 @@ BEGIN
     END IF;
     IF v_existing_id IS NOT NULL THEN
         v_new_id := v_existing_id;
-        -- Link only — do NOT modify existing user data
+        -- Link only - do NOT modify existing user data
         INSERT INTO migration.id_mappings (
             table_name, old_id, new_id, migration_batch,
             migration_run_id, record_action, notes
@@ -805,7 +807,7 @@ BEGIN
         RETURN;
     END IF;
 
-    -- 3. New user — generate deterministic UUID and INSERT
+    -- 3. New user - generate deterministic UUID and INSERT
     v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
 
     BEGIN
@@ -835,7 +837,7 @@ BEGIN
             '{org_id}'::uuid
         );
     EXCEPTION WHEN unique_violation THEN
-        -- Username conflict — use email as username fallback
+        -- Username conflict - use email as username fallback
         BEGIN
             INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
@@ -855,7 +857,7 @@ BEGIN
             -- Edge case: email conflict appeared between our check and insert
             SELECT id INTO v_new_id FROM public.users WHERE email = v_email LIMIT 1;
             IF v_new_id IS NULL THEN
-                RAISE EXCEPTION 'Cannot insert user % — unresolvable unique violation', v_email;
+                RAISE EXCEPTION 'Cannot insert user % - unresolvable unique violation', v_email;
             END IF;
             v_action := 'reused';
             RAISE NOTICE 'User % appeared concurrently in V5, linking to %', v_email, v_new_id;
@@ -2640,14 +2642,208 @@ def extract_question_from_jsonb(question_data) -> str:
     return _extract_value_from_question_array(question_data) or _NO_QUESTION
 
 
+CONVERSATION_COLLISION_POLICIES = {
+    "adopt_exact",
+    "replace_unmapped",
+    "block",
+}
+
+
+def _uuid_array_sql(expressions: List[str]) -> str:
+    if not expressions:
+        return "ARRAY[]::uuid[]"
+    return "ARRAY[" + ", ".join(expressions) + "]::uuid[]"
+
+
+def _conversation_collision_sql(
+    conversation: Mapping[str, Any],
+    namespace_uuid: str,
+    user_id_overrides: Optional[Dict[str, str]],
+    collision_policy: str,
+) -> str:
+    """Build the runtime guard for one canonical conversation UUID."""
+    chat_id = str(conversation["chat_id"])
+    owner_id = str(conversation["user_id"])
+    legacy_log_ids = [
+        clean_string(row.get("id"))
+        for _, row in conversation["logs"].iterrows()
+    ]
+    message_ids = []
+    block_ids = []
+    for legacy_id in legacy_log_ids:
+        for role in ("user", "assistant"):
+            message_ids.append(
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{legacy_id}-{role}')})"
+            )
+            block_ids.append(
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{legacy_id}-{role}-block-0')})"
+            )
+    expected_messages_sql = _uuid_array_sql(message_ids)
+    expected_blocks_sql = _uuid_array_sql(block_ids)
+    expected_owner_sql = resolve_user_id_sql(owner_id, user_id_overrides)
+
+    if collision_policy == "replace_unmapped":
+        unmapped_collision_sql = """
+        IF to_regclass('public.message_reactions') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.message_reactions
+                WHERE message_id IN (
+                    SELECT id FROM public.messages
+                    WHERE conversation_id = $1
+                )'
+            USING v_chat_id;
+        END IF;
+        IF to_regclass('public.document_attachments') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.document_attachments
+                WHERE conversation_id = $1'
+            USING v_chat_id;
+        END IF;
+        IF to_regclass('public.canvases') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.canvases
+                WHERE conversation_id = $1'
+            USING v_chat_id;
+        END IF;
+        IF to_regclass('public.knowledge_base_assignments') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.knowledge_base_assignments
+                WHERE assigned_to_id = $1
+                  AND assigned_to_type::text = ''conversation'''
+            USING v_chat_id;
+        END IF;
+        DELETE FROM message_content_blocks
+        WHERE message_id IN (
+            SELECT id FROM messages WHERE conversation_id = v_chat_id
+        );
+        DELETE FROM messages WHERE conversation_id = v_chat_id;
+        DELETE FROM conversations WHERE id = v_chat_id;
+        RAISE NOTICE
+            'Replaced unmapped V5 conversation % with authoritative V4 data',
+            v_chat_id;
+"""
+    elif collision_policy == "block":
+        unmapped_collision_sql = """
+        RAISE EXCEPTION
+            'Conversation UUID collision for legacy conversation %',
+            v_chat_id;
+"""
+    else:
+        unmapped_collision_sql = """
+        IF NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE id = v_chat_id AND user_id = v_expected_user_id
+        ) THEN
+            RAISE EXCEPTION
+                'Conversation exact adoption owner mismatch for legacy conversation %',
+                v_chat_id;
+        END IF;
+
+        SELECT COUNT(*) INTO v_actual_message_count
+        FROM messages
+        WHERE conversation_id = v_chat_id;
+        SELECT COUNT(*) INTO v_matching_message_count
+        FROM unnest(v_expected_message_ids) expected(id)
+        WHERE EXISTS (SELECT 1 FROM messages WHERE id = expected.id);
+
+        SELECT COUNT(*) INTO v_actual_block_count
+        FROM message_content_blocks block
+        JOIN messages message ON message.id = block.message_id
+        WHERE message.conversation_id = v_chat_id;
+        SELECT COUNT(*) INTO v_matching_block_count
+        FROM unnest(v_expected_block_ids) expected(id)
+        WHERE EXISTS (
+            SELECT 1 FROM message_content_blocks WHERE id = expected.id
+        );
+
+        IF v_actual_message_count <> cardinality(v_expected_message_ids)
+           OR v_matching_message_count <> cardinality(v_expected_message_ids)
+           OR v_actual_block_count <> cardinality(v_expected_block_ids)
+           OR v_matching_block_count <> cardinality(v_expected_block_ids)
+        THEN
+            RAISE EXCEPTION
+                'Conversation exact adoption content mismatch for legacy conversation % '
+                '(messages %/%, blocks %/%)',
+                v_chat_id,
+                v_matching_message_count,
+                cardinality(v_expected_message_ids),
+                v_matching_block_count,
+                cardinality(v_expected_block_ids);
+        END IF;
+
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'conversations', v_chat_id::text, v_chat_id,
+            'legacy_adoption', NULL, 'reused',
+            'Adopted exact previously migrated conversation'
+        );
+        RAISE NOTICE
+            'Adopted exact previously migrated conversation %',
+            v_chat_id;
+"""
+
+    return f"""
+DO $conversation_collision$
+DECLARE
+    v_chat_id uuid := '{chat_id}'::uuid;
+    v_expected_user_id uuid := {expected_owner_sql};
+    v_expected_message_ids uuid[] := {expected_messages_sql};
+    v_expected_block_ids uuid[] := {expected_blocks_sql};
+    v_mapping_old_id text;
+    v_mapping_new_id uuid;
+    v_actual_message_count integer := 0;
+    v_matching_message_count integer := 0;
+    v_actual_block_count integer := 0;
+    v_matching_block_count integer := 0;
+BEGIN
+    SELECT old_id, new_id
+    INTO v_mapping_old_id, v_mapping_new_id
+    FROM migration.id_mappings
+    WHERE table_name = 'conversations'
+      AND (old_id = v_chat_id::text OR new_id = v_chat_id)
+    LIMIT 1;
+
+    IF FOUND THEN
+        IF v_mapping_old_id <> v_chat_id::text
+           OR v_mapping_new_id <> v_chat_id
+        THEN
+            RAISE EXCEPTION
+                'Canonical conversation mapping mismatch for legacy conversation %',
+                v_chat_id;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE id = v_chat_id AND user_id = v_expected_user_id
+        ) THEN
+            RAISE EXCEPTION
+                'Canonical conversation owner mismatch for legacy conversation %',
+                v_chat_id;
+        END IF;
+        RETURN;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM conversations WHERE id = v_chat_id) THEN
+{unmapped_collision_sql}
+    END IF;
+END $conversation_collision$;
+"""
+
+
 def generate_conversations_logs_migration_sql(
     logs_df: pd.DataFrame,
     output_file: str,
     source_info: str,
-    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    namespace_uuid: str = CONVERSATION_MESSAGES_NAMESPACE_UUID,
     max_records_per_insert: int = 50,
     user_id_overrides: Optional[Dict[str, str]] = None,
     migration_run_id: Optional[str] = None,
+    conversation_collision_policy: str = "adopt_exact",
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for jeen_dev_logs.
@@ -2666,6 +2862,11 @@ def generate_conversations_logs_migration_sql(
     Returns:
         Dictionary with generation stats
     """
+    if conversation_collision_policy not in CONVERSATION_COLLISION_POLICIES:
+        raise ValueError(
+            "conversation_collision_policy must be 'adopt_exact', "
+            "'replace_unmapped', or 'block'"
+        )
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
     # Clean up old conversations migration files
@@ -2891,23 +3092,14 @@ END $$;
                 
                 conv_values_joined = ',\n'.join(conv_values)
                 for conv in conv_batch:
-                    sql_file.write(f"""
-DO $conversation_collision$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM conversations
-        WHERE id = '{conv['chat_id']}'::uuid
-    ) AND NOT EXISTS (
-        SELECT 1 FROM migration.id_mappings
-        WHERE table_name = 'conversations'
-          AND old_id = {escape_sql_string(conv['chat_id'])}
-          AND new_id = '{conv['chat_id']}'::uuid
-    ) THEN
-        RAISE EXCEPTION
-            'Conversation UUID collision for legacy conversation {conv['chat_id']}';
-    END IF;
-END $conversation_collision$;
-""")
+                    sql_file.write(
+                        _conversation_collision_sql(
+                            conv,
+                            namespace_uuid,
+                            user_id_overrides,
+                            conversation_collision_policy,
+                        )
+                    )
                 sql_file.write(f"""-- Conversations INSERT
 INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
 SELECT * FROM (
@@ -3159,6 +3351,7 @@ def generate_agent_insert(
     user_id_overrides: Optional[Dict[str, str]] = None,
     merged_instructions: Optional[Dict[str, str]] = None,
     migration_run_id: Optional[str] = None,
+    agent_collision_policy: str = "adopt_exact",
 ) -> Optional[str]:
     """
     Generate INSERT statements for a single agent (agents + agent_settings + knowledge_bases).
@@ -3599,6 +3792,157 @@ def generate_agent_insert(
         escape_sql_string(bot_id),
         "v_agent_id",
     )
+    if agent_collision_policy not in {"adopt_exact", "block"}:
+        raise ValueError(
+            "agent_collision_policy must be 'adopt_exact' or 'block'"
+        )
+    if agent_collision_policy == "block":
+        unmapped_agent_sql = f"""
+        RAISE EXCEPTION
+            'Agent UUID collision for legacy bot % (target id % is not mapped from it)',
+            {escape_sql_string(bot_id)}, v_agent_id;
+"""
+    else:
+        expected_item_expressions = [
+            *[
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{bot_id}-kb-item-{doc_id}')})"
+                for doc_id in docs_chosen
+            ],
+            *[
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{bot_id}-kb-item-folder-{fid}')})"
+                for fid in folders_chosen
+            ],
+        ]
+        expected_items_sql = _uuid_array_sql(expected_item_expressions)
+        helper_mapping_sql = ""
+        helper_exact_sql = f"""
+        IF EXISTS (
+            SELECT 1 FROM knowledge_base_assignments
+            WHERE assigned_to_id = v_agent_id
+        ) THEN
+            RAISE EXCEPTION
+                'Agent exact adoption helper mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
+"""
+        if has_docs_or_folders:
+            helper_exact_sql = f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM knowledge_bases WHERE id = v_kb_id
+        ) OR NOT EXISTS (
+            SELECT 1
+            FROM knowledge_base_assignments
+            WHERE id = v_kb_assignment_id
+              AND knowledge_base_id = v_kb_id
+              AND assigned_to_id = v_agent_id
+              AND assigned_to_type::text = 'agent'
+        ) OR (
+            SELECT COUNT(*)
+            FROM knowledge_base_assignments
+            WHERE assigned_to_id = v_agent_id
+        ) <> 1 OR (
+            SELECT COUNT(*)
+            FROM knowledge_base_items
+            WHERE knowledge_base_id = v_kb_id
+        ) <> cardinality({expected_items_sql}) OR (
+            SELECT COUNT(*)
+            FROM unnest({expected_items_sql}) expected(id)
+            WHERE EXISTS (
+                SELECT 1 FROM knowledge_base_items item
+                WHERE item.id = expected.id
+                  AND item.knowledge_base_id = v_kb_id
+            )
+        ) <> cardinality({expected_items_sql}) THEN
+            RAISE EXCEPTION
+                'Agent exact adoption helper mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
+"""
+            helper_mapping_sql = f"""
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES
+            ('knowledge_bases', {escape_sql_string(bot_id)}, v_kb_id,
+             'legacy_adoption', NULL, 'reused', 'Adopted exact agent helper'),
+            ('knowledge_base_assignments', {escape_sql_string(bot_id)},
+             v_kb_assignment_id, 'legacy_adoption', NULL, 'reused',
+             'Adopted exact agent helper')
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+            for doc_id in docs_chosen:
+                helper_mapping_sql += f"""
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'knowledge_base_items',
+            {escape_sql_string(f'{bot_id}-document-{doc_id}')},
+            migration.deterministic_uuid_v4(
+                '{namespace_uuid}'::uuid,
+                {escape_sql_string(f'{bot_id}-kb-item-{doc_id}')}
+            ),
+            'legacy_adoption', NULL, 'reused', 'Adopted exact agent helper'
+        )
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+            for fid in folders_chosen:
+                helper_mapping_sql += f"""
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'knowledge_base_items',
+            {escape_sql_string(f'{bot_id}-folder-{fid}')},
+            migration.deterministic_uuid_v4(
+                '{namespace_uuid}'::uuid,
+                {escape_sql_string(f'{bot_id}-kb-item-folder-{fid}')}
+            ),
+            'legacy_adoption', NULL, 'reused', 'Adopted exact agent helper'
+        )
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+        unmapped_agent_sql = f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM agents
+            WHERE id = v_agent_id AND user_id = v_user_id
+        ) OR NOT EXISTS (
+            SELECT 1 FROM agent_settings
+            WHERE id = v_settings_id AND agent_id = v_agent_id
+        ) OR (
+            SELECT COUNT(*) FROM agent_settings
+            WHERE agent_id = v_agent_id
+        ) <> 1 THEN
+            RAISE EXCEPTION
+                'Agent exact adoption owner or settings mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
+{helper_exact_sql}
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'agents', {escape_sql_string(bot_id)}, v_agent_id,
+            'legacy_adoption', NULL, 'reused',
+            'Adopted exact previously migrated agent'
+        );
+{helper_mapping_sql}
+{agent_tracking_sql}
+        INSERT INTO legacy_bot_to_agent_mapping (
+            old_bot_id, new_agent_id, agent_type, bot_name
+        ) VALUES (
+            {escape_sql_string(bot_id)}, v_agent_id, '{agent_type}',
+            {escape_sql_string(bot_name[:255])}
+        )
+        ON CONFLICT (old_bot_id) DO NOTHING;
+        RAISE NOTICE 'Adopted exact previously migrated agent %',
+            {escape_sql_string(bot_id)};
+        RETURN;
+"""
 
     sql = f"""
 -- Agent: {bot_name[:60]} (bot_id: {bot_id})
@@ -3612,21 +3956,34 @@ BEGIN
     -- for this run, but do not mutate the older agent or its helper rows.
     IF migration.is_migrated('agents', {escape_sql_string(bot_id)}) THEN
         v_agent_id := migration.get_new_id('agents', {escape_sql_string(bot_id)});
+        IF NOT EXISTS (
+            SELECT 1 FROM agents
+            WHERE id = v_agent_id AND user_id = v_user_id
+        ) THEN
+            RAISE EXCEPTION
+                'Canonical agent owner mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
 {agent_tracking_sql}
         RAISE NOTICE 'Agent % already migrated', {escape_sql_string(bot_id)};
         RETURN;
     END IF;
 
-    IF EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id)
-       AND NOT EXISTS (
-           SELECT 1 FROM migration.id_mappings
-           WHERE table_name = 'agents'
-             AND old_id = {escape_sql_string(bot_id)}
-             AND new_id = v_agent_id
-       ) THEN
+    IF EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id) THEN
+{unmapped_agent_sql}
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM agent_settings
+        WHERE (id = v_settings_id AND agent_id <> v_agent_id)
+           OR (agent_id = v_agent_id AND id <> v_settings_id)
+    ) OR EXISTS (
+        SELECT 1 FROM knowledge_base_assignments
+        WHERE assigned_to_id = v_agent_id
+    ) THEN
         RAISE EXCEPTION
-            'Agent UUID collision for legacy bot % (target id % is not mapped from it)',
-            {escape_sql_string(bot_id)}, v_agent_id;
+            'Agent helper UUID collision for legacy bot %',
+            {escape_sql_string(bot_id)};
     END IF;
 
     -- Insert agent if not exists
@@ -3713,6 +4070,7 @@ def generate_agents_migration_sql(
     user_id_overrides: Optional[Dict[str, str]] = None,
     merged_instructions: Optional[Dict[str, str]] = None,
     migration_run_id: Optional[str] = None,
+    agent_collision_policy: str = "adopt_exact",
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for agents from playground_bot_generator_config.
@@ -3811,6 +4169,7 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
             user_id_overrides,
             merged_instructions,
             migration_run_id,
+            agent_collision_policy,
         )
         if sql:
             owner_id = clean_string(row.get('user_id'))

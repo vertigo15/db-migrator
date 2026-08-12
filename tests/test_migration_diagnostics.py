@@ -5,6 +5,7 @@ from utils.migration_diagnostics import (
     build_support_report,
     classify_error,
     exception_context,
+    is_non_retryable_failure,
 )
 
 
@@ -67,6 +68,45 @@ def test_canonical_document_owner_mismatch_identifies_old_reassign():
 
     assert result["code"] == "CANONICAL_DOCUMENT_OWNER_MISMATCH"
     assert "older migration" in result["title"].lower()
+
+
+def test_conversation_adoption_mismatch_has_authoritative_option():
+    result = classify_error(
+        "Conversation exact adoption content mismatch for legacy conversation "
+        "11111111-1111-4111-8111-111111111111 (messages 2/4, blocks 2/4)",
+        phase="shard",
+        step_key="05_conversations",
+    )
+
+    assert result["code"] == "CONVERSATION_ADOPTION_MISMATCH"
+    assert "V4-authoritative" in result["recommendation"]
+
+
+def test_deterministic_failures_are_terminal_but_transient_errors_retry():
+    assert is_non_retryable_failure(
+        "Conversation UUID collision for legacy conversation abc"
+    )
+    assert is_non_retryable_failure("duplicate", {"sqlstate": "23505"})
+    assert not is_non_retryable_failure(
+        "deadlock detected", {"sqlstate": "40P01"}
+    )
+    assert not is_non_retryable_failure(
+        "server closed the connection", {"sqlstate": "08006"}
+    )
+    assert is_non_retryable_failure(
+        "Canonical agent owner mismatch for legacy bot bot-1"
+    )
+
+
+def test_agent_collision_has_preflight_guidance():
+    result = classify_error(
+        "Agent exact adoption helper mismatch for legacy bot bot-1",
+        phase="shard",
+        step_key="06_agents",
+    )
+
+    assert result["code"] == "AGENT_COLLISION"
+    assert "preflight" in result["recommendation"].lower()
 
 
 def test_history_issue_combines_step_shards_users_and_mapping_evidence():

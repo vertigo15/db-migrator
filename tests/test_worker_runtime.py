@@ -446,9 +446,11 @@ def test_worker_rejects_shard_with_bad_checksum(
     assert "checksum" in outcome.error.lower()
     assert _mapping_count(postgres_cluster, run_id) == 0
 
-    # Failed-but-retryable: still claimable (attempts < max_attempts).
+    # A persistent checksum mismatch cannot heal by rerunning the same shard.
     reclaimed = claim_shard(postgres_cluster, "user_db", worker_id="worker-b")
-    assert reclaimed is not None
+    assert reclaimed is None
+    summary = step_shard_summary(postgres_cluster, run_id, "01_users")
+    assert summary["failed"] == 1
 
 
 def test_enqueue_rejects_manifest_belonging_to_a_different_run(
@@ -515,7 +517,9 @@ def test_worker_accepts_valid_checksummed_shard_without_run_id_in_sql(
     assert outcome.error is None
 
 
-def test_worker_fails_shard_on_sql_error_and_allows_retry(postgres_cluster, tmp_path):
+def test_worker_fails_schema_error_without_repeated_attempts(
+    postgres_cluster, tmp_path
+):
     run_id = str(uuid.uuid4())
     _seed_run_and_step(postgres_cluster, run_id, expected_count=1)
     preamble = generate_migration_schema_setup()
@@ -540,11 +544,10 @@ def test_worker_fails_shard_on_sql_error_and_allows_retry(postgres_cluster, tmp_
     summary = step_shard_summary(postgres_cluster, run_id, "01_users")
     assert summary["total"] == 1
     assert summary["completed"] == 0
-    assert summary["failed"] == 0  # retrying, not yet terminal
+    assert summary["failed"] == 1
 
     reclaimed = claim_shard(postgres_cluster, "user_db", worker_id="worker-b")
-    assert reclaimed is not None
-    assert reclaimed.attempts == 2
+    assert reclaimed is None
 
 
 def test_terminal_failure_updates_step_and_only_affected_user(

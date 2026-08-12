@@ -57,6 +57,16 @@ from utils.migration_tracking import (
 from utils.ownership_preflight import (
     find_canonical_ownership_conflicts,
     ownership_conflict_message,
+    repair_orphaned_document_owners,
+    repair_orphaned_folder_owners,
+)
+from utils.conversation_preflight import (
+    conversation_conflict_message,
+    inspect_conversation_conflicts,
+)
+from utils.agent_preflight import (
+    agent_conflict_message,
+    inspect_agent_conflicts,
 )
 from utils.user_batching import (
     select_user_letter_batch,
@@ -2140,6 +2150,35 @@ def render_extraction_section(
             "not migrated. Agent links to them are removed, and owned folders "
             "below an unowned parent are migrated as root folders."
         )
+        conversation_policy_labels = {
+            "adopt_exact": (
+                "Automatically reuse exact legacy conversation copies (recommended)"
+            ),
+            "replace_unmapped": (
+                "V4 authoritative: replace unmapped V5 conversation collisions"
+            ),
+            "block": "Stop on every unmapped conversation collision",
+        }
+        conversation_collision_policy = st.selectbox(
+            "Existing conversation UUIDs",
+            options=list(conversation_policy_labels),
+            format_func=conversation_policy_labels.get,
+            help=(
+                "Exact reuse verifies the owner and every deterministic message "
+                "and content-block UUID. V4-authoritative replacement is atomic "
+                "inside the shard and never deletes canonically mapped conversations."
+            ),
+        )
+        conversation_policy_confirmed = True
+        if conversation_collision_policy == "replace_unmapped":
+            st.warning(
+                "This mode deletes an unmapped V5 conversation and its messages "
+                "inside the migration transaction, then recreates it from V4."
+            )
+            conversation_policy_confirmed = st.checkbox(
+                "I confirm that V4 conversation data is authoritative.",
+                value=False,
+            )
     else:
         org_id = get_env_org_id()
         embedding_model = get_env_embedding_model()
@@ -2147,6 +2186,8 @@ def render_extraction_section(
         target_embedding_dim = None
         user_id_overrides = {}
         cross_owner_policy = "owned_only"
+        conversation_collision_policy = "adopt_exact"
+        conversation_policy_confirmed = True
 
     conversation_scope = st.session_state.get("_p2_conv_scope", {})
     email_by_user_id = st.session_state.get(
@@ -2204,7 +2245,11 @@ def render_extraction_section(
         "🚀 Start Extraction",
         type="primary",
         use_container_width=True,
-        disabled=workload_blocked or not scope_confirmation,
+        disabled=(
+            workload_blocked
+            or not scope_confirmation
+            or not conversation_policy_confirmed
+        ),
     ):
         if generate_sql and not org_id:
             st.error("Please select an organization before starting extraction.")
@@ -2250,6 +2295,7 @@ def render_extraction_section(
                             "log_row_count": conversation_scope.get(
                                 "log_row_count", 0
                             ),
+                            "collision_policy": conversation_collision_policy,
                         },
                     },
                     source_config=config,
@@ -2284,6 +2330,8 @@ def render_extraction_section(
             user_id_overrides=user_id_overrides if generate_sql else {},
             migration_run_id=migration_run_id,
             cross_owner_policy=cross_owner_policy,
+            conversation_collision_policy=conversation_collision_policy,
+            agent_collision_policy="adopt_exact",
             include_chunkless_documents=st.session_state.get(
                 "include_chunkless_documents", False
             ),
@@ -2309,7 +2357,7 @@ def render_extraction_section(
             )
 
         if generate_sql and not results.get("errors"):
-            ownership_preflight_stopped = False
+            preflight_stopped = False
             try:
                 ownership_conflicts = find_canonical_ownership_conflicts(
                     target_user_config,
@@ -2317,19 +2365,110 @@ def render_extraction_section(
                     user_id_overrides,
                 )
             except Exception as exc:
-                ownership_preflight_stopped = True
+                preflight_stopped = True
                 results.setdefault("errors", []).append(
                     "Could not validate existing V5 entity ownership: "
                     + str(exc)
                 )
             else:
-                if ownership_conflicts:
-                    ownership_preflight_stopped = True
-                    results["ownership_conflicts"] = ownership_conflicts
-                    results.setdefault("errors", []).append(
-                        ownership_conflict_message(ownership_conflicts)
+                try:
+                    repaired_documents = repair_orphaned_document_owners(
+                        target_user_config,
+                        ownership_conflicts,
+                        migration_run_id,
                     )
-            if ownership_preflight_stopped:
+                    repaired_folders = repair_orphaned_folder_owners(
+                        target_user_config,
+                        ownership_conflicts,
+                        migration_run_id,
+                    )
+                    if repaired_documents:
+                        results["repaired_document_owners"] = (
+                            repaired_documents
+                        )
+                    if repaired_folders:
+                        results["repaired_folder_owners"] = repaired_folders
+                    if repaired_documents or repaired_folders:
+                        ownership_conflicts = (
+                            find_canonical_ownership_conflicts(
+                                target_user_config,
+                                results.get("ownership_manifest", {}),
+                                user_id_overrides,
+                            )
+                        )
+                    folder_conflicts_to_exclude = [
+                        row
+                        for row in ownership_conflicts
+                        if row.get("entity_type") == "folders"
+                    ]
+                    if folder_conflicts_to_exclude:
+                        engine.exclude_canonical_folder_conflicts(
+                            [
+                                str(row["old_id"])
+                                for row in folder_conflicts_to_exclude
+                            ],
+                            results,
+                        )
+                        ownership_conflicts = (
+                            find_canonical_ownership_conflicts(
+                                target_user_config,
+                                results.get("ownership_manifest", {}),
+                                user_id_overrides,
+                            )
+                        )
+                except Exception as exc:
+                    preflight_stopped = True
+                    results.setdefault("errors", []).append(
+                        "Could not safely resolve V5 ownership conflicts: "
+                        + str(exc)
+                    )
+                else:
+                    if ownership_conflicts:
+                        preflight_stopped = True
+                        results["ownership_conflicts"] = ownership_conflicts
+                        results.setdefault("errors", []).append(
+                            ownership_conflict_message(ownership_conflicts)
+                        )
+            try:
+                conversation_preflight = inspect_conversation_conflicts(
+                    target_user_config,
+                    results.get("conversation_manifest", []),
+                    conversation_collision_policy,
+                )
+                results["conversation_preflight"] = conversation_preflight
+                if conversation_preflight["conflicts"]:
+                    preflight_stopped = True
+                    results.setdefault("errors", []).append(
+                        conversation_conflict_message(
+                            conversation_preflight["conflicts"]
+                        )
+                    )
+            except Exception as exc:
+                preflight_stopped = True
+                results.setdefault("errors", []).append(
+                    "Could not validate existing V5 conversations: " + str(exc)
+                )
+            try:
+                agent_preflight = inspect_agent_conflicts(
+                    target_user_config,
+                    results.get("agent_manifest", []),
+                    "adopt_exact",
+                )
+                results["agent_preflight"] = agent_preflight
+                if agent_preflight["conflicts"]:
+                    preflight_stopped = True
+                    results.setdefault("errors", []).append(
+                        agent_conflict_message(
+                            agent_preflight["conflicts"]
+                        )
+                    )
+            except Exception as exc:
+                preflight_stopped = True
+                results.setdefault("errors", []).append(
+                    "Could not validate existing V5 agents: " + str(exc)
+                )
+
+            if preflight_stopped:
                 undeleted_files = []
                 for filename in os.listdir(engine.sql_output_dir):
                     if engine.timestamp not in filename:
@@ -2461,8 +2600,93 @@ def render_extraction_section(
                         hide_index=True,
                         use_container_width=True,
                     )
+            conversation_conflicts = results.get(
+                "conversation_preflight", {}
+            ).get("conflicts", [])
+            if conversation_conflicts:
+                with st.expander(
+                    "Existing V5 conversation conflicts",
+                    expanded=True,
+                ):
+                    st.dataframe(
+                        pd.DataFrame(conversation_conflicts),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+            agent_conflicts = results.get("agent_preflight", {}).get(
+                "conflicts", []
+            )
+            if agent_conflicts:
+                with st.expander(
+                    "Existing V5 agent conflicts",
+                    expanded=True,
+                ):
+                    st.dataframe(
+                        pd.DataFrame(agent_conflicts),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
         else:
             st.success(f"✅ Extraction complete! Timestamp: {results['timestamp']}")
+
+        repaired_document_owners = results.get(
+            "repaired_document_owners", []
+        )
+        if repaired_document_owners:
+            st.success(
+                f"Repaired {len(repaired_document_owners)} canonical document "
+                "owner(s) that pointed to deleted V5 users."
+            )
+        repaired_folder_owners = results.get("repaired_folder_owners", [])
+        if repaired_folder_owners:
+            st.success(
+                f"Repaired {len(repaired_folder_owners)} canonical folder "
+                "owner(s) that pointed to deleted V5 users."
+            )
+        folder_exclusions = results.get("canonical_folder_exclusions", {})
+        if folder_exclusions.get("excluded_folder_ids"):
+            with st.expander("Canonical folder conflicts excluded"):
+                st.info(
+                    "Conflicting existing V5 folders were preserved. Their V4 "
+                    "copies were excluded; selected users' documents and child "
+                    "folders were detached and will migrate as roots."
+                )
+                st.json(folder_exclusions)
+
+        conversation_preflight = results.get("conversation_preflight", {})
+        will_adopt = conversation_preflight.get("will_adopt", [])
+        will_replace = conversation_preflight.get("will_replace", [])
+        if will_adopt or will_replace:
+            with st.expander("Conversation collision plan"):
+                if will_adopt:
+                    st.info(
+                        f"{len(will_adopt)} exact legacy conversation copy/copies "
+                        "will be adopted without rewriting their data."
+                    )
+                if will_replace:
+                    st.warning(
+                        f"{len(will_replace)} unmapped V5 conversation(s) will be "
+                        "replaced atomically from V4."
+                    )
+                st.dataframe(
+                    pd.DataFrame(will_adopt + will_replace),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+        agent_adoptions = results.get("agent_preflight", {}).get(
+            "will_adopt", []
+        )
+        if agent_adoptions:
+            with st.expander("Agent collision plan"):
+                st.info(
+                    f"{len(agent_adoptions)} exact previously migrated agent(s) "
+                    "will be adopted without rewriting their data."
+                )
+                st.dataframe(
+                    pd.DataFrame(agent_adoptions),
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
         invalid_chat_rows = results.get("summary", {}).get(
             "invalid_chat_rows", 0

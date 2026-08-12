@@ -28,7 +28,7 @@ from typing import List, Mapping, Optional, Sequence
 
 from utils.db import ConnectionConfig, get_connection
 from utils.migration_diagnostic_store import insert_diagnostic_event
-from utils.migration_diagnostics import classify_error
+from utils.migration_diagnostics import classify_error, is_non_retryable_failure
 from utils.migration_steps import (
     STEP_INDEX,
     STEP_TARGET_DB,
@@ -414,8 +414,13 @@ def fail_shard(
     worker_id: str,
     error_message: str,
     diagnostic_context: Optional[Mapping[str, object]] = None,
+    force_terminal: bool = False,
 ) -> str:
     """Record a shard failure. Returns 'retrying' or 'failed' (terminal)."""
+    force_terminal = force_terminal or is_non_retryable_failure(
+        error_message,
+        diagnostic_context,
+    )
     config = config_for_database(base_config, target_database)
     conn = get_connection(config)
     try:
@@ -424,7 +429,10 @@ def fail_shard(
             cursor.execute(
                 """
                 UPDATE migration.migration_shards
-                SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'retrying' END,
+                SET status = CASE
+                        WHEN %s OR attempts >= max_attempts THEN 'failed'
+                        ELSE 'retrying'
+                    END,
                     error_message = %s,
                     lease_expires_at = NULL,
                     owner = NULL
@@ -432,7 +440,12 @@ def fail_shard(
                 RETURNING status, migration_run_id, step_key, attempts,
                           max_attempts, file_path, owner_emails
                 """,
-                (error_message[:2000] if error_message else None, shard_id, worker_id),
+                (
+                    force_terminal,
+                    error_message[:2000] if error_message else None,
+                    shard_id,
+                    worker_id,
+                ),
             )
             row = cursor.fetchone()
             if row and error_message:
@@ -457,6 +470,7 @@ def fail_shard(
                         "file_path": row[5],
                         "owner_emails": list(row[6] or []),
                         "worker_id": worker_id,
+                        "non_retryable": force_terminal,
                         **classification.get("facts", {}),
                         **dict(diagnostic_context or {}),
                     },

@@ -369,6 +369,62 @@ def test_fail_shard_retries_then_terminally_fails(postgres_cluster):
     assert summary["all_completed"] is False
 
 
+def test_deterministic_conflict_fails_without_repeated_attempts(postgres_cluster):
+    run_id = str(uuid.uuid4())
+    _seed_step_row(
+        postgres_cluster, "user_db", run_id, "01_users",
+        status="running",
+    )
+    enqueue_shards(
+        postgres_cluster, run_id, "01_users", _manifest(1)
+    )
+
+    claimed = claim_shard(
+        postgres_cluster, "user_db", worker_id="worker-a"
+    )
+    status = fail_shard(
+        postgres_cluster,
+        "user_db",
+        claimed.id,
+        "worker-a",
+        "Conversation exact adoption content mismatch for legacy conversation abc",
+    )
+
+    assert status == "failed"
+    assert claim_shard(
+        postgres_cluster, "user_db", worker_id="worker-b"
+    ) is None
+    summary = step_shard_summary(postgres_cluster, run_id, "01_users")
+    assert summary["any_failed"] is True
+
+
+def test_transient_sqlstate_preserves_retry_budget(postgres_cluster):
+    run_id = str(uuid.uuid4())
+    _seed_step_row(
+        postgres_cluster, "user_db", run_id, "01_users", status="running"
+    )
+    enqueue_shards(postgres_cluster, run_id, "01_users", _manifest(1))
+
+    claimed = claim_shard(
+        postgres_cluster, "user_db", worker_id="worker-a"
+    )
+    status = fail_shard(
+        postgres_cluster,
+        "user_db",
+        claimed.id,
+        "worker-a",
+        "deadlock detected",
+        diagnostic_context={"sqlstate": "40P01"},
+    )
+
+    assert status == "retrying"
+    reclaimed = claim_shard(
+        postgres_cluster, "user_db", worker_id="worker-b"
+    )
+    assert reclaimed.id == claimed.id
+    assert reclaimed.attempts == 2
+
+
 def test_stale_lease_is_recovered_for_retry(postgres_cluster):
     run_id = str(uuid.uuid4())
     _seed_step_row(postgres_cluster, "user_db", run_id, "01_users", status="running")

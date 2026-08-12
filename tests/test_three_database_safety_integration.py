@@ -530,6 +530,44 @@ def prepared_cluster(postgres_cluster):
     return postgres_cluster
 
 
+def test_distributed_run_persists_user_resolution_in_every_target(
+    prepared_cluster,
+):
+    run_id = "fafafafa-fafa-4afa-8afa-fafafafafafa"
+    user = {
+        "email": "resolved@example.com",
+        "legacy_user_id": "legacy-resolved",
+        "v5_user_id": "21000000-0000-4000-8000-000000000099",
+        "action": "reused",
+    }
+    create_distributed_run(
+        prepared_cluster,
+        run_id,
+        [user],
+        {"database": "ephemeral-v4"},
+    )
+
+    for database in ("user_db", "document_db", "completion_db"):
+        conn = _connect(prepared_cluster, database)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT legacy_user_id, v5_user_id::text, user_action
+                    FROM migration.migration_run_users
+                    WHERE migration_run_id = %s::uuid
+                    """,
+                    (run_id,),
+                )
+                assert cursor.fetchone() == (
+                    "legacy-resolved",
+                    user["v5_user_id"],
+                    "reused",
+                )
+        finally:
+            conn.close()
+
+
 def _snapshot_existing(base):
     queries = {
         "user_db": "SELECT jsonb_agg(to_jsonb(t) ORDER BY email) FROM users t WHERE payload->>'kind' = 'existing'",

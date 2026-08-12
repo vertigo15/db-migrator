@@ -23,9 +23,12 @@ from utils.sql_generator import (
     generate_chunks_embeddings_migration_sql,
     generate_conversations_logs_migration_sql,
     generate_conversions_migration_sql,
+    generate_agents_migration_sql,
     deterministic_uuid_v4_py,
     USER_NAMESPACE_UUID,
 )
+from utils.conversation_preflight import build_conversation_manifest
+from utils.agent_preflight import build_agent_manifest
 
 CONVERSATION_UUID_PATTERN = (
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
@@ -196,8 +199,10 @@ def resolve_existing_user_overrides(
             USER_NAMESPACE_UUID, legacy_id
         ))
         action = "reused" if manual_id or automatic_id else "created"
-        if action == "reused":
-            resolved[legacy_id] = v5_user_id
+        # Embed the complete resolution in every target database's SQL. User
+        # mappings are database-local, so document_db/completion_db cannot rely
+        # on the users step executed in user_db.
+        resolved[legacy_id] = v5_user_id
         if target_row is not None and target_row.get("organization_id"):
             warnings.append(
                 f"{email} already belongs to V5 organization "
@@ -260,6 +265,8 @@ class ExtractionEngine:
         user_id_overrides: Optional[Dict[str, str]] = None,
         migration_run_id: Optional[str] = None,
         cross_owner_policy: str = "owned_only",
+        conversation_collision_policy: str = "adopt_exact",
+        agent_collision_policy: str = "adopt_exact",
         include_chunkless_documents: bool = False,
     ):
         """
@@ -298,6 +305,21 @@ class ExtractionEngine:
                 "cross_owner_policy must be 'owned_only', 'block', or 'reassign'"
             )
         self.cross_owner_policy = cross_owner_policy
+        if conversation_collision_policy not in {
+            "adopt_exact",
+            "replace_unmapped",
+            "block",
+        }:
+            raise ValueError(
+                "conversation_collision_policy must be 'adopt_exact', "
+                "'replace_unmapped', or 'block'"
+            )
+        self.conversation_collision_policy = conversation_collision_policy
+        if agent_collision_policy not in {"adopt_exact", "block"}:
+            raise ValueError(
+                "agent_collision_policy must be 'adopt_exact' or 'block'"
+            )
+        self.agent_collision_policy = agent_collision_policy
         self.include_chunkless_documents = include_chunkless_documents
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -450,6 +472,9 @@ class ExtractionEngine:
                     org_id=self.organization_id,
                     user_id_overrides=self.user_id_overrides,
                     migration_run_id=self.migration_run_id,
+                    conversation_collision_policy=(
+                        self.conversation_collision_policy
+                    ),
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to generate users SQL: {e}") from e
@@ -806,6 +831,18 @@ class ExtractionEngine:
                                 f"Failed to regenerate embeddings SQL after topup: {e}"
                             ) from e
 
+        if (
+            docs_df is not None
+            and folders_df is not None
+            and embeddings_df is not None
+        ):
+            self._last_scope_frames = {
+                "folders": folders_df.copy(),
+                "documents": docs_df.copy(),
+                "embeddings": embeddings_df.copy(),
+                "agents": df.copy(),
+            }
+
         if self.export_csv:
             df.to_csv(output_path, index=False)
 
@@ -826,6 +863,7 @@ class ExtractionEngine:
                     user_id_overrides=self.user_id_overrides,
                     merged_instructions=merged_instructions,
                     migration_run_id=self.migration_run_id,
+                    agent_collision_policy=self.agent_collision_policy,
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to generate agents SQL: {e}") from e
@@ -939,6 +977,188 @@ class ExtractionEngine:
             "folders": folders,
             "documents": documents,
         }
+
+    def exclude_canonical_folder_conflicts(
+        self,
+        folder_ids: List[str],
+        results: Dict,
+    ) -> Dict[str, List[str]]:
+        """Exclude active-owner V5 folder conflicts and regenerate affected SQL."""
+        frames = getattr(self, "_last_scope_frames", None)
+        if not frames:
+            raise RuntimeError(
+                "Final extraction frames are unavailable for folder exclusion"
+            )
+        excluded = {
+            folder_id
+            for folder_id in (
+                self._normalise_folder_id(value) for value in folder_ids
+            )
+            if folder_id
+        }
+        folders_df = frames["folders"].copy()
+        documents_df = frames["documents"].copy()
+        embeddings_df = frames["embeddings"].copy()
+        agents_df = frames["agents"].copy()
+
+        detached_folder_ids = []
+        if not folders_df.empty:
+            for index, row in folders_df.iterrows():
+                parent_id = self._normalise_folder_id(row.get("parent_id"))
+                if parent_id in excluded:
+                    folders_df.at[index, "parent_id"] = None
+                    child_id = self._normalise_folder_id(row.get("id"))
+                    if child_id:
+                        detached_folder_ids.append(child_id)
+            folders_df = folders_df[
+                ~folders_df["id"].apply(
+                    self._normalise_folder_id
+                ).isin(excluded)
+            ].copy()
+
+        documents_df, detached_document_ids = (
+            self._detach_unmigrated_document_folders(
+                documents_df,
+                folders_df,
+            )
+        )
+        agents_df = self._sanitize_agent_refs(
+            agents_df,
+            removed_doc_ids=set(),
+            removed_folder_ids=excluded,
+        )
+        self._last_scope_frames = {
+            "folders": folders_df,
+            "documents": documents_df,
+            "embeddings": embeddings_df,
+            "agents": agents_df,
+        }
+
+        if self.export_csv:
+            for key, frame in (
+                ("folders", folders_df),
+                ("documents", documents_df),
+                ("agents", agents_df),
+            ):
+                path = results.get("files", {}).get(key)
+                if path:
+                    frame.to_csv(path, index=False)
+
+        if self.generate_sql:
+            source_info = (
+                f"{self.config.host}:{self.config.port}/{self.config.database} "
+                f"(prefix: {self.prefix})"
+            )
+            self._remove_generated_step_outputs("02_folders_")
+            self._remove_generated_step_outputs("03_documents_")
+            self._remove_generated_step_outputs("06_agents_")
+            if not folders_df.empty:
+                path = os.path.join(
+                    self.sql_output_dir, f"02_folders_{self.timestamp}.sql"
+                )
+                generate_folders_migration_sql(
+                    folders_df=folders_df,
+                    output_file=path,
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides,
+                    migration_run_id=self.migration_run_id,
+                )
+                results["sql_files"]["folders"] = path
+            else:
+                results["sql_files"].pop("folders", None)
+            if not documents_df.empty:
+                path = os.path.join(
+                    self.sql_output_dir, f"03_documents_{self.timestamp}.sql"
+                )
+                generate_documents_migration_sql(
+                    documents_df=documents_df,
+                    output_file=path,
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides,
+                    doc_source_labels=results.get(
+                        "topup_report", {}
+                    ).get("doc_source_labels", {}),
+                    embeddings_df=embeddings_df,
+                    migration_run_id=self.migration_run_id,
+                )
+                results["sql_files"]["documents"] = path
+            else:
+                results["sql_files"].pop("documents", None)
+            if not agents_df.empty:
+                path = os.path.join(
+                    self.sql_output_dir, f"06_agents_{self.timestamp}.sql"
+                )
+                generate_agents_migration_sql(
+                    agents_df=agents_df,
+                    output_file=path,
+                    source_info=source_info,
+                    user_id_overrides=self.user_id_overrides,
+                    merged_instructions=self._build_merged_instructions(
+                        agents_df
+                    ),
+                    migration_run_id=self.migration_run_id,
+                    agent_collision_policy=self.agent_collision_policy,
+                )
+                results["sql_files"]["agents"] = path
+            else:
+                results["sql_files"].pop("agents", None)
+
+        results["summary"]["folders"] = len(folders_df)
+        results["summary"]["documents"] = len(documents_df)
+        results["summary"]["agents"] = len(agents_df)
+        results["ownership_manifest"] = self._build_ownership_manifest(
+            documents_df,
+            folders_df,
+        )
+        results["agent_manifest"] = build_agent_manifest(
+            agents_df,
+            self.user_id_overrides,
+        )
+        results["document_readiness"] = self.evaluate_document_readiness(
+            documents_df,
+            embeddings_df,
+        )
+        results.setdefault("folder_hierarchy_report", {}).setdefault(
+            "detached_folder_ids", []
+        )
+        results["folder_hierarchy_report"]["detached_folder_ids"] = sorted(
+            set(
+                results["folder_hierarchy_report"].get(
+                    "detached_folder_ids", []
+                )
+            )
+            | set(detached_folder_ids)
+        )
+        results.setdefault("document_filter_report", {}).setdefault(
+            "detached_document_folder_ids", []
+        )
+        results["document_filter_report"][
+            "detached_document_folder_ids"
+        ] = sorted(
+            set(
+                results["document_filter_report"].get(
+                    "detached_document_folder_ids", []
+                )
+            )
+            | set(detached_document_ids)
+        )
+        report = {
+            "excluded_folder_ids": sorted(excluded),
+            "detached_folder_ids": sorted(set(detached_folder_ids)),
+            "detached_document_ids": sorted(set(detached_document_ids)),
+        }
+        results["canonical_folder_exclusions"] = report
+        return report
+
+    def _remove_generated_step_outputs(self, prefix: str) -> None:
+        if not hasattr(self, "sql_output_dir"):
+            return
+        for filename in os.listdir(self.sql_output_dir):
+            if filename.startswith(prefix) and self.timestamp in filename:
+                try:
+                    os.remove(os.path.join(self.sql_output_dir, filename))
+                except OSError:
+                    pass
 
     def _resolve_folder_ancestor_closure(
         self,
@@ -1936,6 +2156,7 @@ class ExtractionEngine:
             "summary": {},
             "errors": []
         }
+        self._last_scope_frames = None
         
         total_steps = 8
         current_step = 0
@@ -2088,6 +2309,13 @@ class ExtractionEngine:
                 folders_df=folders_df,
                 embeddings_df=embeddings_df,
             )
+            if not getattr(self, "_last_scope_frames", None):
+                self._last_scope_frames = {
+                    "folders": folders_df.copy(),
+                    "documents": docs_df.copy(),
+                    "embeddings": embeddings_df.copy(),
+                    "agents": agents_df.copy(),
+                }
             results["files"]["agents"] = agents_path
             results["summary"]["agents"] = len(agents_df)
 
@@ -2149,6 +2377,12 @@ class ExtractionEngine:
                         results["sql_files"]["documents"] = os.path.join(self.sql_output_dir, f"03_documents_{self.timestamp}.sql")
                         results["sql_files"]["chunks_embeddings"] = os.path.join(self.sql_output_dir, f"04_chunks_embeddings_{self.timestamp}.sql")
 
+            final_frames = getattr(self, "_last_scope_frames", {})
+            results["agent_manifest"] = build_agent_manifest(
+                final_frames.get("agents", agents_df),
+                self.user_id_overrides,
+            )
+
             # 7. Extract logs (conversations/messages)
             current_step += 1
             self._report_progress("logs", current_step, total_steps)
@@ -2175,6 +2409,10 @@ class ExtractionEngine:
                     invalid_chat_rows += 1
             results["summary"]["conversations"] = len(valid_chat_ids)
             results["summary"]["invalid_chat_rows"] = invalid_chat_rows
+            results["conversation_manifest"] = build_conversation_manifest(
+                logs_df,
+                self.user_id_overrides,
+            )
             
             # Track SQL generation (conversations + messages + content_blocks)
             if self.generate_sql and len(logs_df) > 0:

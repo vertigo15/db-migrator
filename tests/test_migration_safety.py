@@ -196,7 +196,10 @@ def test_existing_users_are_resolved_by_normalized_email(monkeypatch):
     )
 
     assert result["overrides"] == {
-        "legacy-existing": "11111111-1111-4111-8111-111111111111"
+        "legacy-existing": "11111111-1111-4111-8111-111111111111",
+        "legacy-new": str(
+            deterministic_uuid_v4_py(USER_NAMESPACE_UUID, "legacy-new")
+        ),
     }
     users = {row["legacy_user_id"]: row for row in result["users"]}
     assert users["legacy-existing"]["action"] == "reused"
@@ -1029,6 +1032,73 @@ def test_missing_folder_parent_is_detached_and_reported(monkeypatch, tmp_path):
     assert engine._folder_hierarchy_report["detached_folder_ids"] == ["941"]
 
 
+def test_active_owner_canonical_folder_is_excluded_and_dependents_detached(
+    tmp_path,
+):
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path / "csv"),
+        generate_sql=False,
+        export_csv=False,
+    )
+    engine._last_scope_frames = {
+        "folders": pd.DataFrame([
+            {
+                "id": 565,
+                "owner_id": "legacy-user",
+                "parent_id": None,
+            },
+            {
+                "id": 566,
+                "owner_id": "legacy-user",
+                "parent_id": 565,
+            },
+        ]),
+        "documents": pd.DataFrame([{
+            "doc_id": "doc-1",
+            "owner_id": "legacy-user",
+            "folder_id": 565,
+        }]),
+        "embeddings": pd.DataFrame(),
+        "agents": pd.DataFrame([{
+            "bot_id": "bot-1",
+            "user_id": "legacy-user",
+            "docs_chosen": [],
+            "chosen_docs_folders": [565],
+            "folder_id": 565,
+        }]),
+    }
+    results = {
+        "files": {},
+        "sql_files": {},
+        "summary": {"folders": 2, "documents": 1, "agents": 1},
+        "folder_hierarchy_report": {"detached_folder_ids": []},
+        "document_filter_report": {
+            "detached_document_folder_ids": []
+        },
+    }
+
+    report = engine.exclude_canonical_folder_conflicts(["565"], results)
+    frames = engine._last_scope_frames
+
+    assert frames["folders"]["id"].tolist() == [566]
+    assert frames["folders"]["parent_id"].isna().all()
+    assert frames["documents"]["folder_id"].isna().all()
+    assert frames["agents"]["chosen_docs_folders"].iloc[0] == []
+    assert pd.isna(frames["agents"]["folder_id"].iloc[0])
+    assert report == {
+        "excluded_folder_ids": ["565"],
+        "detached_folder_ids": ["566"],
+        "detached_document_ids": ["doc-1"],
+    }
+    assert results["summary"]["folders"] == 1
+    assert results["ownership_manifest"]["folders"] == [{
+        "old_id": "566",
+        "owner_id": "legacy-user",
+    }]
+
+
 def test_conversation_generator_skips_blank_and_invalid_chat_ids(tmp_path):
     valid_chat = "11111111-1111-4111-8111-111111111111"
     logs = pd.DataFrame([
@@ -1062,6 +1132,90 @@ def test_conversation_generator_skips_blank_and_invalid_chat_ids(tmp_path):
     assert "ELSE 'reused' END" in sql
     assert "m.migration_run_id = '33333333-3333-4333-8333-333333333333'::uuid" in sql
     assert "m.record_action = 'created'" in sql
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_sql", "unexpected_sql"),
+    [
+        (
+            "adopt_exact",
+            "Conversation exact adoption content mismatch",
+            "Replaced unmapped V5 conversation",
+        ),
+        (
+            "replace_unmapped",
+            "Replaced unmapped V5 conversation",
+            "Conversation exact adoption content mismatch",
+        ),
+        (
+            "block",
+            "Conversation UUID collision for legacy conversation",
+            "Adopted exact previously migrated conversation",
+        ),
+    ],
+)
+def test_conversation_collision_policy_is_embedded_in_shard_sql(
+    tmp_path, policy, expected_sql, unexpected_sql
+):
+    logs = pd.DataFrame([{
+        "id": "legacy-log",
+        "user_id": "legacy-user",
+        "chat_id": "11111111-1111-4111-8111-111111111111",
+        "question": "hello",
+        "answer": "world",
+        "created_at": pd.Timestamp("2025-01-01"),
+        "token_amount": 1,
+        "words_amount": 1,
+    }])
+    output = tmp_path / f"05_conversations_{policy}.sql"
+
+    generate_conversations_logs_migration_sql(
+        logs,
+        str(output),
+        "test",
+        user_id_overrides={
+            "legacy-user": "22222222-2222-4222-8222-222222222222"
+        },
+        migration_run_id="33333333-3333-4333-8333-333333333333",
+        conversation_collision_policy=policy,
+    )
+
+    sql = output.read_text()
+    assert expected_sql in sql
+    assert unexpected_sql not in sql
+    assert "Canonical conversation mapping mismatch" in sql
+    assert "Canonical conversation owner mismatch" in sql
+    assert (
+        "v_expected_user_id uuid := "
+        "'22222222-2222-4222-8222-222222222222'::uuid"
+    ) in sql
+    if policy == "replace_unmapped":
+        block_delete = sql.index("DELETE FROM message_content_blocks")
+        message_delete = sql.index("DELETE FROM messages")
+        conversation_delete = sql.index("DELETE FROM conversations")
+        conversation_insert = sql.index("-- Conversations INSERT")
+        assert (
+            block_delete
+            < message_delete
+            < conversation_delete
+            < conversation_insert
+        )
+
+
+def test_conversation_collision_policy_rejects_unknown_value(tmp_path):
+    logs = pd.DataFrame([{
+        "id": "legacy-log",
+        "user_id": "legacy-user",
+        "chat_id": "11111111-1111-4111-8111-111111111111",
+    }])
+
+    with pytest.raises(ValueError, match="conversation_collision_policy"):
+        generate_conversations_logs_migration_sql(
+            logs,
+            str(tmp_path / "05_conversations.sql"),
+            "test",
+            conversation_collision_policy="unsafe",
+        )
 
 
 def test_conversation_scope_filters_and_limits_unique_chat_ids():
@@ -1168,3 +1322,24 @@ def test_agent_sql_reconciles_kb_count_and_tracks_helper_ownership():
     assert "'knowledge_base_assignments'" in sql
     assert "'knowledge_base_items'" in sql
     assert "false," in sql
+    assert "Canonical agent owner mismatch" in sql
+    assert "Agent exact adoption helper mismatch" in sql
+    assert "Adopted exact previously migrated agent" in sql
+
+
+def test_agent_collision_block_policy_disables_exact_adoption():
+    sql = generate_agent_insert(
+        pd.Series({
+            "bot_id": "bot-1",
+            "user_id": "owner-1",
+            "bot_data": {"bot_name": "Agent"},
+            "toolkit_settings": {},
+            "character_prompts": {},
+            "docs_chosen": [],
+            "chosen_docs_folders": [],
+        }),
+        agent_collision_policy="block",
+    )
+
+    assert "Agent UUID collision for legacy bot" in sql
+    assert "Adopted exact previously migrated agent" not in sql

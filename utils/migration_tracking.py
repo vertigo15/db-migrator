@@ -26,6 +26,20 @@ CREATE TABLE IF NOT EXISTS migration.migration_runs (
     error_message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS migration.migration_run_users (
+    migration_run_id UUID NOT NULL
+        REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
+    legacy_user_id VARCHAR(255) NOT NULL,
+    v5_user_id UUID NOT NULL,
+    email TEXT,
+    user_action VARCHAR(20) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (migration_run_id, legacy_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_migration_run_users_v5_id
+    ON migration.migration_run_users(v5_user_id);
+
 CREATE TABLE IF NOT EXISTS migration.migration_steps (
     migration_run_id UUID NOT NULL
         REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
@@ -468,6 +482,28 @@ def create_distributed_run(
                         """,
                         (run_id, len(user_rows), source_json),
                     )
+                    for user in user_rows:
+                        cursor.execute(
+                            """
+                            INSERT INTO migration.migration_run_users (
+                                migration_run_id, legacy_user_id, v5_user_id,
+                                email, user_action
+                            )
+                            VALUES (%s::uuid, %s, %s::uuid, %s, %s)
+                            ON CONFLICT (migration_run_id, legacy_user_id)
+                            DO UPDATE SET
+                                v5_user_id = EXCLUDED.v5_user_id,
+                                email = EXCLUDED.email,
+                                user_action = EXCLUDED.user_action
+                            """,
+                            (
+                                run_id,
+                                user["legacy_user_id"],
+                                user["v5_user_id"],
+                                user.get("email"),
+                                user["action"],
+                            ),
+                        )
                     for step_key, target_database in STEP_TARGETS.items():
                         if target_database != database:
                             continue

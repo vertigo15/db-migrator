@@ -45,6 +45,48 @@ def exception_context(exc: Exception) -> dict:
     return context
 
 
+def is_non_retryable_failure(
+    message: str,
+    diagnostic_context: Optional[Mapping[str, object]] = None,
+) -> bool:
+    """Return True when another identical shard attempt cannot change the result."""
+    context = dict(diagnostic_context or {})
+    sqlstate = str(context.get("sqlstate") or "")
+    if sqlstate.startswith("08") or sqlstate in {"40001", "40P01", "57P03"}:
+        return False
+    if sqlstate in {
+        "22023",  # invalid_parameter_value
+        "22P02",  # invalid_text_representation
+        "23502",  # not_null_violation
+        "23505",  # unique_violation
+        "23514",  # check_violation
+        "42703",  # undefined_column
+        "42P01",  # undefined_table
+    }:
+        return True
+
+    lower = str(message or "").lower()
+    deterministic_markers = (
+        "canonical folder owner mismatch",
+        "canonical document owner mismatch",
+        "canonical conversation owner mismatch",
+        "canonical conversation mapping mismatch",
+        "conversation uuid collision",
+        "conversation exact adoption",
+        "canonical agent owner mismatch",
+        "agent uuid collision",
+        "agent helper uuid collision",
+        "agent exact adoption",
+        "references parent",
+        "not migrated first",
+        "checksum mismatch",
+        "undefinedtable",
+        "undefinedcolumn",
+        "does not exist",
+    )
+    return any(marker in lower for marker in deterministic_markers)
+
+
 def _count_facts(message: str) -> dict:
     facts = {}
     patterns = (
@@ -151,6 +193,84 @@ def classify_error(
             "recommendation": (
                 "Do not resume this shard. Roll back or clean the older shared "
                 "copy and mapping, then create a fresh owned-data-only batch."
+            ),
+            "facts": count_facts,
+        }
+
+    if "canonical conversation owner mismatch" in lower:
+        return {
+            "code": "CANONICAL_CONVERSATION_OWNER_MISMATCH",
+            "title": "An older migration mapped this conversation to another user",
+            "cause": (
+                "The canonical conversation mapping exists, but its live V5 row "
+                "does not belong to the resolved owner."
+            ),
+            "recommendation": (
+                "Do not resume unchanged. Inspect or roll back the mapping-owner "
+                "run; V4-authoritative replacement never overwrites canonical mappings."
+            ),
+            "facts": count_facts,
+        }
+
+    if "conversation exact adoption" in lower:
+        return {
+            "code": "CONVERSATION_ADOPTION_MISMATCH",
+            "title": "An existing conversation is not an exact legacy copy",
+            "cause": (
+                "The UUID already exists without a canonical mapping, but its owner "
+                "or deterministic message/content-block IDs differ from V4."
+            ),
+            "recommendation": (
+                "Create a fresh batch with the explicit V4-authoritative conversation "
+                "option if replacing this unmapped V5 data is acceptable."
+            ),
+            "facts": count_facts,
+        }
+
+    if "conversation uuid collision" in lower:
+        return {
+            "code": "CONVERSATION_UUID_COLLISION",
+            "title": "An unmapped V5 conversation already uses this V4 UUID",
+            "cause": (
+                "The target conversation exists but has no canonical migration mapping."
+            ),
+            "recommendation": (
+                "Use exact reuse, or explicitly select V4-authoritative replacement "
+                "when the existing unmapped V5 conversation may be discarded."
+            ),
+            "facts": count_facts,
+        }
+
+    if "canonical agent owner mismatch" in lower:
+        return {
+            "code": "CANONICAL_AGENT_OWNER_MISMATCH",
+            "title": "An older migration mapped this agent to another user",
+            "cause": (
+                "The canonical agent mapping exists, but its live V5 row belongs "
+                "to a different resolved owner."
+            ),
+            "recommendation": (
+                "Inspect the listed mapping-owner run. Canonical active-user agents "
+                "are never silently reassigned."
+            ),
+            "facts": count_facts,
+        }
+
+    if (
+        "agent exact adoption" in lower
+        or "agent uuid collision" in lower
+        or "agent helper uuid collision" in lower
+    ):
+        return {
+            "code": "AGENT_COLLISION",
+            "title": "An existing agent does not match the planned legacy agent",
+            "cause": (
+                "A deterministic V5 agent or helper UUID already exists without "
+                "a compatible canonical mapping."
+            ),
+            "recommendation": (
+                "Review the batch-wide agent preflight details. Exact copies are "
+                "adopted automatically; ambiguous agent graphs remain blocked."
             ),
             "facts": count_facts,
         }

@@ -2,8 +2,11 @@ import pandas as pd
 
 from utils.db import ConnectionConfig
 from utils.ownership_preflight import (
+    active_owner_folder_conflicts,
     find_canonical_ownership_conflicts,
     ownership_conflict_message,
+    repair_orphaned_document_owners,
+    repair_orphaned_folder_owners,
 )
 
 
@@ -69,3 +72,98 @@ def test_preflight_accepts_empty_owned_scope(monkeypatch):
         TARGET,
         {"folders": [], "documents": []},
     ) == []
+
+
+def test_orphaned_document_owner_is_repaired_only_to_existing_user(
+    monkeypatch,
+):
+    expected_owner = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    actual_owner = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    conflict = {
+        "entity_type": "documents",
+        "old_id": "legacy-doc",
+        "mapped_entity_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "actual_owner_id": actual_owner,
+        "expected_owner_id": expected_owner,
+    }
+    monkeypatch.setattr(
+        "utils.ownership_preflight.execute_query",
+        lambda *_args, **_kwargs: pd.DataFrame([{"id": expected_owner}]),
+    )
+
+    class FakeCursor:
+        rowcount = 0
+
+        def __init__(self):
+            self.params = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, _query, params):
+            self.params = params
+            self.rowcount = 1
+
+    class FakeConnection:
+        def __init__(self):
+            self.cursor_instance = FakeCursor()
+            self.committed = False
+            self.closed = False
+
+        def cursor(self):
+            return self.cursor_instance
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            raise AssertionError("repair should not roll back")
+
+        def close(self):
+            self.closed = True
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        "utils.ownership_preflight.get_connection",
+        lambda _config: connection,
+    )
+
+    repaired = repair_orphaned_document_owners(TARGET, [conflict])
+
+    assert repaired == [conflict]
+    assert connection.cursor_instance.params == (
+        expected_owner,
+        conflict["mapped_entity_id"],
+        actual_owner,
+        "documents",
+        conflict["old_id"],
+    )
+    assert connection.committed is True
+    assert connection.closed is True
+
+
+def test_active_folder_owner_is_excluded_from_automatic_repair(monkeypatch):
+    active_owner = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    conflict = {
+        "entity_type": "folders",
+        "old_id": "565",
+        "mapped_entity_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "actual_owner_id": active_owner,
+        "expected_owner_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    }
+    monkeypatch.setattr(
+        "utils.ownership_preflight.execute_query",
+        lambda *_args, **_kwargs: pd.DataFrame([{"id": active_owner}]),
+    )
+    monkeypatch.setattr(
+        "utils.ownership_preflight.get_connection",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("active owner must never be reassigned")
+        ),
+    )
+
+    assert repair_orphaned_folder_owners(TARGET, [conflict]) == []
+    assert active_owner_folder_conflicts(TARGET, [conflict]) == [conflict]
