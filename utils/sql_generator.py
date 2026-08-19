@@ -8,7 +8,7 @@ import json
 import re
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Mapping, Optional
 import pandas as pd
 from pathlib import Path
 import glob
