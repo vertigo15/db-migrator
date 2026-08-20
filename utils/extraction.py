@@ -472,9 +472,6 @@ class ExtractionEngine:
                     org_id=self.organization_id,
                     user_id_overrides=self.user_id_overrides,
                     migration_run_id=self.migration_run_id,
-                    conversation_collision_policy=(
-                        self.conversation_collision_policy
-                    ),
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to generate users SQL: {e}") from e
@@ -520,6 +517,9 @@ class ExtractionEngine:
                     source_info=source_info,
                     user_id_overrides=self.user_id_overrides,
                     migration_run_id=self.migration_run_id,
+                    conversation_collision_policy=(
+                        self.conversation_collision_policy
+                    ),
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to generate folders SQL: {e}") from e
