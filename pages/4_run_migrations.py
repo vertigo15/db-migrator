@@ -23,9 +23,11 @@ from utils.file_preview import (
 )
 from utils.config import SessionKeys, get_env_connection_defaults
 from utils.migration_tracking import (
+    distributed_step_statuses,
     finalize_distributed_run,
     reconcile_rollback_status,
 )
+from utils.worker_runtime import reverify_completed_step
 from utils.rollback import (
     DB_MAPPING,
     ALL_STEPS,
@@ -239,14 +241,54 @@ def render_shard_queue_section(migration_files, files_by_prefix, progress):
             st.rerun()
 
     if is_run_fully_enqueued_and_done(progress):
-        st.success("✅ All enqueued steps are completed and verified.")
-        if st.button("🏁 Finalize Batch"):
-            try:
-                _finalize_batch(batch_id)
-                st.success("Batch finalized.")
-            except Exception as exc:
-                st.error(f"Could not finalize batch: {exc}")
-            st.rerun()
+        step_statuses = distributed_step_statuses(base_config, batch_id)
+        run_verified = bool(step_statuses) and all(
+            status in {"completed", "skipped"}
+            for status in step_statuses.values()
+        )
+        failed_verification_steps = [
+            step_key
+            for step_key, status in step_statuses.items()
+            if status == "failed" and step_key in active
+        ]
+        if run_verified:
+            st.success("✅ All enqueued steps are completed and verified.")
+            if st.button("🏁 Finalize Batch"):
+                try:
+                    _finalize_batch(batch_id)
+                    st.success("Batch finalized.")
+                except Exception as exc:
+                    st.error(f"Could not finalize batch: {exc}")
+                st.rerun()
+        elif failed_verification_steps:
+            st.error(
+                "All SQL shards committed, but post-migration verification "
+                "failed. Resume cannot rerun completed shards. Correct the "
+                "reported data/tracking issue, then re-run verification, or "
+                "roll back and create a fresh extraction."
+            )
+            for failed_step in failed_verification_steps:
+                if st.button(
+                    f"🔎 Re-run verification for {failed_step}",
+                    key=f"reverify_{batch_id}_{failed_step}",
+                ):
+                    try:
+                        verified = reverify_completed_step(
+                            base_config,
+                            batch_id,
+                            failed_step,
+                            source_config=_source_tracking_config(),
+                        )
+                        if verified:
+                            st.success(f"{failed_step} verified successfully.")
+                    except Exception as exc:
+                        st.error(f"{failed_step} still fails verification: {exc}")
+                    st.rerun()
+        else:
+            st.warning(
+                "All shards are completed, but step verification has not "
+                "finished. Refresh status before finalizing."
+            )
 
     failures = failed_shard_details(base_config, batch_id)
     if failures:

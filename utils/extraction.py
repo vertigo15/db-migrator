@@ -24,17 +24,12 @@ from utils.sql_generator import (
     generate_conversations_logs_migration_sql,
     generate_conversions_migration_sql,
     generate_agents_migration_sql,
+    clean_string,
     deterministic_uuid_v4_py,
     USER_NAMESPACE_UUID,
 )
 from utils.conversation_preflight import build_conversation_manifest
 from utils.agent_preflight import build_agent_manifest
-
-CONVERSATION_UUID_PATTERN = (
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
-    r"[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
-)
-
 
 def normalize_email(value: object) -> str:
     """Return the canonical email key used for source/target matching."""
@@ -58,7 +53,7 @@ def build_conversation_scope_cte(
         raise ValueError("At least one user ID is required for conversation scope")
 
     placeholders = ", ".join(["%s"] * len(user_ids))
-    params: List[object] = list(user_ids) + [CONVERSATION_UUID_PATTERN]
+    params: List[object] = list(user_ids)
     having = []
     if date_from is not None:
         having.append("MIN(l.created_at) >= %s")
@@ -82,7 +77,7 @@ def build_conversation_scope_cte(
                 COUNT(*)::bigint AS log_row_count
             FROM public.{table_name} l
             WHERE l.user_id IN ({placeholders})
-              AND btrim(l.chat_id::text) ~ %s
+              AND NULLIF(btrim(l.chat_id::text), '') IS NOT NULL
             GROUP BY l.user_id, lower(btrim(l.chat_id::text))
             {having_sql}
         ),
@@ -179,8 +174,46 @@ def resolve_existing_user_overrides(
     target_by_email = {
         row["normalized_email"]: row for _, row in target_df.iterrows()
     } if not target_df.empty else {}
-    manual = manual_overrides or {}
+    manual = {
+        str(legacy_id): str(v5_id)
+        for legacy_id, v5_id in (manual_overrides or {}).items()
+    }
+    manual_targets_by_id: Dict[str, pd.Series] = {}
+    if manual:
+        invalid_ids = []
+        for v5_id in sorted(set(manual.values())):
+            try:
+                uuid.UUID(v5_id)
+            except (ValueError, TypeError, AttributeError):
+                invalid_ids.append(v5_id)
+        if invalid_ids:
+            raise ValueError(
+                "Manual overrides contain invalid V5 UUIDs: "
+                + ", ".join(invalid_ids)
+            )
+        manual_target_df = execute_query(
+            target_user_config,
+            """
+            SELECT id::text AS v5_user_id, email, organization_id::text
+            FROM public.users
+            WHERE id = ANY(%s::uuid[])
+            """,
+            (sorted(set(manual.values())),),
+        )
+        manual_targets_by_id = {
+            str(row["v5_user_id"]): row
+            for _, row in manual_target_df.iterrows()
+        }
+        missing_manual_ids = sorted(
+            set(manual.values()) - set(manual_targets_by_id)
+        )
+        if missing_manual_ids:
+            raise ValueError(
+                "Manual overrides reference missing V5 users: "
+                + ", ".join(missing_manual_ids)
+            )
     resolved: Dict[str, str] = {}
+    existing_overrides: Dict[str, str] = {}
     users: List[Dict[str, str]] = []
     warnings: List[str] = []
 
@@ -190,6 +223,13 @@ def resolve_existing_user_overrides(
         target_row = target_by_email.get(source_row["normalized_email"])
         automatic_id = str(target_row["v5_user_id"]) if target_row is not None else None
         manual_id = manual.get(legacy_id)
+        if manual_id:
+            manual_target = manual_targets_by_id[manual_id]
+            if normalize_email(manual_target.get("email")) != normalize_email(email):
+                raise ValueError(
+                    f"Manual override for {email} points to V5 user "
+                    f"{manual_id} with a different email."
+                )
         if manual_id and automatic_id and str(manual_id) != automatic_id:
             raise ValueError(
                 f"Manual override for {email} conflicts with its normalized-email V5 match."
@@ -203,6 +243,8 @@ def resolve_existing_user_overrides(
         # mappings are database-local, so document_db/completion_db cannot rely
         # on the users step executed in user_db.
         resolved[legacy_id] = v5_user_id
+        if action == "reused":
+            existing_overrides[legacy_id] = v5_user_id
         if target_row is not None and target_row.get("organization_id"):
             warnings.append(
                 f"{email} already belongs to V5 organization "
@@ -222,7 +264,12 @@ def resolve_existing_user_overrides(
             + ", ".join(sorted(unmatched_manual))
         )
 
-    return {"overrides": resolved, "users": users, "warnings": warnings}
+    return {
+        "overrides": resolved,
+        "existing_overrides": existing_overrides,
+        "users": users,
+        "warnings": warnings,
+    }
 
 
 def validate_target_organization(
@@ -268,6 +315,7 @@ class ExtractionEngine:
         conversation_collision_policy: str = "adopt_exact",
         agent_collision_policy: str = "adopt_exact",
         include_chunkless_documents: bool = False,
+        existing_user_overrides: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize extraction engine.
@@ -283,8 +331,9 @@ class ExtractionEngine:
             embedding_model: Default embedding model name for chunks/embeddings
             skip_empty_embeddings: Skip rows without embeddings in chunks/embeddings migration
             target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
-            user_id_overrides: Optional mapping of {v4_user_id: existing_v5_uuid} for users
-                               who already exist in V5 with a different UUID
+            user_id_overrides: Complete run-scoped mapping of V4 user IDs to
+                               their planned or existing V5 UUIDs
+            existing_user_overrides: Subset proven to already exist in V5
             include_chunkless_documents: Preserve metadata-only documents that
                                          have no V4 chunk rows (default: False)
         """
@@ -299,6 +348,9 @@ class ExtractionEngine:
         self.skip_empty_embeddings = skip_empty_embeddings
         self.target_embedding_dim = target_embedding_dim
         self.user_id_overrides = user_id_overrides or {}
+        self.existing_user_overrides = (
+            existing_user_overrides or {}
+        )
         self.migration_run_id = migration_run_id or str(uuid.uuid4())
         if cross_owner_policy not in {"owned_only", "block", "reassign"}:
             raise ValueError(
@@ -436,16 +488,27 @@ class ExtractionEngine:
         group_select = f'"{group_col}" AS "__group_id__",' if group_col else 'NULL::text AS "__group_id__",'
         
         if user_emails:
-            placeholders = ", ".join(["%s"] * len(user_emails))
+            normalized_emails = [
+                normalize_email(email)
+                for email in user_emails
+                if normalize_email(email)
+            ]
+            if not normalized_emails:
+                raise ValueError("No valid user emails were supplied for extraction.")
+            placeholders = ", ".join(["%s"] * len(normalized_emails))
             query = f"""
                 SELECT id, name, letter_checkbox, created_at, last_connected, times_connected,
                        token_used, words_used, phone_number, company_name, company_name_in_hebrew,
                        job, department, email, {group_select} token_limit, model, history_categories,
                        enabled_features, azure_oid, subfeatures, last_name
                 FROM public.{table_name}
-                WHERE email IN ({placeholders})
+                WHERE lower(trim(email)) IN ({placeholders})
             """
-            df = execute_query(self.config, query, tuple(user_emails))
+            df = execute_query(
+                self.config,
+                query,
+                tuple(normalized_emails),
+            )
         else:
             query = f"""
                 SELECT id, name, letter_checkbox, created_at, last_connected, times_connected,
@@ -470,7 +533,7 @@ class ExtractionEngine:
                     output_file=sql_output_path,
                     source_info=source_info,
                     org_id=self.organization_id,
-                    user_id_overrides=self.user_id_overrides,
+                    user_id_overrides=self.existing_user_overrides,
                     migration_run_id=self.migration_run_id,
                 )
             except Exception as e:
@@ -517,9 +580,6 @@ class ExtractionEngine:
                     source_info=source_info,
                     user_id_overrides=self.user_id_overrides,
                     migration_run_id=self.migration_run_id,
-                    conversation_collision_policy=(
-                        self.conversation_collision_policy
-                    ),
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to generate folders SQL: {e}") from e
@@ -1998,6 +2058,7 @@ class ExtractionEngine:
         date_to: Optional[datetime] = None,
         max_per_user: Optional[int] = None,
         selected_chat_ids: Optional[List[str]] = None,
+        agent_id_by_bot_id: Optional[Dict[str, str]] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Extract conversation logs belonging to specified users.
@@ -2062,6 +2123,10 @@ class ExtractionEngine:
                     source_info=source_info,
                     user_id_overrides=self.user_id_overrides,
                     migration_run_id=self.migration_run_id,
+                    conversation_collision_policy=(
+                        self.conversation_collision_policy
+                    ),
+                    agent_id_by_bot_id=agent_id_by_bot_id,
                 )
             except Exception as e:
                 raise RuntimeError(
@@ -2382,6 +2447,10 @@ class ExtractionEngine:
                 final_frames.get("agents", agents_df),
                 self.user_id_overrides,
             )
+            agent_id_by_bot_id = {
+                str(row["bot_id"]): str(row["agent_id"])
+                for row in results["agent_manifest"]
+            }
 
             # 7. Extract logs (conversations/messages)
             current_step += 1
@@ -2392,23 +2461,43 @@ class ExtractionEngine:
                 date_to=conv_date_to,
                 max_per_user=conv_max_per_user,
                 selected_chat_ids=selected_conversation_chat_ids,
+                agent_id_by_bot_id=agent_id_by_bot_id,
             )
             results["files"]["logs"] = logs_path
             results["summary"]["logs"] = len(logs_df)
             valid_chat_ids = set()
-            invalid_chat_rows = 0
+            missing_chat_rows = 0
+            remapped_non_uuid_chat_ids = set()
             for value in logs_df.get("chat_id", []):
                 if value is None or (
                     isinstance(value, float) and pd.isna(value)
                 ):
-                    invalid_chat_rows += 1
+                    missing_chat_rows += 1
                     continue
                 try:
                     valid_chat_ids.add(str(uuid.UUID(str(value).strip())))
                 except (ValueError, TypeError, AttributeError):
-                    invalid_chat_rows += 1
-            results["summary"]["conversations"] = len(valid_chat_ids)
-            results["summary"]["invalid_chat_rows"] = invalid_chat_rows
+                    remapped_non_uuid_chat_ids.add(str(value).strip().lower())
+            results["summary"]["conversations"] = (
+                len(valid_chat_ids) + len(remapped_non_uuid_chat_ids)
+            )
+            results["summary"]["invalid_chat_rows"] = missing_chat_rows
+            results["summary"]["remapped_non_uuid_conversations"] = len(
+                remapped_non_uuid_chat_ids
+            )
+            referenced_bot_ids = {
+                clean_string(value)
+                for value in logs_df.get("bot_id", [])
+                if clean_string(value)
+            }
+            results["agent_conversation_report"] = {
+                "linked_bot_ids": sorted(
+                    referenced_bot_ids & set(agent_id_by_bot_id)
+                ),
+                "unlinked_bot_ids": sorted(
+                    referenced_bot_ids - set(agent_id_by_bot_id)
+                ),
+            }
             results["conversation_manifest"] = build_conversation_manifest(
                 logs_df,
                 self.user_id_overrides,

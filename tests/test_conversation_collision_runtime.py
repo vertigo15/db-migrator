@@ -9,6 +9,7 @@ from utils.sql_generator import (
 
 CHAT_ID = "11111111-1111-4111-8111-111111111111"
 OWNER_ID = "22222222-2222-4222-8222-222222222222"
+AGENT_ID = "33333333-3333-4333-8333-333333333333"
 NAMESPACE = "0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b"
 
 
@@ -24,7 +25,14 @@ def _connect(base):
 def _conversation():
     return {
         "chat_id": CHAT_ID,
+        "legacy_chat_id": CHAT_ID,
         "user_id": "legacy-user",
+        "agent_id": AGENT_ID,
+        "metadata": {
+            "initiatedByAgentId": AGENT_ID,
+            "legacyBotId": "legacy-agent",
+            "legacyAgentLinkMissing": False,
+        },
         "logs": pd.DataFrame([{"id": "legacy-log"}]),
     }
 
@@ -38,7 +46,8 @@ def _prepare_tables(cursor):
         DROP SCHEMA IF EXISTS migration CASCADE;
         CREATE TABLE conversations (
             id uuid PRIMARY KEY,
-            user_id uuid NOT NULL
+            user_id uuid NOT NULL,
+            metadata jsonb
         );
         CREATE TABLE messages (
             id uuid PRIMARY KEY,
@@ -111,6 +120,11 @@ def test_exact_legacy_conversation_is_adopted(postgres_cluster):
                 (CHAT_ID,),
             )
             assert cursor.fetchone() == (CHAT_ID, None, "reused")
+            cursor.execute(
+                "SELECT metadata FROM conversations WHERE id = %s",
+                (CHAT_ID,),
+            )
+            assert cursor.fetchone()[0]["initiatedByAgentId"] == AGENT_ID
         conn.rollback()
     finally:
         conn.close()
@@ -158,6 +172,64 @@ def test_v4_authoritative_policy_removes_unmapped_collision(postgres_cluster):
                 """
             )
             assert cursor.fetchone() == (0, 0, 0)
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_canonical_conversation_backfills_agent_metadata(postgres_cluster):
+    conn = _connect(postgres_cluster)
+    try:
+        with conn.cursor() as cursor:
+            _prepare_tables(cursor)
+            user_message, assistant_message, user_block, assistant_block = (
+                _expected_ids(cursor)
+            )
+            cursor.execute(
+                "INSERT INTO conversations (id, user_id) VALUES (%s, %s)",
+                (CHAT_ID, OWNER_ID),
+            )
+            cursor.executemany(
+                "INSERT INTO messages (id, conversation_id) VALUES (%s, %s)",
+                [(user_message, CHAT_ID), (assistant_message, CHAT_ID)],
+            )
+            cursor.executemany(
+                """
+                INSERT INTO message_content_blocks (id, message_id)
+                VALUES (%s, %s)
+                """,
+                [(user_block, user_message), (assistant_block, assistant_message)],
+            )
+            cursor.execute(
+                """
+                INSERT INTO migration.id_mappings (
+                    table_name, old_id, new_id, migration_batch,
+                    record_action
+                ) VALUES (
+                    'conversations', %s, %s::uuid, 'older-run', 'created'
+                )
+                """,
+                (CHAT_ID, CHAT_ID),
+            )
+
+            cursor.execute(
+                _conversation_collision_sql(
+                    _conversation(),
+                    NAMESPACE,
+                    {"legacy-user": OWNER_ID},
+                    "adopt_exact",
+                )
+            )
+
+            cursor.execute(
+                "SELECT metadata FROM conversations WHERE id = %s",
+                (CHAT_ID,),
+            )
+            assert cursor.fetchone()[0] == {
+                "initiatedByAgentId": AGENT_ID,
+                "legacyBotId": "legacy-agent",
+                "legacyAgentLinkMissing": False,
+            }
         conn.rollback()
     finally:
         conn.close()

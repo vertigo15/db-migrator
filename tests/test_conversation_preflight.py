@@ -5,6 +5,10 @@ from utils.conversation_preflight import (
     inspect_conversation_conflicts,
 )
 from utils.db import ConnectionConfig
+from utils.sql_generator import (
+    CONVERSATION_MESSAGES_NAMESPACE_UUID,
+    deterministic_uuid_v4_py,
+)
 
 
 TARGET = ConnectionConfig("target", 5432, "user_db", "user", "password")
@@ -82,3 +86,27 @@ def test_preflight_reports_all_adoptable_and_mismatched_conversations(
         mismatch_chat,
     }
     assert replacement["conflicts"] == []
+
+
+def test_manifest_preserves_non_uuid_legacy_chat_id():
+    legacy_chat_id = "agent-chat-legacy"
+    manifest = build_conversation_manifest(
+        pd.DataFrame([{
+            "id": "legacy-log",
+            "user_id": "legacy-user",
+            "chat_id": legacy_chat_id,
+        }]),
+        {"legacy-user": OWNER_ID},
+    )
+
+    assert manifest == [{
+        "chat_id": str(deterministic_uuid_v4_py(
+            CONVERSATION_MESSAGES_NAMESPACE_UUID,
+            f"conversation-{legacy_chat_id}",
+        )),
+        "legacy_chat_id": legacy_chat_id,
+        "legacy_owner_id": "legacy-user",
+        "expected_owner_id": OWNER_ID,
+        "message_ids": manifest[0]["message_ids"],
+        "block_ids": manifest[0]["block_ids"],
+    }]

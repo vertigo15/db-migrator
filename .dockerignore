@@ -27,6 +27,7 @@ ENV/
 output/
 backups/
 .tmp_db_move/
+*.tar
 
 # IDE
 .idea/

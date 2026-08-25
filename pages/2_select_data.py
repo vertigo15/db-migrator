@@ -2328,6 +2328,9 @@ def render_extraction_section(
             skip_empty_embeddings=skip_empty_embeddings if generate_sql else False,
             target_embedding_dim=target_embedding_dim if generate_sql else None,
             user_id_overrides=user_id_overrides if generate_sql else {},
+            existing_user_overrides=(
+                resolution["existing_overrides"] if generate_sql else {}
+            ),
             migration_run_id=migration_run_id,
             cross_owner_policy=cross_owner_policy,
             conversation_collision_policy=conversation_collision_policy,
@@ -2694,7 +2697,35 @@ def render_extraction_section(
         if invalid_chat_rows:
             st.warning(
                 f"{invalid_chat_rows} conversation log row(s) had a null, "
-                "blank, or invalid chat UUID and were skipped."
+                "or blank chat ID and could not be grouped into conversations."
+            )
+        remapped_chat_ids = results.get("summary", {}).get(
+            "remapped_non_uuid_conversations", 0
+        )
+        if remapped_chat_ids:
+            st.info(
+                f"{remapped_chat_ids} conversation(s) used legacy non-UUID "
+                "chat IDs. They were assigned stable deterministic V5 UUIDs."
+            )
+        agent_conversation_report = results.get(
+            "agent_conversation_report", {}
+        )
+        linked_bot_ids = agent_conversation_report.get("linked_bot_ids", [])
+        unlinked_bot_ids = agent_conversation_report.get(
+            "unlinked_bot_ids", []
+        )
+        if linked_bot_ids:
+            st.success(
+                f"Linked conversations to {len(linked_bot_ids)} migrated "
+                "agent(s)."
+            )
+        if unlinked_bot_ids:
+            st.warning(
+                f"Conversation history references {len(unlinked_bot_ids)} "
+                "V4 agent(s) that are not in the selected agent migration. "
+                "Those conversations will be migrated with their legacy bot "
+                "ID but cannot appear under a V5 agent. First IDs: "
+                + ", ".join(unlinked_bot_ids[:10])
             )
 
         document_filter_report = results.get("document_filter_report", {})

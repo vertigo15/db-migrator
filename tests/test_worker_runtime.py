@@ -35,6 +35,7 @@ from utils.worker_runtime import (
     ensure_worker_runtime_schema,
     execute_claimed_shard,
     reconcile_terminal_failures,
+    reverify_completed_step,
 )
 
 
@@ -416,6 +417,56 @@ def test_worker_marks_step_failed_when_verification_count_mismatches(postgres_cl
     assert outcomes[-1].step_finalized is False
     status, _ = _step_status(postgres_cluster, run_id, "01_users")
     assert status == "failed"
+
+
+def test_completed_shards_can_be_reverified_after_tracking_is_corrected(
+    postgres_cluster,
+    tmp_path,
+):
+    run_id = str(uuid.uuid4())
+    _seed_run_and_step(postgres_cluster, run_id, expected_count=2)
+    shard_specs = [
+        (*_write_shard(tmp_path, 1, run_id, ["u1"]), ["u1"]),
+    ]
+    enqueue_shards(
+        postgres_cluster,
+        run_id,
+        "01_users",
+        _manifest_from_shards(shard_specs),
+    )
+    claimed = claim_shard(
+        postgres_cluster, "user_db", worker_id="worker-a"
+    )
+    outcome = execute_claimed_shard(
+        postgres_cluster, claimed, "worker-a"
+    )
+    assert outcome.success is True
+    assert outcome.step_finalized is False
+
+    conn = _connect(postgres_cluster, "user_db")
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE migration.migration_steps
+                SET expected_count = 1
+                WHERE migration_run_id = %s::uuid
+                  AND step_key = '01_users'
+                """,
+                (run_id,),
+            )
+    finally:
+        conn.close()
+
+    assert reverify_completed_step(
+        postgres_cluster, run_id, "01_users"
+    )
+    status, affected = _step_status(
+        postgres_cluster, run_id, "01_users"
+    )
+    assert status == "completed"
+    assert affected == 1
 
 
 def test_worker_rejects_shard_with_bad_checksum(

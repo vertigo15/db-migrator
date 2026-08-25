@@ -509,3 +509,30 @@ def finalize_step_if_complete(
         source_config=source_config,
     )
     return True
+
+
+def reverify_completed_step(
+    base_config: ConnectionConfig,
+    run_id: str,
+    step_key: str,
+    source_config: Optional[ConnectionConfig] = None,
+) -> bool:
+    """Re-run verification only after every shard committed successfully."""
+    summary = step_shard_summary(base_config, run_id, step_key)
+    if summary["total"] == 0 or summary["completed"] != summary["total"]:
+        raise RuntimeError(
+            f"Cannot re-verify {step_key}: not every shard is completed"
+        )
+    result = finalize_step_if_complete(
+        base_config,
+        run_id,
+        step_key,
+        source_config=source_config,
+    )
+    if result is True and is_distributed_run_ready(base_config, run_id):
+        finalize_distributed_run(
+            base_config,
+            run_id,
+            source_config=source_config,
+        )
+    return result is True

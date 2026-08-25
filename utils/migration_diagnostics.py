@@ -71,6 +71,7 @@ def is_non_retryable_failure(
         "canonical document owner mismatch",
         "canonical conversation owner mismatch",
         "canonical conversation mapping mismatch",
+        "conversation agent association mismatch",
         "conversation uuid collision",
         "conversation exact adoption",
         "canonical agent owner mismatch",

@@ -641,6 +641,16 @@ def generate_user_insert(
 -- V4 old_id: {old_id} -> V5 UUID: {v5_uuid}
 DO $$
 BEGIN
+    -- Preflight proved that this user already exists. Recheck at execution
+    -- time so a deleted or incorrect override cannot create stale tracking.
+    IF NOT EXISTS (
+        SELECT 1 FROM public.users WHERE id = '{v5_uuid}'::uuid
+    ) THEN
+        RAISE EXCEPTION
+            'Resolved existing V5 user is missing for legacy user % (expected id %)',
+            {escape_sql_string(old_id)}, '{v5_uuid}'::uuid;
+    END IF;
+
     -- User already exists in V5; skip INSERT.
     -- Register mapping in migration.id_mappings for audit and downstream tracking.
     INSERT INTO migration.id_mappings (
@@ -756,6 +766,25 @@ END $$;
         "v_old_id",
         "v_new_id",
     )
+    planned_user_declare = "\n    v_planned_id UUID := NULL;"
+    planned_user_guard = ""
+    if migration_run_id:
+        planned_user_declare = f"""
+    v_planned_id UUID := (
+        SELECT v5_user_id
+        FROM migration.migration_run_users
+        WHERE migration_run_id = {_migration_run_sql(migration_run_id)}
+          AND legacy_user_id = {escape_sql_string(old_id)}
+    );"""
+        planned_user_guard = """
+        IF v_planned_id IS NOT NULL
+           AND v_new_id IS DISTINCT FROM v_planned_id THEN
+            RAISE EXCEPTION
+                'Runtime V5 user resolution changed for legacy user % '
+                '(planned %, resolved %)',
+                v_old_id, v_planned_id, v_new_id;
+        END IF;
+"""
     
     # Generate SQL with mapping table integration
     sql = f"""
@@ -767,12 +796,13 @@ DECLARE
     v_new_id UUID;
     v_existing_id UUID;
     v_match_count INTEGER;
-    v_action VARCHAR := 'created';
+    v_action VARCHAR := 'created';{planned_user_declare}
 BEGIN
     -- 1. Reuse a valid canonical mapping from a previous run without
     -- transferring its rollback ownership to this run.
     IF migration.is_migrated('users', v_old_id) THEN
         v_new_id := migration.get_new_id('users', v_old_id);
+{planned_user_guard}
 {mapped_user_tracking_sql}
         RAISE NOTICE 'User % already migrated (old_id: %)', v_email, v_old_id;
         RETURN;
@@ -793,6 +823,7 @@ BEGIN
     END IF;
     IF v_existing_id IS NOT NULL THEN
         v_new_id := v_existing_id;
+{planned_user_guard}
         -- Link only - do NOT modify existing user data
         INSERT INTO migration.id_mappings (
             table_name, old_id, new_id, migration_batch,
@@ -808,7 +839,12 @@ BEGIN
     END IF;
 
     -- 3. New user - generate deterministic UUID and INSERT
-    v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
+    v_new_id := COALESCE(
+        v_planned_id,
+        migration.deterministic_uuid_v4(
+            '{USER_NAMESPACE_UUID}'::uuid, v_old_id
+        )
+    );
 
     BEGIN
         INSERT INTO public.users (
@@ -855,10 +891,14 @@ BEGIN
             RAISE NOTICE 'User %: username conflict, used email as username', v_email;
         EXCEPTION WHEN unique_violation THEN
             -- Edge case: email conflict appeared between our check and insert
-            SELECT id INTO v_new_id FROM public.users WHERE email = v_email LIMIT 1;
+            SELECT id INTO v_new_id
+            FROM public.users
+            WHERE lower(trim(email)) = lower(trim(v_email))
+            LIMIT 1;
             IF v_new_id IS NULL THEN
                 RAISE EXCEPTION 'Cannot insert user % - unresolvable unique violation', v_email;
             END IF;
+{planned_user_guard}
             v_action := 'reused';
             RAISE NOTICE 'User % appeared concurrently in V5, linking to %', v_email, v_new_id;
         END;
@@ -981,6 +1021,22 @@ BEGIN
     FROM migration.id_mappings
     WHERE table_name = 'users'
       AND old_id IN ({ids_array});
+
+    IF EXISTS (
+        SELECT 1
+        FROM migration.migration_run_users planned
+        LEFT JOIN migration.id_mappings mapped
+          ON mapped.table_name = 'users'
+         AND mapped.old_id = planned.legacy_user_id
+         AND mapped.new_id = planned.v5_user_id
+        WHERE planned.migration_run_id = {_migration_run_sql(migration_run_id)}
+          AND planned.legacy_user_id IN ({ids_array})
+          AND mapped.new_id IS NULL
+    ) THEN
+        RAISE EXCEPTION
+            'User mapping validation failed: runtime UUID differs from '
+            'the run-scoped planned UUID';
+    END IF;
 
     IF v_mapped = v_expected THEN
         RAISE NOTICE '[VALIDATION OK] All % users mapped successfully.', v_expected;
@@ -2663,7 +2719,10 @@ def _conversation_collision_sql(
 ) -> str:
     """Build the runtime guard for one canonical conversation UUID."""
     chat_id = str(conversation["chat_id"])
+    legacy_chat_id = str(conversation.get("legacy_chat_id") or chat_id)
     owner_id = str(conversation["user_id"])
+    conversation_metadata = conversation.get("metadata")
+    expected_agent_id = conversation.get("agent_id")
     legacy_log_ids = [
         clean_string(row.get("id"))
         for _, row in conversation["logs"].iterrows()
@@ -2685,6 +2744,31 @@ def _conversation_collision_sql(
     expected_messages_sql = _uuid_array_sql(message_ids)
     expected_blocks_sql = _uuid_array_sql(block_ids)
     expected_owner_sql = resolve_user_id_sql(owner_id, user_id_overrides)
+    metadata_reconciliation_sql = ""
+    if conversation_metadata:
+        metadata_sql = escape_json_for_sql(conversation_metadata)
+        agent_guard_sql = ""
+        if expected_agent_id:
+            agent_guard_sql = f"""
+        IF EXISTS (
+            SELECT 1
+            FROM conversations
+            WHERE id = v_chat_id
+              AND metadata ? 'initiatedByAgentId'
+              AND metadata->>'initiatedByAgentId'
+                  <> {escape_sql_string(str(expected_agent_id))}
+        ) THEN
+            RAISE EXCEPTION
+                'Conversation agent association mismatch for legacy conversation %',
+                v_old_chat_id;
+        END IF;
+"""
+        metadata_reconciliation_sql = f"""
+{agent_guard_sql}
+        UPDATE conversations
+        SET metadata = COALESCE(metadata, '{{}}'::jsonb) || {metadata_sql}
+        WHERE id = v_chat_id;
+"""
 
     if collision_policy == "replace_unmapped":
         unmapped_collision_sql = """
@@ -2733,7 +2817,7 @@ def _conversation_collision_sql(
             v_chat_id;
 """
     else:
-        unmapped_collision_sql = """
+        unmapped_collision_sql = f"""
         IF NOT EXISTS (
             SELECT 1 FROM conversations
             WHERE id = v_chat_id AND user_id = v_expected_user_id
@@ -2779,19 +2863,21 @@ def _conversation_collision_sql(
             table_name, old_id, new_id, migration_batch,
             migration_run_id, record_action, notes
         ) VALUES (
-            'conversations', v_chat_id::text, v_chat_id,
+            'conversations', v_old_chat_id, v_chat_id,
             'legacy_adoption', NULL, 'reused',
             'Adopted exact previously migrated conversation'
         );
         RAISE NOTICE
             'Adopted exact previously migrated conversation %',
             v_chat_id;
+{metadata_reconciliation_sql}
 """
 
     return f"""
 DO $conversation_collision$
 DECLARE
     v_chat_id uuid := '{chat_id}'::uuid;
+    v_old_chat_id text := {escape_sql_string(legacy_chat_id)};
     v_expected_user_id uuid := {expected_owner_sql};
     v_expected_message_ids uuid[] := {expected_messages_sql};
     v_expected_block_ids uuid[] := {expected_blocks_sql};
@@ -2806,11 +2892,11 @@ BEGIN
     INTO v_mapping_old_id, v_mapping_new_id
     FROM migration.id_mappings
     WHERE table_name = 'conversations'
-      AND (old_id = v_chat_id::text OR new_id = v_chat_id)
+      AND (old_id = v_old_chat_id OR new_id = v_chat_id)
     LIMIT 1;
 
     IF FOUND THEN
-        IF v_mapping_old_id <> v_chat_id::text
+        IF v_mapping_old_id <> v_old_chat_id
            OR v_mapping_new_id <> v_chat_id
         THEN
             RAISE EXCEPTION
@@ -2823,8 +2909,9 @@ BEGIN
         ) THEN
             RAISE EXCEPTION
                 'Canonical conversation owner mismatch for legacy conversation %',
-                v_chat_id;
+                v_old_chat_id;
         END IF;
+{metadata_reconciliation_sql}
         RETURN;
     END IF;
 
@@ -2844,6 +2931,7 @@ def generate_conversations_logs_migration_sql(
     user_id_overrides: Optional[Dict[str, str]] = None,
     migration_run_id: Optional[str] = None,
     conversation_collision_policy: str = "adopt_exact",
+    agent_id_by_bot_id: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for jeen_dev_logs.
@@ -2867,6 +2955,11 @@ def generate_conversations_logs_migration_sql(
             "conversation_collision_policy must be 'adopt_exact', "
             "'replace_unmapped', or 'block'"
         )
+    planned_agent_ids = {
+        str(bot_id).strip(): str(agent_id)
+        for bot_id, agent_id in (agent_id_by_bot_id or {}).items()
+        if str(bot_id).strip() and str(agent_id).strip()
+    }
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
     # Clean up old conversations migration files
@@ -2874,23 +2967,47 @@ def generate_conversations_logs_migration_sql(
     
     source_row_count = len(logs_df)
 
-    def normalize_chat_uuid(value):
+    def normalize_legacy_chat_id(value):
         if _is_scalar_na(value):
             return None
         text = str(value).strip()
         if not text:
             return None
-        try:
-            return str(uuid.UUID(text))
-        except (ValueError, TypeError, AttributeError):
-            return None
+        return text.lower()
 
-    normalized_chat_ids = logs_df["chat_id"].apply(normalize_chat_uuid)
+    def target_chat_uuid(legacy_chat_id: str) -> tuple[str, bool]:
+        try:
+            return str(uuid.UUID(legacy_chat_id)), False
+        except (ValueError, TypeError, AttributeError):
+            return str(deterministic_uuid_v4_py(
+                namespace_uuid,
+                f"conversation-{legacy_chat_id}",
+            )), True
+
+    normalized_chat_ids = logs_df["chat_id"].apply(normalize_legacy_chat_id)
     logs_df = logs_df[
         logs_df["user_id"].notna() & normalized_chat_ids.notna()
     ].copy()
-    logs_df["chat_id"] = normalized_chat_ids[normalized_chat_ids.notna()]
-    skipped_invalid_chat_id = source_row_count - len(logs_df)
+    logs_df["legacy_chat_id"] = normalized_chat_ids[
+        normalized_chat_ids.notna()
+    ]
+    target_chat_id_rows = logs_df["legacy_chat_id"].apply(target_chat_uuid)
+    logs_df["chat_id"] = target_chat_id_rows.apply(lambda value: value[0])
+    logs_df["_chat_id_was_remapped"] = target_chat_id_rows.apply(
+        lambda value: value[1]
+    )
+    skipped_missing_chat_id = source_row_count - len(logs_df)
+    remapped_non_uuid_chat_ids = int(
+        logs_df.loc[logs_df["_chat_id_was_remapped"], "legacy_chat_id"].nunique()
+    )
+
+    target_sources = logs_df.groupby("chat_id")["legacy_chat_id"].nunique()
+    ambiguous_targets = target_sources[target_sources > 1]
+    if not ambiguous_targets.empty:
+        raise ValueError(
+            "Multiple legacy conversation IDs resolved to the same V5 UUID: "
+            + ", ".join(ambiguous_targets.index.astype(str).tolist()[:10])
+        )
 
     shared_chat_ids = (
         logs_df.groupby("chat_id")["user_id"].nunique()
@@ -2911,7 +3028,8 @@ def generate_conversations_logs_migration_sql(
             'conversations_processed': 0,
             'messages_processed': 0,
             'blocks_processed': 0,
-            'skipped_invalid_chat_id': skipped_invalid_chat_id,
+            'skipped_invalid_chat_id': skipped_missing_chat_id,
+            'remapped_non_uuid_chat_ids': remapped_non_uuid_chat_ids,
             'truncated_titles': 0,
         }
     
@@ -3055,15 +3173,59 @@ END $$;
                 total_tokens = int(chat_logs_sorted['token_amount'].fillna(0).sum())
                 created_at = chat_logs_sorted['created_at'].min()
                 updated_at = chat_logs_sorted['created_at'].max()
+                legacy_chat_ids = sorted({
+                    str(value)
+                    for value in chat_logs_sorted["legacy_chat_id"]
+                    if str(value).strip()
+                })
+                if len(legacy_chat_ids) != 1:
+                    raise ValueError(
+                        f"Conversation {chat_id} contains multiple legacy chat IDs: "
+                        + ", ".join(legacy_chat_ids[:10])
+                    )
+                legacy_chat_id = legacy_chat_ids[0]
+                bot_ids = sorted({
+                    clean_string(value)
+                    for value in chat_logs_sorted.get(
+                        "bot_id", pd.Series(dtype=object)
+                    )
+                    if clean_string(value)
+                })
+                if len(bot_ids) > 1:
+                    raise ValueError(
+                        f"Conversation {legacy_chat_id} references multiple V4 "
+                        "agents and cannot be linked safely: "
+                        + ", ".join(bot_ids[:10])
+                    )
+                legacy_bot_id = bot_ids[0] if bot_ids else None
+                planned_agent_id = (
+                    planned_agent_ids.get(legacy_bot_id)
+                    if legacy_bot_id
+                    else None
+                )
+                conversation_metadata = None
+                if legacy_bot_id:
+                    conversation_metadata = {
+                        "legacyBotId": legacy_bot_id,
+                        "legacyAgentLinkMissing": planned_agent_id is None,
+                    }
+                    if planned_agent_id:
+                        conversation_metadata["initiatedByAgentId"] = (
+                            planned_agent_id
+                        )
                 
                 conversations.append({
                     'chat_id': chat_id,
+                    'legacy_chat_id': legacy_chat_id,
                     'user_id': user_id,
                     'title': title,
                     'message_count': message_count,
                     'total_tokens': total_tokens,
                     'created_at': created_at,
                     'updated_at': updated_at,
+                    'legacy_bot_id': legacy_bot_id,
+                    'agent_id': planned_agent_id,
+                    'metadata': conversation_metadata,
                     'logs': chat_logs_sorted
                 })
             
@@ -3087,7 +3249,8 @@ END $$;
                         f"{conv['message_count']}, {conv['total_tokens']}, "
                         f"true, NULL::timestamp, '{created_at_str}'::timestamptz, '{updated_at_str}'::timestamptz, "
                         f"'{updated_at_str}'::timestamptz, "
-                        f"{resolve_user_id_sql(str(user_id), user_id_overrides)})"
+                        f"{resolve_user_id_sql(str(user_id), user_id_overrides)}, "
+                        f"{escape_json_for_sql(conv['metadata']) if conv['metadata'] else 'NULL::jsonb'})"
                     )
                 
                 conv_values_joined = ',\n'.join(conv_values)
@@ -3101,11 +3264,11 @@ END $$;
                         )
                     )
                 sql_file.write(f"""-- Conversations INSERT
-INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
+INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id, metadata)
 SELECT * FROM (
   VALUES
 {conv_values_joined}
-) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
+) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id, metadata)
 WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 
 """)
@@ -3114,7 +3277,7 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                     sql_file.write(
                         f"INSERT INTO migration.id_mappings "
                         f"(table_name, old_id, new_id, migration_batch, migration_run_id, record_action, notes) "
-                        f"VALUES ('conversations', {escape_sql_string(conv['chat_id'])}, '{conv['chat_id']}'::uuid, "
+                        f"VALUES ('conversations', {escape_sql_string(conv['legacy_chat_id'])}, '{conv['chat_id']}'::uuid, "
                         f"'{migration_run_id or 'conversations_batch'}', {_migration_run_sql(migration_run_id)}, "
                         f"'created', 'Migrated conversation') "
                         f"ON CONFLICT (table_name, old_id) DO NOTHING;\n"
@@ -3124,13 +3287,13 @@ WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
                             "INSERT INTO migration.migration_step_entities "
                             "(migration_run_id, step_key, table_name, old_id, new_id, record_action) "
                             f"SELECT '{migration_run_id}'::uuid, '05_conversations', "
-                            f"'conversations', {escape_sql_string(conv['chat_id'])}, "
+                            f"'conversations', {escape_sql_string(conv['legacy_chat_id'])}, "
                             f"'{conv['chat_id']}'::uuid, "
                             f"CASE WHEN m.migration_run_id = '{migration_run_id}'::uuid "
                             "THEN m.record_action ELSE 'reused' END "
                             "FROM migration.id_mappings m "
                             "WHERE m.table_name = 'conversations' "
-                            f"AND m.old_id = {escape_sql_string(conv['chat_id'])} "
+                            f"AND m.old_id = {escape_sql_string(conv['legacy_chat_id'])} "
                             f"AND m.new_id = '{conv['chat_id']}'::uuid "
                             "ON CONFLICT (migration_run_id, step_key, table_name, old_id) "
                             "DO UPDATE SET new_id = EXCLUDED.new_id, "
@@ -3298,7 +3461,8 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id){block_ow
 -- Conversations processed: {conversations_processed}
 -- Messages processed: {messages_processed}
 -- Content blocks processed: {blocks_processed}
--- Rows skipped for null/blank/invalid chat_id: {skipped_invalid_chat_id}
+-- Rows skipped for null/blank chat_id: {skipped_missing_chat_id}
+-- Non-UUID conversation IDs deterministically remapped: {remapped_non_uuid_chat_ids}
 -- ============================================================
 """
     manifest = shard_writer.finalize(epilogue=footer)
@@ -3310,7 +3474,8 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id){block_ow
         'conversations_processed': conversations_processed,
         'messages_processed': messages_processed,
         'blocks_processed': blocks_processed,
-        'skipped_invalid_chat_id': skipped_invalid_chat_id,
+        'skipped_invalid_chat_id': skipped_missing_chat_id,
+        'remapped_non_uuid_chat_ids': remapped_non_uuid_chat_ids,
         'truncated_titles': truncated_titles,
         'shards': [s.file_path for s in manifest.shards],
         'manifest': manifest.to_dict(),

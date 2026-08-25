@@ -18,6 +18,8 @@ from utils.rollback import (
 )
 from utils.step_verification import verify_step
 from utils.sql_generator import (
+    CONVERSATION_MESSAGES_NAMESPACE_UUID,
+    NAMESPACE_UUID,
     USER_NAMESPACE_UUID,
     _topologically_sort_folders,
     deterministic_uuid_v4_py,
@@ -201,12 +203,81 @@ def test_existing_users_are_resolved_by_normalized_email(monkeypatch):
             deterministic_uuid_v4_py(USER_NAMESPACE_UUID, "legacy-new")
         ),
     }
+    assert result["existing_overrides"] == {
+        "legacy-existing": "11111111-1111-4111-8111-111111111111",
+    }
     users = {row["legacy_user_id"]: row for row in result["users"]}
     assert users["legacy-existing"]["action"] == "reused"
     assert users["legacy-new"]["action"] == "created"
     assert users["legacy-new"]["v5_user_id"] == str(
         deterministic_uuid_v4_py(USER_NAMESPACE_UUID, "legacy-new")
     )
+
+
+def test_user_sql_only_reuses_users_proven_to_exist(
+    monkeypatch,
+    tmp_path,
+):
+    planned_new_id = str(
+        deterministic_uuid_v4_py(USER_NAMESPACE_UUID, "legacy-new")
+    )
+    captured = {}
+
+    def fake_query(_config, query, _params=None):
+        if "information_schema.columns" in query:
+            return pd.DataFrame({"column_name": ["id", "email"]})
+        return pd.DataFrame([
+            {
+                "id": "legacy-new",
+                "email": "new@example.com",
+                "name": "New",
+            },
+            {
+                "id": "legacy-existing",
+                "email": "existing@example.com",
+                "name": "Existing",
+            },
+        ])
+
+    def fake_generate(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr("utils.extraction.execute_query", fake_query)
+    monkeypatch.setattr(
+        "utils.extraction.generate_users_migration_sql",
+        fake_generate,
+    )
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path / "extract"),
+        generate_sql=True,
+        export_csv=False,
+        user_id_overrides={
+            "legacy-new": planned_new_id,
+            "legacy-existing": "11111111-1111-4111-8111-111111111111",
+        },
+        existing_user_overrides={
+            "legacy-existing": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    engine.extract_users(["new@example.com", "existing@example.com"])
+
+    assert captured["user_id_overrides"] == {
+        "legacy-existing": "11111111-1111-4111-8111-111111111111",
+    }
+    assert engine.user_id_overrides["legacy-new"] == planned_new_id
+    default_engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path / "default"),
+        generate_sql=False,
+        export_csv=False,
+        user_id_overrides={"legacy-new": planned_new_id},
+    )
+    assert default_engine.existing_user_overrides == {}
 
 
 def test_normalized_email_ambiguity_fails_closed(monkeypatch):
@@ -222,6 +293,56 @@ def test_normalized_email_ambiguity_fails_closed(monkeypatch):
     with pytest.raises(ValueError, match="Ambiguous V4 email"):
         resolve_existing_user_overrides(
             SOURCE, TARGET, "jeen_dev", ["same@example.com"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("manual_target_rows", "expected_error"),
+    [
+        ([], "missing V5 users"),
+        (
+            [{
+                "v5_user_id": "11111111-1111-4111-8111-111111111111",
+                "email": "somebody-else@example.com",
+                "organization_id": None,
+            }],
+            "different email",
+        ),
+    ],
+)
+def test_manual_user_overrides_require_existing_matching_email(
+    monkeypatch,
+    manual_target_rows,
+    expected_error,
+):
+    source_df = pd.DataFrame([{
+        "legacy_user_id": "legacy-user",
+        "email": "user@example.com",
+    }])
+
+    def fake_query(config, query, _params=None):
+        if config.database == "source":
+            return source_df.copy()
+        if "WHERE id = ANY" in query:
+            return pd.DataFrame(
+                manual_target_rows,
+                columns=["v5_user_id", "email", "organization_id"],
+            )
+        return pd.DataFrame(
+            columns=["v5_user_id", "email", "organization_id"]
+        )
+
+    monkeypatch.setattr("utils.extraction.execute_query", fake_query)
+
+    with pytest.raises(ValueError, match=expected_error):
+        resolve_existing_user_overrides(
+            SOURCE,
+            TARGET,
+            "jeen_dev",
+            ["user@example.com"],
+            manual_overrides={
+                "legacy-user": "11111111-1111-4111-8111-111111111111"
+            },
         )
 
 
@@ -701,16 +822,30 @@ def test_full_extraction_excludes_selected_chunkless_document(
         embeddings_df=None,
     ):
         captured["doc_ids"] = docs_df["doc_id"].astype(str).tolist()
-        return pd.DataFrame(columns=["bot_id"]), "agents.csv"
+        return pd.DataFrame([{
+            "bot_id": "legacy-agent",
+            "user_id": "owner-1",
+            "docs_chosen": [],
+            "chosen_docs_folders": [],
+        }]), "agents.csv"
 
     monkeypatch.setattr(engine, "extract_agents", fake_extract_agents)
-    monkeypatch.setattr(
-        engine,
-        "extract_logs",
-        lambda *_args, **_kwargs: (pd.DataFrame(columns=["chat_id"]), "logs.csv"),
-    )
 
-    results = engine.run_full_extraction(["user@example.com"])
+    def fake_extract_logs(*_args, **kwargs):
+        captured["agent_id_by_bot_id"] = kwargs["agent_id_by_bot_id"]
+        return pd.DataFrame([{
+            "id": "legacy-log",
+            "user_id": "owner-1",
+            "chat_id": "agent-chat",
+            "bot_id": "legacy-agent",
+        }]), "logs.csv"
+
+    monkeypatch.setattr(engine, "extract_logs", fake_extract_logs)
+
+    results = engine.run_full_extraction(
+        ["user@example.com"],
+        extract_conversions=False,
+    )
 
     assert results["errors"] == []
     assert results["summary"]["documents"] == 1
@@ -718,6 +853,12 @@ def test_full_extraction_excludes_selected_chunkless_document(
         "chunkless-doc"
     ]
     assert captured["doc_ids"] == ["chunked-doc"]
+    assert captured["agent_id_by_bot_id"] == {
+        "legacy-agent": str(deterministic_uuid_v4_py(
+            NAMESPACE_UUID, "legacy-agent-agent"
+        ))
+    }
+    assert results["agent_conversation_report"]["unlinked_bot_ids"] == []
 
 
 def test_documents_start_pending_and_step_four_reconciles_readiness(tmp_path):
@@ -812,11 +953,15 @@ def test_user_sql_records_explicit_created_and_reused_actions():
     assert "v_action VARCHAR := 'created'" in created_sql
     assert "record_action" in created_sql
     assert "'reused'" in reused_sql
+    assert "Resolved existing V5 user is missing" in reused_sql
     assert "migration.migration_step_entities" in created_sql
     assert "migration.migration_step_entities" in reused_sql
     assert "WHEN m.migration_run_id =" in reused_sql
     assert "ELSE 'reused'" in reused_sql
     assert "Canonical users mapping mismatch" in reused_sql
+    assert "migration.migration_run_users" in created_sql
+    assert "Runtime V5 user resolution changed" in created_sql
+    assert "lower(trim(email)) = lower(trim(v_email))" in created_sql
     assert run_id in created_sql and run_id in reused_sql
 
 
@@ -1099,7 +1244,9 @@ def test_active_owner_canonical_folder_is_excluded_and_dependents_detached(
     }]
 
 
-def test_conversation_generator_skips_blank_and_invalid_chat_ids(tmp_path):
+def test_conversation_generator_skips_blank_and_remaps_non_uuid_chat_ids(
+    tmp_path,
+):
     valid_chat = "11111111-1111-4111-8111-111111111111"
     logs = pd.DataFrame([
         {
@@ -1123,11 +1270,12 @@ def test_conversation_generator_skips_blank_and_invalid_chat_ids(tmp_path):
         "test",
         migration_run_id="33333333-3333-4333-8333-333333333333",
     )
-    assert result["conversations_processed"] == 1
-    assert result["skipped_invalid_chat_id"] == 3
+    assert result["conversations_processed"] == 2
+    assert result["skipped_invalid_chat_id"] == 2
+    assert result["remapped_non_uuid_chat_ids"] == 1
     sql = output.read_text()
     assert valid_chat in sql
-    assert "not-a-uuid" not in sql
+    assert "'not-a-uuid'" in sql
     assert "migration.migration_step_entities" in sql
     assert "ELSE 'reused' END" in sql
     assert "m.migration_run_id = '33333333-3333-4333-8333-333333333333'::uuid" in sql
@@ -1234,8 +1382,79 @@ def test_conversation_scope_filters_and_limits_unique_chat_ids():
     assert "MIN(l.created_at) >= %s" in sql
     assert "MIN(l.created_at) <= %s" in sql
     assert "WHERE conversation_rank <= %s" in sql
+    assert "NULLIF(btrim(l.chat_id::text), '') IS NOT NULL" in sql
+    assert "chat_id::text) ~ %s" not in sql
     assert params[:2] == ("user-a", "user-b")
     assert params[-3:] == (date_from, date_to, 25)
+
+
+def test_agent_conversation_gets_v5_agent_metadata(tmp_path):
+    bot_id = "legacy-agent"
+    agent_id = str(deterministic_uuid_v4_py(
+        NAMESPACE_UUID, f"{bot_id}-agent"
+    ))
+    logs = pd.DataFrame([{
+        "id": "agent-log",
+        "user_id": "legacy-user",
+        "chat_id": "11111111-1111-4111-8111-111111111111",
+        "question": "hello",
+        "answer": "world",
+        "bot_id": bot_id,
+        "type": "playground",
+        "created_at": pd.Timestamp("2026-01-01"),
+        "token_amount": 1,
+        "words_amount": 1,
+    }])
+    output = tmp_path / "05_agent_conversation.sql"
+
+    generate_conversations_logs_migration_sql(
+        logs,
+        str(output),
+        "test",
+        agent_id_by_bot_id={bot_id: agent_id},
+    )
+
+    sql = output.read_text()
+    assert '"initiatedByAgentId": "' + agent_id + '"' in sql
+    assert '"legacyBotId": "legacy-agent"' in sql
+    assert '"legacyAgentLinkMissing": false' in sql
+    assert "Conversation agent association mismatch" in sql
+    assert "INSERT INTO conversations" in sql
+    assert "user_id, metadata)" in sql
+
+
+def test_non_uuid_conversation_id_is_deterministically_migrated(tmp_path):
+    legacy_chat_id = "legacy-agent-chat"
+    expected_chat_id = str(deterministic_uuid_v4_py(
+        CONVERSATION_MESSAGES_NAMESPACE_UUID,
+        f"conversation-{legacy_chat_id}",
+    ))
+    logs = pd.DataFrame([{
+        "id": "agent-log",
+        "user_id": "legacy-user",
+        "chat_id": legacy_chat_id,
+        "question": "hello",
+        "answer": "world",
+        "created_at": pd.Timestamp("2026-01-01"),
+        "token_amount": 1,
+        "words_amount": 1,
+    }])
+    output = tmp_path / "05_non_uuid_conversation.sql"
+
+    result = generate_conversations_logs_migration_sql(
+        logs,
+        str(output),
+        "test",
+    )
+
+    sql = output.read_text()
+    assert result["conversations_processed"] == 1
+    assert result["remapped_non_uuid_chat_ids"] == 1
+    assert f"'{expected_chat_id}'::uuid" in sql
+    assert (
+        "VALUES ('conversations', 'legacy-agent-chat', "
+        f"'{expected_chat_id}'::uuid"
+    ) in sql
 
 
 def test_extract_logs_fetches_every_row_for_selected_conversations(
@@ -1302,6 +1521,77 @@ def test_conversation_generator_truncates_titles_to_v5_limit(tmp_path):
     assert result["truncated_titles"] == 1
     assert long_title[:256] in conversation_insert
     assert long_title not in conversation_insert
+
+
+def test_extraction_routes_collision_policy_only_to_conversations(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    def fake_query(_config, query, _params=None):
+        if "FROM public.jeen_dev_folders" in query:
+            return pd.DataFrame([{
+                "id": 7,
+                "folder_name": "Owned",
+                "owner_id": "legacy-user",
+                "parent_id": None,
+                "created_at": None,
+                "folder_type": "default",
+            }])
+        if "FROM public.jeen_dev_logs" in query:
+            return pd.DataFrame([{
+                "id": "legacy-log",
+                "user_id": "legacy-user",
+                "chat_id": "11111111-1111-4111-8111-111111111111",
+                "question": "hello",
+                "answer": "world",
+                "created_at": pd.Timestamp("2026-01-01"),
+            }])
+        raise AssertionError(query)
+
+    def fake_folders(**kwargs):
+        captured["folders"] = kwargs
+        return {}
+
+    def fake_conversations(**kwargs):
+        captured["conversations"] = kwargs
+        return {}
+
+    monkeypatch.setattr("utils.extraction.execute_query", fake_query)
+    monkeypatch.setattr(
+        "utils.extraction.generate_folders_migration_sql",
+        fake_folders,
+    )
+    monkeypatch.setattr(
+        "utils.extraction.generate_conversations_logs_migration_sql",
+        fake_conversations,
+    )
+    engine = ExtractionEngine(
+        SOURCE,
+        "jeen_dev",
+        str(tmp_path / "extract"),
+        generate_sql=True,
+        export_csv=False,
+        conversation_collision_policy="replace_unmapped",
+    )
+
+    engine.extract_folders(["legacy-user"])
+    engine.extract_logs(
+        ["legacy-user"],
+        agent_id_by_bot_id={
+            "legacy-agent": "22222222-2222-4222-8222-222222222222"
+        },
+    )
+
+    assert "conversation_collision_policy" not in captured["folders"]
+    assert (
+        captured["conversations"]["conversation_collision_policy"]
+        == "replace_unmapped"
+    )
+    assert captured["conversations"]["agent_id_by_bot_id"] == {
+        "legacy-agent": "22222222-2222-4222-8222-222222222222"
+    }
 
 
 def test_agent_sql_reconciles_kb_count_and_tracks_helper_ownership():

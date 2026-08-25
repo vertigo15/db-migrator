@@ -30,13 +30,22 @@ def build_conversation_manifest(
         return manifest
 
     normalized = logs_df.copy()
-    normalized["chat_id"] = normalized["chat_id"].apply(
-        lambda value: _normalize_uuid(value)
+    normalized["legacy_chat_id"] = normalized["chat_id"].apply(
+        _normalize_legacy_chat_id
+    )
+    normalized["chat_id"] = normalized["legacy_chat_id"].apply(
+        _target_chat_uuid
     )
     normalized = normalized[
         normalized["chat_id"].notna() & normalized["user_id"].notna()
     ]
     for chat_id, rows in normalized.groupby("chat_id"):
+        legacy_chat_ids = {
+            str(value) for value in rows["legacy_chat_id"]
+        }
+        if len(legacy_chat_ids) != 1:
+            continue
+        legacy_chat_id = legacy_chat_ids.pop()
         owners = {str(value) for value in rows["user_id"]}
         if len(owners) != 1:
             continue
@@ -58,6 +67,7 @@ def build_conversation_manifest(
                 )))
         manifest.append({
             "chat_id": str(chat_id),
+            "legacy_chat_id": legacy_chat_id,
             "legacy_owner_id": legacy_owner_id,
             "expected_owner_id": expected_owner_id,
             "message_ids": sorted(message_ids),
@@ -81,6 +91,10 @@ def inspect_conversation_conflicts(
         base_target_config, "completion_db"
     )
     chat_ids = [str(row["chat_id"]) for row in planned]
+    legacy_chat_ids = [
+        str(row.get("legacy_chat_id") or row["chat_id"])
+        for row in planned
+    ]
     mappings = execute_query(
         completion_config,
         """
@@ -89,7 +103,7 @@ def inspect_conversation_conflicts(
         WHERE table_name = 'conversations'
           AND (old_id = ANY(%s::text[]) OR new_id = ANY(%s::uuid[]))
         """,
-        (chat_ids, chat_ids),
+        (legacy_chat_ids, chat_ids),
     )
     conversations = execute_query(
         completion_config,
@@ -134,12 +148,16 @@ def inspect_conversation_conflicts(
 
     for row in planned:
         chat_id = str(row["chat_id"])
+        legacy_chat_id = str(row.get("legacy_chat_id") or chat_id)
         expected_owner_id = str(row["expected_owner_id"])
-        mapping = mapping_by_old.get(chat_id) or mapping_by_new.get(chat_id)
+        mapping = (
+            mapping_by_old.get(legacy_chat_id)
+            or mapping_by_new.get(chat_id)
+        )
         existing = conversation_by_id.get(chat_id)
         if mapping:
             if (
-                str(mapping["old_id"]) != chat_id
+                str(mapping["old_id"]) != legacy_chat_id
                 or str(mapping["new_id"]) != chat_id
             ):
                 result["conflicts"].append(_conflict(
@@ -185,11 +203,29 @@ def conversation_conflict_message(conflicts: Iterable[Mapping[str, object]]) -> 
     )
 
 
-def _normalize_uuid(value: object) -> Optional[str]:
-    try:
-        return str(uuid.UUID(str(value).strip()))
-    except (ValueError, TypeError, AttributeError):
+def _normalize_legacy_chat_id(value: object) -> Optional[str]:
+    if value is None:
         return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _target_chat_uuid(value: object) -> Optional[str]:
+    legacy_chat_id = _normalize_legacy_chat_id(value)
+    if not legacy_chat_id:
+        return None
+    try:
+        return str(uuid.UUID(legacy_chat_id))
+    except ValueError:
+        return str(deterministic_uuid_v4_py(
+            CONVERSATION_MESSAGES_NAMESPACE_UUID,
+            f"conversation-{legacy_chat_id}",
+        ))
 
 
 def _ids_by_chat(frame: pd.DataFrame) -> defaultdict[str, list[str]]:
@@ -207,6 +243,9 @@ def _conflict(
 ) -> dict:
     return {
         "chat_id": str(planned["chat_id"]),
+        "legacy_chat_id": str(
+            planned.get("legacy_chat_id") or planned["chat_id"]
+        ),
         "reason": reason,
         "expected_owner_id": str(planned["expected_owner_id"]),
         "actual_owner_id": (

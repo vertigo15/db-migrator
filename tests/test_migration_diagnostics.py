@@ -96,6 +96,9 @@ def test_deterministic_failures_are_terminal_but_transient_errors_retry():
     assert is_non_retryable_failure(
         "Canonical agent owner mismatch for legacy bot bot-1"
     )
+    assert is_non_retryable_failure(
+        "Conversation agent association mismatch for legacy conversation chat-1"
+    )
 
 
 def test_agent_collision_has_preflight_guidance():

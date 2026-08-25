@@ -1131,6 +1131,32 @@ def is_distributed_run_ready(
     return True
 
 
+def distributed_step_statuses(
+    base_config: ConnectionConfig,
+    run_id: str,
+) -> dict[str, str]:
+    """Return the canonical status of every recorded step across target DBs."""
+    statuses: dict[str, str] = {}
+    for step_key, database in STEP_TARGETS.items():
+        config = config_for_database(base_config, database)
+        conn = get_connection(config)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM migration.migration_steps
+                    WHERE migration_run_id = %s::uuid AND step_key = %s
+                    """,
+                    (run_id, step_key),
+                )
+                row = cursor.fetchone()
+                statuses[step_key] = str(row[0]) if row else "missing"
+        finally:
+            conn.close()
+    return statuses
+
+
 def reconcile_rollback_status(
     base_config: ConnectionConfig,
     run_id: str,
