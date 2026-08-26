@@ -3031,6 +3031,7 @@ def generate_conversations_logs_migration_sql(
             'skipped_invalid_chat_id': skipped_missing_chat_id,
             'remapped_non_uuid_chat_ids': remapped_non_uuid_chat_ids,
             'truncated_titles': 0,
+            'multi_agent_conversations': 0,
         }
     
     # Add question_number if not present (for ordering)
@@ -3046,6 +3047,7 @@ def generate_conversations_logs_migration_sql(
     messages_processed = 0
     blocks_processed = 0
     truncated_titles = 0
+    multi_agent_conversations = 0
     
     header = f"""-- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
@@ -3184,20 +3186,24 @@ END $$;
                         + ", ".join(legacy_chat_ids[:10])
                     )
                 legacy_chat_id = legacy_chat_ids[0]
-                bot_ids = sorted({
-                    clean_string(value)
-                    for value in chat_logs_sorted.get(
-                        "bot_id", pd.Series(dtype=object)
+                # A V4 chat can span several bots when the user switched agents
+                # mid-conversation. V5 links a conversation to exactly one
+                # agent, so the most recent bot in the chat wins and every bot
+                # the chat touched is preserved in metadata.
+                ordered_bot_ids = [
+                    cleaned
+                    for cleaned in (
+                        clean_string(value)
+                        for value in chat_logs_sorted.get(
+                            "bot_id", pd.Series(dtype=object)
+                        )
                     )
-                    if clean_string(value)
-                })
+                    if cleaned
+                ]
+                bot_ids = sorted(set(ordered_bot_ids))
                 if len(bot_ids) > 1:
-                    raise ValueError(
-                        f"Conversation {legacy_chat_id} references multiple V4 "
-                        "agents and cannot be linked safely: "
-                        + ", ".join(bot_ids[:10])
-                    )
-                legacy_bot_id = bot_ids[0] if bot_ids else None
+                    multi_agent_conversations += 1
+                legacy_bot_id = ordered_bot_ids[-1] if ordered_bot_ids else None
                 planned_agent_id = (
                     planned_agent_ids.get(legacy_bot_id)
                     if legacy_bot_id
@@ -3209,6 +3215,11 @@ END $$;
                         "legacyBotId": legacy_bot_id,
                         "legacyAgentLinkMissing": planned_agent_id is None,
                     }
+                    if len(bot_ids) > 1:
+                        conversation_metadata["legacyBotIds"] = bot_ids
+                        conversation_metadata["legacyAgentResolution"] = (
+                            "last_agent_in_conversation"
+                        )
                     if planned_agent_id:
                         conversation_metadata["initiatedByAgentId"] = (
                             planned_agent_id
@@ -3463,6 +3474,7 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id){block_ow
 -- Content blocks processed: {blocks_processed}
 -- Rows skipped for null/blank chat_id: {skipped_missing_chat_id}
 -- Non-UUID conversation IDs deterministically remapped: {remapped_non_uuid_chat_ids}
+-- Multi-agent conversations linked to their last agent: {multi_agent_conversations}
 -- ============================================================
 """
     manifest = shard_writer.finalize(epilogue=footer)
@@ -3477,6 +3489,7 @@ WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id){block_ow
         'skipped_invalid_chat_id': skipped_missing_chat_id,
         'remapped_non_uuid_chat_ids': remapped_non_uuid_chat_ids,
         'truncated_titles': truncated_titles,
+        'multi_agent_conversations': multi_agent_conversations,
         'shards': [s.file_path for s in manifest.shards],
         'manifest': manifest.to_dict(),
     }
