@@ -17,6 +17,11 @@ from utils.db import (
 )
 from utils.storage import save_connection, save_to_storage
 from utils.config import SessionKeys, get_all_table_names
+from utils.file_preview import (
+    INLINE_DOWNLOAD_BYTES,
+    human_file_size,
+    read_inline_download,
+)
 from utils.audit import run_full_audit
 from utils.pdf_export import generate_audit_pdf
 import pandas as pd
@@ -134,6 +139,34 @@ def _get_workflow_counts(config: ConnectionConfig, prefix: str) -> dict:
         return {"error": str(e)}
 
 
+def _build_fresh_audit_summary(
+    config: ConnectionConfig,
+    prefix: str,
+    table_status: dict,
+) -> list:
+    """Build overall audit counts from fresh source queries.
+
+    Table verification counts are intentionally cached for ordinary rerenders,
+    but an explicit audit calculation must reflect the source at that moment.
+    """
+    summary_items = []
+    for logical_name, info in table_status.items():
+        if not info["exists"]:
+            continue
+        fresh_count = get_table_row_count(config, info["actual_name"])
+        info["row_count"] = fresh_count
+        item = {
+            "table": logical_name,
+            "count": fresh_count,
+        }
+        if logical_name == "agents":
+            item["knowledge_counts"] = _get_agent_knowledge_counts(
+                config, prefix
+            )
+        summary_items.append(item)
+    return summary_items
+
+
 # Page config
 st.set_page_config(page_title="Connect to Source DB", page_icon="🔌", layout="wide")
 st.title("🔌 Connect to Source Database")
@@ -141,6 +174,28 @@ st.title("🔌 Connect to Source Database")
 # Get the base directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+
+
+def _ensure_source_config():
+    """Auto-populate source_config from .env if not already in session state."""
+    if "source_config" not in st.session_state:
+        from utils.config import get_env_connection_defaults, get_env_table_prefix
+        defaults = get_env_connection_defaults()
+        if defaults.get("host") and defaults.get("database") and defaults.get("username") and defaults.get("password"):
+            config = ConnectionConfig(
+                host=defaults["host"],
+                port=int(defaults["port"]),
+                database=defaults["database"],
+                username=defaults["username"],
+                password=defaults["password"],
+            )
+            st.session_state["source_config"] = config
+            st.session_state[SessionKeys.SOURCE_CONNECTION] = config.to_dict()
+            if SessionKeys.TABLE_PREFIX not in st.session_state:
+                st.session_state[SessionKeys.TABLE_PREFIX] = get_env_table_prefix()
+
+
+_ensure_source_config()
 
 
 @st.cache_data
@@ -261,9 +316,27 @@ def render_table_verification():
         return
     
     config = st.session_state["source_config"]
-    
-    with st.spinner("Checking tables..."):
-        table_status = check_tables_exist(config, prefix)
+    scope = (
+        config.host,
+        config.port,
+        config.database,
+        config.username,
+        prefix,
+    )
+    refresh = st.button("↻ Refresh table verification")
+    if refresh or st.session_state.get("_source_table_scope") != scope:
+        with st.spinner("Checking tables..."):
+            table_status = check_tables_exist(config, prefix)
+            for info in table_status.values():
+                info["row_count"] = (
+                    get_table_row_count(config, info["actual_name"])
+                    if info["exists"]
+                    else -1
+                )
+        st.session_state["_source_table_scope"] = scope
+        st.session_state["_source_table_status"] = table_status
+    else:
+        table_status = st.session_state.get("_source_table_status", {})
     
     if not table_status:
         st.error("Failed to check tables. Please verify your connection.")
@@ -276,7 +349,7 @@ def render_table_verification():
     for i, (logical_name, info) in enumerate(table_status.items()):
         with cols[i % 3]:
             if info["exists"]:
-                count = get_table_row_count(config, info["actual_name"])
+                count = info.get("row_count", -1)
                 st.success(f"**{logical_name}**  \n`{info['actual_name']}`  \n{count:,} rows")
             else:
                 st.error(f"**{logical_name}**  \n`{info['actual_name']}`  \n❌ Not found")
@@ -303,41 +376,30 @@ def render_audit_section():
     prefix = st.session_state.get(SessionKeys.TABLE_PREFIX, "jeen_dev")
     table_status = st.session_state.get(SessionKeys.RESOLVED_TABLES, {})
     
-    # Section 1: Overall Counts Summary from Table Verification
-    if table_status:
+    # Section 1 is computed only with the explicit audit action below.
+    summary_items = st.session_state.get("audit_counts", [])
+    if summary_items:
         st.markdown("### 📊 Section 1: Overall Counts")
-        # Build summary data
-        summary_items = []
-        for logical_name, info in table_status.items():
-            if info["exists"]:
-                count = get_table_row_count(config, info["actual_name"])
-                item = {"table": logical_name, "count": count}
-                if logical_name == "agents":
-                    item["knowledge_counts"] = _get_agent_knowledge_counts(config, prefix)
-                summary_items.append(item)
-        
-        if summary_items:
-            st.session_state["audit_counts"] = summary_items
-            # Create a single row with all KPIs
-            cols = st.columns(len(summary_items))
-            for i, item in enumerate(summary_items):
-                with cols[i]:
-                    if item["table"] == "agents" and item.get("knowledge_counts"):
-                        counts = item["knowledge_counts"]
-                        st.markdown(
-                            f"**{item['table']}**<br>"
-                            f"**{item['count']:,}**<br>"
-                            f"<small>With attached documents: **{counts['with_knowledge']:,}**<br>"
-                            f"Without attached documents: **{counts['without_knowledge']:,}**</small>",
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.markdown(f"**{item['table']}**<br>**{item['count']:,}**", unsafe_allow_html=True)
+        cols = st.columns(len(summary_items))
+        for i, item in enumerate(summary_items):
+            with cols[i]:
+                if item["table"] == "agents" and item.get("knowledge_counts"):
+                    counts = item["knowledge_counts"]
+                    st.markdown(
+                        f"**{item['table']}**<br>"
+                        f"**{item['count']:,}**<br>"
+                        f"<small>With attached documents: **{counts['with_knowledge']:,}**<br>"
+                        f"Without attached documents: **{counts['without_knowledge']:,}**</small>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"**{item['table']}**<br>**{item['count']:,}**",
+                        unsafe_allow_html=True,
+                    )
 
-        # Workflow (Langflow) usage metrics
-        wf = _get_workflow_counts(config, prefix)
+        wf = st.session_state.get("audit_workflow_counts")
         if wf:
-            st.session_state["audit_workflow_counts"] = wf
             st.markdown("**🔀 Workflows (Langflow)**")
             if wf.get("error"):
                 st.warning(
@@ -368,6 +430,13 @@ def render_audit_section():
     if st.button("📊 Calculate Audit Statistics", type="secondary", use_container_width=True):
         with st.spinner("Running audit queries... This may take a few minutes for large databases."):
             try:
+                summary_items = _build_fresh_audit_summary(
+                    config, prefix, table_status
+                )
+                st.session_state["audit_counts"] = summary_items
+                st.session_state["audit_workflow_counts"] = _get_workflow_counts(
+                    config, prefix
+                )
                 results = run_full_audit(config, prefix)
                 st.session_state["audit_results"] = results
             except Exception as e:
@@ -671,15 +740,34 @@ def render_backup_section():
         if success:
             st.success(f"✅ {message}")
             if output_path and os.path.exists(output_path):
-                with open(output_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Download Backup",
-                        data=f,
-                        file_name=os.path.basename(output_path),
-                        mime="application/gzip" if compress else "application/sql"
-                    )
+                st.session_state["_last_backup_path"] = output_path
         else:
             st.error(f"❌ {message}")
+
+    last_backup_path = st.session_state.get("_last_backup_path")
+    if last_backup_path and os.path.exists(last_backup_path):
+        last_size = os.path.getsize(last_backup_path)
+        st.caption(
+            f"Latest backup: `{last_backup_path}` · {human_file_size(last_size)}"
+        )
+        if last_size <= INLINE_DOWNLOAD_BYTES and st.toggle(
+            "Prepare latest backup for browser download",
+            value=False,
+            key="_prepare_latest_backup",
+        ):
+            st.download_button(
+                label="📥 Download Backup",
+                data=read_inline_download(last_backup_path),
+                file_name=os.path.basename(last_backup_path),
+                mime=(
+                    "application/gzip"
+                    if last_backup_path.endswith(".gz")
+                    else "application/sql"
+                ),
+                on_click="ignore",
+            )
+        elif last_size > INLINE_DOWNLOAD_BYTES:
+            st.info("Large backup downloads stay server-side to protect UI memory.")
     
     if os.path.exists(BACKUP_DIR):
         backups = [f for f in os.listdir(BACKUP_DIR) if f.endswith(('.sql', '.sql.gz'))]
@@ -692,8 +780,22 @@ def render_backup_section():
                     with col1:
                         st.text(f"{backup} ({size_mb:.2f} MB)")
                     with col2:
-                        with open(backup_path, "rb") as f:
-                            st.download_button(label="📥", data=f, file_name=backup, key=f"dl_{backup}")
+                        size = os.path.getsize(backup_path)
+                        if size <= INLINE_DOWNLOAD_BYTES and st.toggle(
+                            "Prepare",
+                            value=False,
+                            key=f"prepare_{backup}",
+                            label_visibility="collapsed",
+                        ):
+                            st.download_button(
+                                label="📥",
+                                data=read_inline_download(backup_path),
+                                file_name=backup,
+                                key=f"dl_{backup}",
+                                on_click="ignore",
+                            )
+                        elif size > INLINE_DOWNLOAD_BYTES:
+                            st.caption("server only")
 
 
 def main():
@@ -709,4 +811,5 @@ def main():
 
 
 # Run main
-main()
+if __name__ == "__main__":
+    main()

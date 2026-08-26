@@ -137,7 +137,7 @@ The migration transforms a single V4 database into three separate V5 databases:
 | 03 | `{prefix}_custom_documents` | `document_db.documents` | New UUID per doc; MIME type mapping; agent-topup appends missing docs |
 | 04 | `{prefix}` (embeddings) | `document_db.chunks` + `embeddings` | Single source split into two tables; chunk_index assigned per document |
 | 05 | `{prefix}_logs` | `completion_db.conversations` + `messages` + `message_content_blocks` | Logs aggregated by `chat_id`; each row → user + assistant message pair |
-| 06 | `playground_bot_generator_config` | `completion_db.agents` + `agent_settings` + `agent_documents` | JSONB fields decomposed; `docs_chosen` expanded via `migration.get_new_id` |
+| 06 | `playground_bot_generator_config` | `completion_db.agents` + `agent_settings` + `knowledge_bases` + `knowledge_base_assignments` + `knowledge_base_items` | JSONB fields decomposed; `docs_chosen` and `chosen_docs_folders` expanded into knowledge base items via `migration.get_new_id` |
 
 All IDs are generated using `migration.deterministic_uuid_v4(namespace, legacy_id)` so the same legacy ID always produces the same new UUID regardless of run. Each mapping is recorded in `migration.id_mappings` enabling idempotent re-runs.
 

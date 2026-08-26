@@ -60,6 +60,9 @@ backups/*.sql.gz
 .DS_Store
 Thumbs.db
 
+# Local test scratch (ephemeral PostgreSQL clusters)
+.tmp_db_move/
+
 
 
 sql_files_16_4_2026/

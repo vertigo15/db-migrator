@@ -25,7 +25,7 @@ migration runs.
 referenced by selected agents is checked against the migration plan. Missing records are
 automatically fetched from V4 and appended to `03_documents_*.sql` and `04_chunks_embeddings_*.sql`
 (annotated `[agent-topup]`). Stale references (records no longer in V4) are flagged as warnings —
-those specific `agent_documents` links will be dropped at runtime.
+those specific knowledge base item links will be dropped at runtime.
 
 ---
 
@@ -46,10 +46,8 @@ those specific `agent_documents` links will be dropped at runtime.
 | `metadata` | Multiple | JSONB `legacyData`: `id, job, model, __group_id__, azure_oid, department, token_used, words_used, subfeatures, token_limit, company_name, phone_number, last_connected, letter_checkbox, times_connected, enabled_features, history_categories, company_name_in_hebrew` |
 | `created_at` | `created_at` | Direct |
 | `updated_at` | — | `now()` |
-| `deleted_at` | — | `NULL` |
 | `zitadel_user_id` | — | `NULL` |
 | `organization_id` | — | Configurable UUID from `DEFAULT_ORG_ID` env var or Org ID field in UI (default: `356b50f7-bcbd-42aa-9392-e1605f42f7a1`) |
-| `is_owner` | — | `false` (DB default — not explicitly inserted) |
 | `preferred_language` | — | `NULL` (DB default — not explicitly inserted) |
 
 **Skipped if:** `email` is NULL
@@ -264,12 +262,12 @@ One embedding row generated per chunk row (only if `embeddings` column is not NU
 
 ---
 
-## 7. playground_bot_generator_config → agents + agent_settings + agent_documents
+## 7. playground_bot_generator_config → agents + agent_settings + knowledge_bases
 
 **Source table:** `{prefix}_playground_bot_generator_config`  
 **SQL file:** `06_agents_*.sql`  
 **Prerequisite:** Users, folders, and documents migrated first (agent-topup guarantees all agent-referenced documents and folders are present)  
-**Output per row:** 1 agent, 1 agent_settings, 0–N agent_documents
+**Output per row:** 1 agent, 1 agent_settings, and 0 or 1 knowledge base with assignment/items when the agent references documents or folders
 
 ### 7a. → agents
 
@@ -315,22 +313,31 @@ One embedding row generated per chunk row (only if `embeddings` column is not NU
 | `follow_up_questions` | `toolkit_settings.questions_selected` | Contains `'Follow-up questions'` |
 | `additional_links` | `additional_links_title.is_selected` | `== 'true'` |
 
-### 7c. → agent_documents
+### 7c. → knowledge_bases + knowledge_base_assignments + knowledge_base_items
 
-One row per entry in `docs_chosen`, one row per entry in `chosen_docs_folders`
+Agents with `docs_chosen` or `chosen_docs_folders` get one knowledge base, one assignment linking that knowledge base to the agent, and one item per selected document/folder.
 
 | Target Column | Source Column | Transformation |
 |---|---|---|
-| `id` | `bot_id` + doc/folder id | `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-doc-{doc_id}')` or `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-folder-{fid}')` |
-| `agent_id` | `bot_id` | `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-agent')` |
-| `document_id` | `docs_chosen` | `migration.get_new_id('documents', doc_id)` — guaranteed present by agent-topup |
-| `document_id` | `chosen_docs_folders` | `migration.get_new_id('folders', fid)` — guaranteed present by agent-topup |
-| `is_active` | — | `true` |
-| `type` | — | `'document'` or `'folder'` |
+| `knowledge_bases.id` | `bot_id` | `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-kb')` |
+| `knowledge_bases.name` | `bot_data.bot_name` | `<agent name> Knowledge Base`, max 128 chars |
+| `knowledge_bases.similarity_top_k` | `toolkit_settings` / `grade_prompt.vectors` | Same value as `agent_settings.retrieved_context_size` |
+| `knowledge_bases.re_rank_score` | — | `0.15` |
+| `knowledge_bases.total_document_count` | `docs_chosen` + `chosen_docs_folders` | Count of referenced documents/folders |
+| `knowledge_base_assignments.id` | `bot_id` | `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-kb-assignment')` |
+| `knowledge_base_assignments.knowledge_base_id` | `bot_id` | Same generated KB id |
+| `knowledge_base_assignments.assigned_to_id` | `bot_id` | `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-agent')` |
+| `knowledge_base_assignments.assigned_to_type` | — | `'agent'` |
+| `knowledge_base_items.id` | `bot_id` + doc/folder id | `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-kb-doc-{doc_id}')` or `migration.deterministic_uuid_v4(NAMESPACE, '{bot_id}-kb-folder-{fid}')` |
+| `knowledge_base_items.knowledge_base_id` | `bot_id` | Same generated KB id |
+| `knowledge_base_items.item_id` | `docs_chosen` | `migration.get_new_id('documents', doc_id)` — guaranteed present by agent-topup |
+| `knowledge_base_items.item_id` | `chosen_docs_folders` | `migration.get_new_id('folders', fid)` — guaranteed present by agent-topup |
+| `knowledge_base_items.item_type` | — | `'document'` or `'folder'` |
+| `knowledge_base_items.is_active` | — | `true` |
 
 **Note:** Agent-topup ensures all referenced documents and folders are in the migration plan
 before this SQL is generated. If a referenced record no longer exists in V4 (stale reference),
-that specific `agent_documents` row is silently skipped at runtime and flagged as a warning in
+that specific knowledge base item row is silently skipped at runtime and flagged as a warning in
 the extraction UI.
 
 ---

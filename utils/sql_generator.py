@@ -2,14 +2,40 @@
 SQL migration generator - generates INSERT statements directly from database data.
 Integrated with the extraction engine to create SQL files alongside CSV exports.
 """
+import contextlib
 import os
 import json
 import re
+import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Mapping, Optional
 import pandas as pd
 from pathlib import Path
 import glob
+
+from utils.sharding import ShardWriter, ShardWriterFileAdapter, manifest_path_for
+
+# Per-step shard sizing defaults. Chunks/embeddings carry large vector payloads
+# so they use a smaller row cap and byte cap than the lighter-weight steps.
+SHARD_MAX_ROWS = {
+    "01_users": 1000,
+    "02_folders": 1000,
+    "03_documents": 500,
+    "04_chunks_embeddings": 500,
+    "05_conversations": 20,  # weight = conversations per unit (already batched)
+    "06_agents": 200,
+    "07_conversions": 1000,
+}
+SHARD_MAX_BYTES = {
+    "01_users": 8 * 1024 * 1024,
+    "02_folders": 8 * 1024 * 1024,
+    "03_documents": 8 * 1024 * 1024,
+    "04_chunks_embeddings": 6 * 1024 * 1024,
+    "05_conversations": 8 * 1024 * 1024,
+    "06_agents": 8 * 1024 * 1024,
+    "07_conversions": 8 * 1024 * 1024,
+}
+CONVERSATION_TITLE_MAX_LENGTH = 256
 
 
 # ============================================================
@@ -24,24 +50,94 @@ USER_NAMESPACE_UUID        = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'   # Users (s
 DOC_NAMESPACE_UUID         = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e'   # Documents (step 03)
 NAMESPACE_UUID             = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'   # Folders, agents, chunks, embeddings
 CONVERSIONS_NAMESPACE_UUID = 'c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f'   # Conversions (step 07)
+CONVERSATION_MESSAGES_NAMESPACE_UUID = (
+    '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b'
+)
+
+
+def deterministic_uuid_v4_py(namespace: str, value: str) -> uuid.UUID:
+    """Python equivalent of migration.deterministic_uuid_v4()."""
+    generated = str(uuid.uuid5(uuid.UUID(namespace), str(value)))
+    return uuid.UUID(generated[:14] + "4" + generated[15:])
+
+
+def _migration_run_sql(migration_run_id: Optional[str]) -> str:
+    return f"'{migration_run_id}'::uuid" if migration_run_id else "NULL::uuid"
+
+
+def _record_primary_step_entity_sql(
+    migration_run_id: Optional[str],
+    step_key: str,
+    table_name: str,
+    old_id_sql: str,
+    new_id_sql: str,
+) -> str:
+    """Track run-scoped reuse without changing canonical mapping ownership.
+
+    ``migration.id_mappings`` has one canonical row per source entity, so a
+    later run cannot own a second mapping for the same ``old_id``. The
+    run-scoped ``migration_step_entities`` table records that the later run
+    verified/reused the canonical target while preserving rollback ownership
+    on the original mapping.
+
+    The returned SQL is intended for use inside a PL/pgSQL block.
+    """
+    if not migration_run_id:
+        return ""
+    run_sql = _migration_run_sql(migration_run_id)
+    return f"""
+    IF NOT EXISTS (
+        SELECT 1
+        FROM migration.id_mappings
+        WHERE table_name = '{table_name}'
+          AND old_id = {old_id_sql}
+          AND new_id = {new_id_sql}
+    ) THEN
+        RAISE EXCEPTION
+            'Canonical {table_name} mapping mismatch for legacy id %',
+            {old_id_sql};
+    END IF;
+
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    SELECT
+        {run_sql}, '{step_key}', '{table_name}', {old_id_sql}, {new_id_sql},
+        CASE
+            WHEN m.migration_run_id = {run_sql} THEN m.record_action
+            ELSE 'reused'
+        END
+    FROM migration.id_mappings m
+    WHERE m.table_name = '{table_name}'
+      AND m.old_id = {old_id_sql}
+      AND m.new_id = {new_id_sql}
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET
+        new_id = EXCLUDED.new_id,
+        record_action = EXCLUDED.record_action,
+        recorded_at = now();
+"""
 
 
 def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None) -> str:
     """
     Return a SQL expression that resolves a V4 user hash ID to a V5 user UUID.
 
-    If old_id is present in the overrides dict (user already exists in V5 with
-    a known UUID), the real V5 UUID is embedded directly into the SQL at
-    generation time — no runtime lookup required.
+    Resolution order (evaluated at SQL runtime, not at generation time):
 
-    Otherwise falls back to the deterministic_uuid_v4 formula, which
-    is the standard path for users being migrated fresh.
+    1. **Override path** — if old_id is in the overrides dict the literal V5 UUID
+       is embedded at generation time; no runtime lookup needed.
 
-    This approach avoids cross-database issues: each SQL file runs against a
-    different target DB (user_db / document_db / completion_db) and only has
-    access to its own local migration.id_mappings.  Resolving at generation
-    time means the correct UUID is always embedded regardless of which DB the
-    script runs against.
+    2. **id_mappings path** — compatibility fallback for older/manual SQL.
+       For fresh migrations the mapped UUID equals the deterministic value.
+       For pre-existing V5 users the ON CONFLICT path in Step 01 captures their
+       *real* V5 UUID (which may differ from the deterministic one) and stores it
+       in id_mappings — so this lookup returns the correct UUID automatically,
+       with no manual override required.
+
+    3. **Deterministic fallback** — used only for standalone SQL generated
+       without the distributed run's complete user-resolution overrides.
 
     Args:
         old_id:    V4 legacy hash ID (e.g. 'de0ff05457533c93fdf3e0d1cdd0f808')
@@ -49,12 +145,24 @@ def resolve_user_id_sql(old_id: str, overrides: Optional[Dict[str, str]] = None)
 
     Returns:
         SQL expression string, e.g.:
-          "'7a1b2c3d-...'::uuid"                          (override path)
-          "migration.deterministic_uuid_v4('...'::uuid, 'de0ff054...')" (default path)
+          "'7a1b2c3d-...'::uuid"                    (override path)
+          "COALESCE((SELECT new_id FROM migration.id_mappings ...), deterministic_uuid_v4(...))"
     """
     if overrides and old_id and old_id in overrides:
         return f"'{overrides[old_id]}'::uuid"
-    return f"migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(old_id)})"
+    # Check migration.id_mappings first so that pre-existing V5 users (whose UUID
+    # differs from the deterministic value) are resolved to their real UUID.
+    # Step 01 (users) stores the actual V5 UUID there via the ON CONFLICT path.
+    # Falls back to deterministic when no mapping exists (e.g. fresh migrations
+    # or when agents/conversations SQL is generated before Step 01 runs).
+    deterministic = f"migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, {escape_sql_string(old_id)})"
+    return (
+        f"COALESCE("
+        f"(SELECT new_id FROM migration.id_mappings "
+        f"WHERE table_name = 'users' AND old_id = {escape_sql_string(old_id)} LIMIT 1), "
+        f"{deterministic}"
+        f")"
+    )
 
 
 def cleanup_old_migration_files(output_file: str, file_prefix: str):
@@ -171,6 +279,24 @@ def _is_scalar_na(val):
         return False
 
 
+def _normalize_legacy_folder_id(value) -> Optional[str]:
+    """Return one canonical string for a V4 int4 folder identifier.
+
+    Nullable PostgreSQL integer columns are commonly loaded by pandas as
+    floats, so a parent such as ``1105`` can arrive as ``1105.0``. Folder UUIDs
+    are deterministic from this string; allowing both representations would
+    generate two different UUIDs for the same source folder.
+    """
+    if _is_scalar_na(value):
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    if re.fullmatch(r"[+-]?\d+\.0+", cleaned):
+        return cleaned.split(".", 1)[0]
+    return cleaned
+
+
 def escape_json_for_sql(json_data):
     """Escape JSON data for inclusion in SQL."""
     if json_data is None:
@@ -214,11 +340,63 @@ CREATE TABLE IF NOT EXISTS migration.id_mappings (
     old_id VARCHAR(255) NOT NULL,
     new_id UUID NOT NULL,
     migration_batch VARCHAR(50),
+    migration_run_id UUID,
+    record_action VARCHAR(20) NOT NULL DEFAULT 'created',
     migrated_at TIMESTAMP DEFAULT now(),
     notes TEXT,
     CONSTRAINT uq_table_old_id UNIQUE (table_name, old_id),
     CONSTRAINT uq_table_new_id UNIQUE (table_name, new_id)
 );
+
+ALTER TABLE migration.id_mappings
+    ADD COLUMN IF NOT EXISTS migration_run_id UUID;
+ALTER TABLE migration.id_mappings
+    ADD COLUMN IF NOT EXISTS record_action VARCHAR(20) NOT NULL DEFAULT 'created';
+
+CREATE TABLE IF NOT EXISTS migration.migration_runs (
+    id UUID PRIMARY KEY,
+    status VARCHAR(30) NOT NULL DEFAULT 'running',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    total_users INTEGER NOT NULL DEFAULT 0,
+    source_info JSONB,
+    error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS migration.migration_steps (
+    migration_run_id UUID NOT NULL
+        REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(50) NOT NULL,
+    target_database VARCHAR(100) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'pending',
+    expected_count INTEGER,
+    affected_count INTEGER,
+    verification_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY (migration_run_id, step_key)
+);
+
+ALTER TABLE migration.migration_steps
+    ADD COLUMN IF NOT EXISTS verification_details JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Record entities verified by each step without changing the original
+-- id_mappings ownership used by rollback.
+CREATE TABLE IF NOT EXISTS migration.migration_step_entities (
+    migration_run_id UUID NOT NULL
+        REFERENCES migration.migration_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(50) NOT NULL,
+    table_name VARCHAR(100) NOT NULL,
+    old_id VARCHAR(255) NOT NULL,
+    new_id UUID NOT NULL,
+    record_action VARCHAR(20) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (migration_run_id, step_key, table_name, old_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_step_entities_new_id
+    ON migration.migration_step_entities(table_name, new_id);
 
 -- Create indexes for fast lookups
 CREATE INDEX IF NOT EXISTS idx_mappings_table_old_id 
@@ -227,6 +405,8 @@ CREATE INDEX IF NOT EXISTS idx_mappings_table_new_id
     ON migration.id_mappings(table_name, new_id);
 CREATE INDEX IF NOT EXISTS idx_mappings_batch 
     ON migration.id_mappings(migration_batch);
+CREATE INDEX IF NOT EXISTS idx_mappings_run_action
+    ON migration.id_mappings(migration_run_id, record_action);
 
 -- Create batch tracking table
 CREATE TABLE IF NOT EXISTS migration.batch_log (
@@ -260,11 +440,37 @@ CREATE OR REPLACE FUNCTION migration.is_migrated(
     p_table_name VARCHAR,
     p_old_id VARCHAR
 ) RETURNS BOOLEAN AS $$
+DECLARE
+    v_new_id UUID;
+    v_target_exists BOOLEAN;
 BEGIN
-    RETURN EXISTS (
-        SELECT 1 FROM migration.id_mappings
-        WHERE table_name = p_table_name AND old_id = p_old_id
-    );
+    SELECT new_id INTO v_new_id
+    FROM migration.id_mappings
+    WHERE table_name = p_table_name AND old_id = p_old_id;
+
+    IF v_new_id IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    EXECUTE format(
+        'SELECT EXISTS (SELECT 1 FROM public.%I WHERE id = $1)',
+        p_table_name
+    )
+    INTO v_target_exists
+    USING v_new_id;
+
+    IF v_target_exists THEN
+        RETURN TRUE;
+    END IF;
+
+    -- A mapping without its target row is stale bookkeeping, not proof that
+    -- the source entity is migrated. Remove it so this run can recreate and
+    -- own the target row safely.
+    DELETE FROM migration.id_mappings
+    WHERE table_name = p_table_name
+      AND old_id = p_old_id
+      AND new_id = v_new_id;
+    RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -392,7 +598,8 @@ END $$;
 def generate_user_insert(
     row: pd.Series,
     org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single user.
@@ -422,18 +629,40 @@ def generate_user_insert(
     # --- OVERRIDE PATH: user already exists in V5 with a known UUID ---
     if user_id_overrides and old_id and old_id in user_id_overrides:
         v5_uuid = user_id_overrides[old_id]
+        override_tracking_sql = _record_primary_step_entity_sql(
+            migration_run_id,
+            "01_users",
+            "users",
+            escape_sql_string(old_id),
+            f"'{v5_uuid}'::uuid",
+        )
         return f"""
--- User: {email} (OVERRIDE — already exists in V5)
--- V4 old_id: {old_id}  →  V5 UUID: {v5_uuid}
+-- User: {email} (OVERRIDE - already exists in V5)
+-- V4 old_id: {old_id} -> V5 UUID: {v5_uuid}
 DO $$
 BEGIN
+    -- Preflight proved that this user already exists. Recheck at execution
+    -- time so a deleted or incorrect override cannot create stale tracking.
+    IF NOT EXISTS (
+        SELECT 1 FROM public.users WHERE id = '{v5_uuid}'::uuid
+    ) THEN
+        RAISE EXCEPTION
+            'Resolved existing V5 user is missing for legacy user % (expected id %)',
+            {escape_sql_string(old_id)}, '{v5_uuid}'::uuid;
+    END IF;
+
     -- User already exists in V5; skip INSERT.
     -- Register mapping in migration.id_mappings for audit and downstream tracking.
-    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action, notes
+    )
     VALUES ('users', {escape_sql_string(old_id)}, '{v5_uuid}'::uuid,
-            'user_overrides', 'Pre-existing V5 user — override supplied at migration time')
+            '{migration_run_id or "user_overrides"}', {_migration_run_sql(migration_run_id)},
+            'reused', 'Pre-existing V5 user - resolved before migration')
     ON CONFLICT (table_name, old_id) DO NOTHING;
-    RAISE NOTICE 'Skipped INSERT for user % — already exists in V5 as %',
+{override_tracking_sql}
+    RAISE NOTICE 'Skipped INSERT for user % - already exists in V5 as %',
                  {escape_sql_string(email)}, '{v5_uuid}';
 END $$;
 """
@@ -530,6 +759,32 @@ END $$;
     }
     
     metadata_sql = escape_json_for_sql(metadata)
+    mapped_user_tracking_sql = _record_primary_step_entity_sql(
+        migration_run_id,
+        "01_users",
+        "users",
+        "v_old_id",
+        "v_new_id",
+    )
+    planned_user_declare = "\n    v_planned_id UUID := NULL;"
+    planned_user_guard = ""
+    if migration_run_id:
+        planned_user_declare = f"""
+    v_planned_id UUID := (
+        SELECT v5_user_id
+        FROM migration.migration_run_users
+        WHERE migration_run_id = {_migration_run_sql(migration_run_id)}
+          AND legacy_user_id = {escape_sql_string(old_id)}
+    );"""
+        planned_user_guard = """
+        IF v_planned_id IS NOT NULL
+           AND v_new_id IS DISTINCT FROM v_planned_id THEN
+            RAISE EXCEPTION
+                'Runtime V5 user resolution changed for legacy user % '
+                '(planned %, resolved %)',
+                v_old_id, v_planned_id, v_new_id;
+        END IF;
+"""
     
     # Generate SQL with mapping table integration
     sql = f"""
@@ -539,17 +794,58 @@ DECLARE
     v_old_id VARCHAR := {escape_sql_string(old_id)};
     v_email VARCHAR := {escape_sql_string(email)};
     v_new_id UUID;
+    v_existing_id UUID;
+    v_match_count INTEGER;
+    v_action VARCHAR := 'created';{planned_user_declare}
 BEGIN
-    -- Check if already migrated using mapping table (FAST)
+    -- 1. Reuse a valid canonical mapping from a previous run without
+    -- transferring its rollback ownership to this run.
     IF migration.is_migrated('users', v_old_id) THEN
+        v_new_id := migration.get_new_id('users', v_old_id);
+{planned_user_guard}
+{mapped_user_tracking_sql}
         RAISE NOTICE 'User % already migrated (old_id: %)', v_email, v_old_id;
         RETURN;
     END IF;
-    
-    -- Generate deterministic UUID (same namespace+input = same UUID across all databases)
-    v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
-    
-    -- Insert user (handle all unique constraint conflicts)
+
+    -- 2. Check if this email already exists in V5 (created outside migration)
+    SELECT count(*)
+    INTO v_match_count
+    FROM public.users
+    WHERE lower(trim(email)) = lower(trim(v_email));
+    IF v_match_count > 1 THEN
+        RAISE EXCEPTION 'Ambiguous normalized email match for user %', v_email;
+    END IF;
+    IF v_match_count = 1 THEN
+        SELECT id INTO v_existing_id
+        FROM public.users
+        WHERE lower(trim(email)) = lower(trim(v_email));
+    END IF;
+    IF v_existing_id IS NOT NULL THEN
+        v_new_id := v_existing_id;
+{planned_user_guard}
+        -- Link only - do NOT modify existing user data
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        )
+        VALUES ('users', v_old_id, v_existing_id, 'batch_{{{{TIMESTAMP}}}}',
+                {_migration_run_sql(migration_run_id)}, 'reused',
+                'Linked to pre-existing V5 user (normalized email match, no data overwrite)')
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+{mapped_user_tracking_sql}
+        RAISE NOTICE 'User % already exists in V5 (id: %), linked without modification', v_email, v_existing_id;
+        RETURN;
+    END IF;
+
+    -- 3. New user - generate deterministic UUID and INSERT
+    v_new_id := COALESCE(
+        v_planned_id,
+        migration.deterministic_uuid_v4(
+            '{USER_NAMESPACE_UUID}'::uuid, v_old_id
+        )
+    );
+
     BEGIN
         INSERT INTO public.users (
             id,
@@ -575,22 +871,10 @@ BEGIN
             now(),
             NULL,
             '{org_id}'::uuid
-        )
-        ON CONFLICT (email) DO UPDATE SET
-            first_name = EXCLUDED.first_name,
-            last_name = EXCLUDED.last_name,
-            metadata = EXCLUDED.metadata,
-            updated_at = now()
-        RETURNING id INTO v_new_id;
+        );
     EXCEPTION WHEN unique_violation THEN
-        -- Username conflict — check if this user already exists by email
-        SELECT id INTO v_new_id FROM public.users WHERE email = v_email;
-        IF v_new_id IS NOT NULL THEN
-            RAISE NOTICE 'User % already exists (matched by email), reusing id %', v_email, v_new_id;
-        ELSE
-            -- User doesn't exist yet, username is taken — retry with email as username
-            v_new_id := migration.deterministic_uuid_v4('{USER_NAMESPACE_UUID}'::uuid, v_old_id);
-            RAISE NOTICE 'User %: username conflict, using email as username instead', v_email;
+        -- Username conflict - use email as username fallback
+        BEGIN
             INSERT INTO public.users (
                 id, email, first_name, last_name, username, avatar_url,
                 metadata, created_at, updated_at, zitadel_user_id,
@@ -603,31 +887,36 @@ BEGIN
                 {escape_sql_string(email)},
                 NULL, {metadata_sql}, {created_at_sql}, now(), NULL,
                 '{org_id}'::uuid
-            )
-            ON CONFLICT (email) DO UPDATE SET
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                metadata = EXCLUDED.metadata,
-                updated_at = now()
-            RETURNING id INTO v_new_id;
-        END IF;
+            );
+            RAISE NOTICE 'User %: username conflict, used email as username', v_email;
+        EXCEPTION WHEN unique_violation THEN
+            -- Edge case: email conflict appeared between our check and insert
+            SELECT id INTO v_new_id
+            FROM public.users
+            WHERE lower(trim(email)) = lower(trim(v_email))
+            LIMIT 1;
+            IF v_new_id IS NULL THEN
+                RAISE EXCEPTION 'Cannot insert user % - unresolvable unique violation', v_email;
+            END IF;
+{planned_user_guard}
+            v_action := 'reused';
+            RAISE NOTICE 'User % appeared concurrently in V5, linking to %', v_email, v_new_id;
+        END;
     END;
-    
-    -- Store ID mapping for fast future lookups
+
+    -- 4. Store ID mapping
     INSERT INTO migration.id_mappings (
-        table_name,
-        old_id,
-        new_id,
-        migration_batch,
-        notes
-    ) VALUES (
-        'users',
-        v_old_id,
-        v_new_id,
-        'batch_{{{{TIMESTAMP}}}}',
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action, notes
+    )
+    VALUES (
+        'users', v_old_id, v_new_id, 'batch_{{{{TIMESTAMP}}}}',
+        {_migration_run_sql(migration_run_id)}, v_action,
         'Migrated from V4 users table'
-    );
-    
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+{mapped_user_tracking_sql}
+
     RAISE NOTICE 'Migrated user %: % → %', v_email, v_old_id, v_new_id;
 END $$;
 """
@@ -640,7 +929,8 @@ def generate_users_migration_sql(
     output_file: str,
     source_info: str,
     org_id: str = '356b50f7-bcbd-42aa-9392-e1605f42f7a1',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for users table.
@@ -664,22 +954,17 @@ def generate_users_migration_sql(
     
     record_count = 0
     skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = generate_sql_header(
-            table_name='users',
-            target_schema='user_db',
-            target_table='public.users',
-            source_info=source_info,
-            record_count=len(users_df),
-            org_id=org_id
-        )
-        sql_file.write(header)
-        
-        # Write UUID extension and batch tracking start
-        source_json = json.dumps({"source": source_info})
-        batch_start = f"""-- Ensure UUID extensions are available
+
+    header = generate_sql_header(
+        table_name='users',
+        target_schema='user_db',
+        target_table='public.users',
+        source_info=source_info,
+        record_count=len(users_df),
+        org_id=org_id
+    )
+    source_json = json.dumps({"source": source_info})
+    batch_start = f"""-- Ensure UUID extensions are available
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
@@ -688,22 +973,87 @@ VALUES ('{batch_id}', 'users', {len(users_df)}, '{source_json}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 """
-        sql_file.write(batch_start)
-        
-        # Write individual INSERT statements with batch_id substitution
-        for _, row in users_df.iterrows():
-            sql = generate_user_insert(row, org_id, user_id_overrides)
-            if sql:
-                # Replace batch placeholder with actual batch_id
-                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
-                sql_file.write(sql)
-                sql_file.write('\n')
-                record_count += 1
-            else:
-                skipped_count += 1
-        
-        # Write batch completion and footer
-        footer = f"""-- Complete batch tracking
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='01_users',
+        target_database='user_db',
+        migration_run_id=migration_run_id,
+        preamble=header + batch_start,
+        max_rows_per_shard=SHARD_MAX_ROWS['01_users'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['01_users'],
+    )
+
+    # Write individual INSERT statements with batch_id substitution
+    expected_old_ids = []
+    for _, row in users_df.iterrows():
+        sql = generate_user_insert(
+            row, org_id, user_id_overrides, migration_run_id
+        )
+        if sql:
+            sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
+            owner_id = clean_string(row.get('id'))
+            shard_writer.write_unit(
+                sql,
+                owner_legacy_ids=[owner_id] if owner_id else None,
+            )
+            record_count += 1
+            old_id = owner_id
+            if old_id:
+                expected_old_ids.append(old_id)
+        else:
+            skipped_count += 1
+
+    # Build validation block (runs once, in the last shard)
+    validation = ""
+    if expected_old_ids:
+        ids_array = ", ".join(escape_sql_string(oid) for oid in expected_old_ids)
+        validation = f"""
+-- ============================================================
+-- VALIDATION: verify all expected users have id_mappings entries
+-- ============================================================
+DO $$
+DECLARE
+    v_expected INT := {len(expected_old_ids)};
+    v_mapped INT;
+    v_missing TEXT;
+BEGIN
+    SELECT COUNT(*) INTO v_mapped
+    FROM migration.id_mappings
+    WHERE table_name = 'users'
+      AND old_id IN ({ids_array});
+
+    IF EXISTS (
+        SELECT 1
+        FROM migration.migration_run_users planned
+        LEFT JOIN migration.id_mappings mapped
+          ON mapped.table_name = 'users'
+         AND mapped.old_id = planned.legacy_user_id
+         AND mapped.new_id = planned.v5_user_id
+        WHERE planned.migration_run_id = {_migration_run_sql(migration_run_id)}
+          AND planned.legacy_user_id IN ({ids_array})
+          AND mapped.new_id IS NULL
+    ) THEN
+        RAISE EXCEPTION
+            'User mapping validation failed: runtime UUID differs from '
+            'the run-scoped planned UUID';
+    END IF;
+
+    IF v_mapped = v_expected THEN
+        RAISE NOTICE '[VALIDATION OK] All % users mapped successfully.', v_expected;
+    ELSE
+        SELECT string_agg(oid, ', ') INTO v_missing
+        FROM unnest(ARRAY[{ids_array}]) AS oid
+        WHERE oid NOT IN (
+            SELECT old_id FROM migration.id_mappings WHERE table_name = 'users'
+        );
+        RAISE WARNING '[VALIDATION FAILED] Expected % mappings, found %. Missing: %',
+                      v_expected, v_mapped, v_missing;
+    END IF;
+END $$;
+
+"""
+
+    footer = f"""-- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
 WHERE batch_id = '{batch_id}';
@@ -711,20 +1061,24 @@ WHERE batch_id = '{batch_id}';
 -- Total records processed: {record_count}
 -- Skipped (no email): {skipped_count}
 """
-        sql_file.write(footer)
-    
+    manifest = shard_writer.finalize(epilogue=validation + footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'processed': record_count,
         'skipped': skipped_count,
-        'batch_id': batch_id
+        'batch_id': batch_id,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
 def generate_folder_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single folder.
@@ -738,9 +1092,9 @@ def generate_folder_insert(
         SQL INSERT statement or None to skip
     """
     # Extract and clean fields
-    old_id = clean_string(row.get('id'))
+    old_id = _normalize_legacy_folder_id(row.get('id'))
     folder_name = clean_string(row.get('folder_name'))
-    parent_id = clean_string(row.get('parent_id'))
+    parent_id = _normalize_legacy_folder_id(row.get('parent_id'))
     owner_id = clean_string(row.get('owner_id'))  # Legacy hash ID
     # Map V4 folder_type to valid V5 enum values
     # V5 enum: 'default', 'agent' (TypeORM folders_folder_type_enum)
@@ -776,6 +1130,39 @@ def generate_folder_insert(
         parent_id_sql = f"migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{parent_id}')"
     else:
         parent_id_sql = 'NULL'
+
+    reused_step_tracking_sql = ""
+    created_step_tracking_sql = ""
+    if migration_run_id:
+        run_sql = _migration_run_sql(migration_run_id)
+        reused_step_tracking_sql = f"""
+        INSERT INTO migration.migration_step_entities (
+            migration_run_id, step_key, table_name, old_id, new_id,
+            record_action
+        )
+        VALUES (
+            {run_sql}, '02_folders', 'folders', v_old_folder_id,
+            v_folder_id, 'reused'
+        )
+        ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+        DO UPDATE SET new_id = EXCLUDED.new_id,
+                      record_action = EXCLUDED.record_action,
+                      recorded_at = now();
+"""
+        created_step_tracking_sql = f"""
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    VALUES (
+        {run_sql}, '02_folders', 'folders', v_old_folder_id,
+        v_folder_id, 'created'
+    )
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET new_id = EXCLUDED.new_id,
+                  record_action = EXCLUDED.record_action,
+                  recorded_at = now();
+"""
     
     # Generate SQL with mapping table integration
     sql = f"""
@@ -785,12 +1172,44 @@ DECLARE
     v_old_folder_id VARCHAR := {escape_sql_string(old_id)};
     v_old_owner_id VARCHAR := {escape_sql_string(owner_id)};
     v_folder_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, v_old_folder_id);
+    v_mapped_folder_id uuid;
+    v_parent_id uuid := {parent_id_sql};
     v_user_id uuid := {resolve_user_id_sql(owner_id, user_id_overrides)};
 BEGIN
-    -- Check if folder already migrated using mapping table (FAST)
+    -- Reuse only a canonical mapping whose target folder still exists.
+    -- migration.is_migrated removes stale mappings whose target disappeared.
     IF migration.is_migrated('folders', v_old_folder_id) THEN
-        RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
-        RETURN;
+        SELECT new_id INTO v_mapped_folder_id
+        FROM migration.id_mappings
+        WHERE table_name = 'folders' AND old_id = v_old_folder_id;
+        IF EXISTS (
+            SELECT 1
+            FROM public.folders mapped
+            WHERE mapped.id = v_mapped_folder_id
+              AND mapped.user_id = v_user_id
+        ) THEN
+            v_folder_id := v_mapped_folder_id;
+{reused_step_tracking_sql}
+            RAISE NOTICE 'Folder % already migrated', v_old_folder_id;
+            RETURN;
+        END IF;
+
+        -- Never delete or reassign another run's canonical mapping. The
+        -- owning run must be rolled back or explicitly repaired first.
+        RAISE EXCEPTION
+            'Canonical folder owner mismatch for legacy folder %: mapped folder % is not owned by user %',
+            v_old_folder_id, v_mapped_folder_id, v_user_id;
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.folders WHERE id = v_folder_id) THEN
+        RAISE EXCEPTION
+            'Folder UUID collision for legacy id % (target id % is not mapped from it)',
+            v_old_folder_id, v_folder_id;
+    END IF;
+    IF v_parent_id IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM public.folders WHERE id = v_parent_id) THEN
+        RAISE EXCEPTION
+            'Folder % references parent % that was not migrated first',
+            v_old_folder_id, v_parent_id;
     END IF;
     
     -- Insert folder
@@ -807,7 +1226,7 @@ BEGIN
     ) VALUES (
         v_folder_id,
         {escape_sql_string(folder_name)},
-        {parent_id_sql},
+        v_parent_id,
         '{folder_type}'::public.folders_folder_type_enum,
         'upload'::public.folders_source_type_enum,
         v_user_id,
@@ -822,13 +1241,18 @@ BEGIN
         table_name,
         old_id,
         new_id,
-        migration_batch
+        migration_batch,
+        migration_run_id,
+        record_action
     ) VALUES (
         'folders',
         v_old_folder_id,
         v_folder_id,
-        'batch_{{{{TIMESTAMP}}}}'
+        'batch_{{{{TIMESTAMP}}}}',
+        {_migration_run_sql(migration_run_id)},
+        'created'
     );
+{created_step_tracking_sql}
     
     RAISE NOTICE 'Migrated folder: % → %', v_old_folder_id, v_folder_id;
 END $$;
@@ -837,12 +1261,70 @@ END $$;
     return sql
 
 
+def _topologically_sort_folders(folders_df: pd.DataFrame) -> pd.DataFrame:
+    """Return folders in parent-before-child order and reject bad graphs."""
+    rows = {}
+    parents = {}
+    children = {}
+    for index, row in folders_df.iterrows():
+        folder_id = _normalize_legacy_folder_id(row.get("id"))
+        if not folder_id:
+            continue
+        if folder_id in rows:
+            raise ValueError(f"Duplicate source folder id: {folder_id}")
+        parent_id = _normalize_legacy_folder_id(row.get("parent_id"))
+        rows[folder_id] = index
+        parents[folder_id] = parent_id
+        children.setdefault(folder_id, [])
+
+    missing = {
+        parent_id
+        for parent_id in parents.values()
+        if parent_id is not None and parent_id not in rows
+    }
+    if missing:
+        raise ValueError(
+            "Folder hierarchy is missing parent rows: "
+            + ", ".join(sorted(missing))
+        )
+
+    indegree = {folder_id: 0 for folder_id in rows}
+    for folder_id, parent_id in parents.items():
+        if parent_id is not None:
+            indegree[folder_id] += 1
+            children[parent_id].append(folder_id)
+
+    ready = sorted(
+        folder_id for folder_id, degree in indegree.items() if degree == 0
+    )
+    ordered = []
+    while ready:
+        folder_id = ready.pop(0)
+        ordered.append(folder_id)
+        for child_id in sorted(children[folder_id]):
+            indegree[child_id] -= 1
+            if indegree[child_id] == 0:
+                ready.append(child_id)
+                ready.sort()
+
+    if len(ordered) != len(rows):
+        cyclic = sorted(
+            folder_id for folder_id, degree in indegree.items() if degree > 0
+        )
+        raise ValueError(
+            "Folder hierarchy contains a cycle involving: "
+            + ", ".join(cyclic)
+        )
+    return folders_df.loc[[rows[folder_id] for folder_id in ordered]].copy()
+
+
 def generate_folders_migration_sql(
     folders_df: pd.DataFrame,
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for folders table.
@@ -865,28 +1347,20 @@ def generate_folders_migration_sql(
     # Generate batch ID
     batch_id = f"folders_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Sort folders: parents (NULL parent_id) first, then by parent_id, then by id
-    folders_sorted = folders_df.copy()
-    folders_sorted['parent_id_sort'] = folders_sorted['parent_id'].fillna('')
-    folders_sorted = folders_sorted.sort_values(['parent_id_sort', 'id'])
+    folders_sorted = _topologically_sort_folders(folders_df)
     
     record_count = 0
     skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header using standard function
-        header = generate_sql_header(
-            table_name='folders',
-            target_schema='document_db',
-            target_table='public.folders',
-            source_info=source_info,
-            record_count=len(folders_df)
-        )
-        sql_file.write(header)
-        
-        # Write extension and batch tracking
-        source_json = json.dumps({"source": source_info})
-        batch_start = f"""-- Ensure uuid-ossp extension
+
+    header = generate_sql_header(
+        table_name='folders',
+        target_schema='document_db',
+        target_table='public.folders',
+        source_info=source_info,
+        record_count=len(folders_df)
+    )
+    source_json = json.dumps({"source": source_info})
+    batch_start = f"""-- Ensure uuid-ossp extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Start batch tracking
@@ -895,22 +1369,36 @@ VALUES ('{batch_id}', 'folders', {len(folders_df)}, '{source_json}'::jsonb)
 ON CONFLICT (batch_id) DO NOTHING;
 
 """
-        sql_file.write(batch_start)
-        
-        # Write individual INSERT statements (sorted order)
-        for _, row in folders_sorted.iterrows():
-            sql = generate_folder_insert(row, namespace_uuid, user_id_overrides)
-            if sql:
-                # Replace batch placeholder with actual batch_id
-                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
-                sql_file.write(sql)
-                sql_file.write('\n')
-                record_count += 1
-            else:
-                skipped_count += 1
-        
-        # Write batch completion and footer
-        footer = f"""-- Complete batch tracking
+    # Folders must stay in parent-first order within a shard AND across shards
+    # (a child folder's shard must run after its parent's shard has committed),
+    # so the shard boundary itself never splits a parent from its own row —
+    # each row is one atomic unit and topological order is preserved globally.
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='02_folders',
+        target_database='document_db',
+        migration_run_id=migration_run_id,
+        preamble=header + batch_start,
+        max_rows_per_shard=SHARD_MAX_ROWS['02_folders'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['02_folders'],
+    )
+
+    for _, row in folders_sorted.iterrows():
+        sql = generate_folder_insert(
+            row, namespace_uuid, user_id_overrides, migration_run_id
+        )
+        if sql:
+            sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
+            owner_id = clean_string(row.get('owner_id'))
+            shard_writer.write_unit(
+                sql,
+                owner_legacy_ids=[owner_id] if owner_id else None,
+            )
+            record_count += 1
+        else:
+            skipped_count += 1
+
+    footer = f"""-- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
 WHERE batch_id = '{batch_id}';
@@ -920,13 +1408,16 @@ WHERE batch_id = '{batch_id}';
 -- Note: Folders inserted in parent-first order using deterministic UUIDs (deterministic_uuid_v4)
 -- Namespace UUID: {namespace_uuid}
 """
-        sql_file.write(footer)
-    
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'processed': record_count,
         'skipped': skipped_count,
-        'batch_id': batch_id
+        'batch_id': batch_id,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -959,6 +1450,7 @@ def generate_document_insert(
     user_id_overrides: Optional[Dict[str, str]] = None,
     source_label: Optional[str] = None,
     translate_to_english: bool = False,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statement for a single document plus its document_processing record.
@@ -986,14 +1478,7 @@ def generate_document_insert(
 
     # folder_id is int4 in V4 — pandas may load it as float (e.g. 1393.0).
     # Normalise to plain integer string so migration.id_mappings lookup matches.
-    _doc_folder_id_raw = row.get('folder_id')
-    if _doc_folder_id_raw is not None and not (isinstance(_doc_folder_id_raw, float) and pd.isna(_doc_folder_id_raw)):
-        try:
-            folder_id = str(int(float(_doc_folder_id_raw)))
-        except (ValueError, TypeError):
-            folder_id = clean_string(_doc_folder_id_raw)
-    else:
-        folder_id = None
+    folder_id = _normalize_legacy_folder_id(row.get('folder_id'))
     
     # Skip if no doc_id
     if not doc_id:
@@ -1093,6 +1578,13 @@ def generate_document_insert(
     
     # Build optional agent-topup annotation
     topup_comment = f'\n-- [agent-topup] Auto-added: required by {source_label}' if source_label else ''
+    document_tracking_sql = _record_primary_step_entity_sql(
+        migration_run_id,
+        "03_documents",
+        "documents",
+        "v_old_doc_id",
+        "v_new_doc_id",
+    )
 
     # Generate SQL with mapping table integration
     sql = f"""
@@ -1106,10 +1598,28 @@ DECLARE
     v_user_id UUID := {resolve_user_id_sql(owner_id, user_id_overrides)};
     v_folder_id UUID;
 BEGIN
-    -- Check if document already migrated using mapping table (FAST)
+    -- Reuse an older canonical document without transferring rollback
+    -- ownership to this run.
     IF migration.is_migrated('documents', v_old_doc_id) THEN
-        RAISE NOTICE 'Document % already migrated', v_old_doc_id;
-        RETURN;
+        v_new_doc_id := migration.get_new_id('documents', v_old_doc_id);
+        IF EXISTS (
+            SELECT 1
+            FROM public.documents mapped
+            WHERE mapped.id = v_new_doc_id
+              AND mapped.user_id = v_user_id
+        ) THEN
+{document_tracking_sql}
+            RAISE NOTICE 'Document % already migrated', v_old_doc_id;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION
+            'Canonical document owner mismatch for legacy document %: mapped document % is not owned by user %',
+            v_old_doc_id, v_new_doc_id, v_user_id;
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.documents WHERE id = v_new_doc_id) THEN
+        RAISE EXCEPTION
+            'Document UUID collision for legacy id % (target id % is not mapped from it)',
+            v_old_doc_id, v_new_doc_id;
     END IF;
     
     -- Lookup folder via mapping table if folder specified (same DB - document_db)
@@ -1157,7 +1667,8 @@ BEGIN
     )
     ON CONFLICT (id) DO NOTHING;
 
-    -- Insert document_processing record (status COMPLETED, is_ready true)
+    -- Step 03 never claims readiness. Step 04 reconciles this after chunks and
+    -- embeddings have actually been inserted.
     -- parsing_technique_id: subquery picks first available technique
     -- translate_to_english: derived from whether source chunks contained translated content
     INSERT INTO public.document_processing (
@@ -1179,11 +1690,11 @@ BEGIN
         (SELECT id FROM public.parsing_techniques ORDER BY created_at LIMIT 1),
         512,
         50,
-        'COMPLETED'::public.document_processing_status_enum,
+        'PENDING'::public.document_processing_status_enum,
         true,
         {str(translate_to_english).lower()},
         '00000000-0000-0000-0000-000000000001'::uuid,
-        true,
+        false,
         false,
         NULL
     )
@@ -1194,13 +1705,18 @@ BEGIN
         table_name,
         old_id,
         new_id,
-        migration_batch
+        migration_batch,
+        migration_run_id,
+        record_action
     ) VALUES (
         'documents',
         v_old_doc_id,
         v_new_doc_id,
-        'batch_{{{{TIMESTAMP}}}}'
+        'batch_{{{{TIMESTAMP}}}}',
+        {_migration_run_sql(migration_run_id)},
+        'created'
     );
+{document_tracking_sql}
     
     RAISE NOTICE 'Migrated document: % → %', v_old_doc_id, v_new_doc_id;
 END $$;
@@ -1217,6 +1733,7 @@ def generate_documents_migration_sql(
     user_id_overrides: Optional[Dict[str, str]] = None,
     doc_source_labels: Optional[Dict[str, str]] = None,
     embeddings_df: Optional[pd.DataFrame] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for documents table.
@@ -1267,22 +1784,17 @@ def generate_documents_migration_sql(
 
     # Generate batch ID for tracking
     batch_id = f"documents_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header with migration setup
-        header = generate_sql_header(
-            table_name='documents',
-            target_schema='document_db',
-            target_table='public.documents',
-            source_info=source_info,
-            record_count=len(documents_df),
-            include_mapping_setup=True
-        )
-        sql_file.write(header)
-        
-        # Write UUID extensions and batch tracking
-        source_json = json.dumps({"source": source_info, "namespace_uuid": namespace_uuid})
-        batch_start = f"""-- Ensure UUID extensions are available
+
+    header = generate_sql_header(
+        table_name='documents',
+        target_schema='document_db',
+        target_table='public.documents',
+        source_info=source_info,
+        record_count=len(documents_df),
+        include_mapping_setup=True
+    )
+    source_json = json.dumps({"source": source_info, "namespace_uuid": namespace_uuid})
+    batch_start = f"""-- Ensure UUID extensions are available
 -- Note: gen_random_uuid() is built-in for PostgreSQL 13+
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -1295,36 +1807,45 @@ ON CONFLICT (batch_id) DO NOTHING;
 -- Documents reference both users (owner_id) and folders (folder_id)
 
 """
-        sql_file.write(batch_start)
-        
-        # Write individual INSERT statements with batch_id substitution
-        for _, row in documents_df.iterrows():
-            try:
-                _doc_id = clean_string(row.get('doc_id'))
-                _source_label = doc_source_labels.get(_doc_id) if doc_source_labels and _doc_id else None
-                _translate = _doc_id in translated_doc_ids if _doc_id else False
-                sql = generate_document_insert(
-                    row, namespace_uuid, user_id_overrides,
-                    source_label=_source_label,
-                    translate_to_english=_translate,
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='03_documents',
+        target_database='document_db',
+        migration_run_id=migration_run_id,
+        preamble=header + batch_start,
+        max_rows_per_shard=SHARD_MAX_ROWS['03_documents'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['03_documents'],
+    )
+
+    for _, row in documents_df.iterrows():
+        try:
+            _doc_id = clean_string(row.get('doc_id'))
+            _source_label = doc_source_labels.get(_doc_id) if doc_source_labels and _doc_id else None
+            _translate = _doc_id in translated_doc_ids if _doc_id else False
+            sql = generate_document_insert(
+                row, namespace_uuid, user_id_overrides,
+                source_label=_source_label,
+                translate_to_english=_translate,
+                migration_run_id=migration_run_id,
+            )
+            if sql:
+                sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
+                owner_id = clean_string(row.get('owner_id'))
+                shard_writer.write_unit(
+                    sql,
+                    owner_legacy_ids=[owner_id] if owner_id else None,
                 )
-                if sql:
-                    # Replace batch placeholder with actual batch_id
-                    sql = sql.replace('batch_{{TIMESTAMP}}', batch_id)
-                    sql_file.write(sql)
-                    sql_file.write('\n')
-                    record_count += 1
-                else:
-                    skipped_count += 1
-            except Exception as e:
-                import sys, traceback
-                doc_id = row.get('doc_id', 'unknown')
-                print(f"Warning: Failed to generate SQL for document {doc_id}: {e}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
+                record_count += 1
+            else:
                 skipped_count += 1
-        
-        # Write batch completion and footer
-        footer = f"""-- Complete batch tracking
+        except Exception as e:
+            import sys, traceback
+            doc_id = row.get('doc_id', 'unknown')
+            print(f"Warning: Failed to generate SQL for document {doc_id}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            skipped_count += 1
+
+    footer = f"""-- Complete batch tracking
 UPDATE migration.batch_log 
 SET completed_at = now(), status = 'completed' 
 WHERE batch_id = '{batch_id}';
@@ -1332,13 +1853,16 @@ WHERE batch_id = '{batch_id}';
 -- Total documents processed: {record_count}
 -- Skipped (no doc_id): {skipped_count}
 """
-        sql_file.write(footer)
-    
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'processed': record_count,
         'skipped': skipped_count,
-        'batch_id': batch_id
+        'batch_id': batch_id,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -1352,12 +1876,12 @@ def truncate_embedding_vector(
     
     Used when the source embeddings were produced by a smaller model (e.g. E5-large
     at 1024 dims) and zero-padded to a larger size (e.g. 1536) for storage.
-    Truncation strips the trailing zero-padded dimensions.
+    Truncation is allowed only when the removed dimensions are zero-padded.
     
     Args:
         embeddings_value: pgvector-format string, e.g. "[0.1,0.2,...,0.0]"
         target_dim: Target dimension count (default 1024)
-        warn_nonzero_tail: If True, print a warning when truncated dims are non-zero
+        warn_nonzero_tail: Retained for API compatibility. Non-zero tails always fail.
         
     Returns:
         Truncated pgvector-format string with target_dim dimensions
@@ -1380,18 +1904,14 @@ def truncate_embedding_vector(
     if source_dim <= target_dim:
         return embeddings_value
     
-    # Warn if truncated tail contains non-zero values
-    if warn_nonzero_tail:
-        tail = parts[target_dim:]
-        nonzero_count = sum(1 for v in tail if abs(float(v)) > 1e-9)
-        if nonzero_count > 0:
-            import sys
-            print(
-                f"WARNING: Truncating embedding from {source_dim} to {target_dim} dims, "
-                f"but {nonzero_count}/{len(tail)} truncated values are non-zero. "
-                f"This may indicate the vector was NOT zero-padded.",
-                file=sys.stderr
-            )
+    tail = parts[target_dim:]
+    nonzero_count = sum(1 for value in tail if abs(float(value)) > 1e-9)
+    if nonzero_count:
+        raise ValueError(
+            f"Refusing destructive embedding truncation from {source_dim} to "
+            f"{target_dim}: {nonzero_count}/{len(tail)} removed values are non-zero. "
+            "Preserve the source dimension by setting target dimension to 0."
+        )
     
     # Truncate and re-serialize
     truncated = parts[:target_dim]
@@ -1437,7 +1957,8 @@ def generate_chunk_and_embedding_inserts(
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     default_embedding_model: str = 'text-embedding-ada-002',
     skip_empty_embeddings: bool = False,
-    target_embedding_dim: Optional[int] = None
+    target_embedding_dim: Optional[int] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Generate INSERT statements for BOTH chunk and embedding from a single source row.
@@ -1561,6 +2082,40 @@ def generate_chunk_and_embedding_inserts(
     while f'${outer_tag}$' in all_content:
         outer_tag = outer_tag + '_'
     
+    chunk_run_setup_sql = ""
+    chunk_tracking_sql = ""
+    if migration_run_id:
+        run_sql = _migration_run_sql(migration_run_id)
+        chunk_run_setup_sql = f"""
+    SELECT record_action INTO v_document_action
+    FROM migration.migration_step_entities
+    WHERE migration_run_id = {run_sql}
+      AND step_key = '03_documents'
+      AND table_name = 'documents'
+      AND old_id = v_old_doc_id;
+
+    IF v_document_action IS NULL THEN
+        RAISE EXCEPTION
+            'Missing run-scoped document tracking for legacy document %',
+            v_old_doc_id;
+    END IF;
+"""
+        chunk_tracking_sql = f"""
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    VALUES (
+        {run_sql}, '04_chunks_embeddings', 'chunks', {escape_sql_string(legacy_id)},
+        v_chunk_id, CASE WHEN v_chunk_existed THEN 'reused' ELSE 'created' END
+    )
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET
+        new_id = EXCLUDED.new_id,
+        record_action = EXCLUDED.record_action,
+        recorded_at = now();
+"""
+
     # Generate chunk INSERT
     chunk_sql = f"""
 -- Chunk from legacy ID: {legacy_id} (doc_id: {doc_id})
@@ -1569,6 +2124,9 @@ DECLARE
     v_chunk_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}');
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
+    v_document_processing_id uuid;
+    v_document_action VARCHAR := 'created';
+    v_chunk_existed BOOLEAN;
 BEGIN
     -- Lookup document_id from migration mapping table (FAST)
     v_document_id := migration.get_new_id('documents', v_old_doc_id);
@@ -1584,15 +2142,40 @@ BEGIN
         RAISE NOTICE 'Skipping chunk % - document % has stale mapping (not in documents table)', '{legacy_id}', v_old_doc_id;
         RETURN;
     END IF;
+{chunk_run_setup_sql}
+
+    -- The chunks API scopes rows by both document_id and
+    -- document_processing_id. Resolve the actual processing row instead of
+    -- independently recomputing its UUID.
+    SELECT id INTO v_document_processing_id
+    FROM document_processing
+    WHERE document_id = v_document_id
+      AND deleted_at IS NULL
+    ORDER BY created_at DESC NULLS LAST, id
+    LIMIT 1;
+
+    IF v_document_processing_id IS NULL THEN
+        RAISE EXCEPTION
+            'Cannot migrate chunk %: document % has no active document_processing row',
+            '{legacy_id}', v_document_id;
+    END IF;
     
-    -- Insert chunk if not exists
-    IF NOT EXISTS (
+    v_chunk_existed := EXISTS (
         SELECT 1 FROM chunks
         WHERE id = v_chunk_id
-    ) THEN
+    );
+    IF v_document_action = 'reused' AND NOT v_chunk_existed THEN
+        RAISE EXCEPTION
+            'Reused document % is missing canonical chunk %; resume its owning run instead',
+            v_old_doc_id, {escape_sql_string(legacy_id)};
+    END IF;
+
+    -- Insert chunk if not exists
+    IF NOT v_chunk_existed THEN
         INSERT INTO chunks (
             id,
             document_id,
+            document_processing_id,
             chunk_index,
             content,
             content_hash,
@@ -1606,6 +2189,7 @@ BEGIN
         ) VALUES (
             v_chunk_id,
             v_document_id,
+            v_document_processing_id,
             {chunk_index},
             {escape_sql_string_with_dollar_quotes(original_content, 'ORIG')},
             {content_hash},
@@ -1617,7 +2201,29 @@ BEGIN
             {created_at_sql},
             {escape_sql_string_with_dollar_quotes(translated_content, 'TRANS') if translated_content else 'NULL'}
         );
+    ELSE
+        -- Repair idempotent reruns of SQL generated before
+        -- document_processing_id was populated, but reject real collisions.
+        UPDATE chunks
+        SET document_processing_id = v_document_processing_id
+        WHERE id = v_chunk_id
+          AND document_id = v_document_id
+          AND document_processing_id IS NULL;
+
+        IF EXISTS (
+            SELECT 1 FROM chunks
+            WHERE id = v_chunk_id
+              AND (
+                  document_id <> v_document_id
+                  OR document_processing_id IS DISTINCT FROM v_document_processing_id
+              )
+        ) THEN
+            RAISE EXCEPTION
+                'Chunk UUID collision or processing mismatch for legacy chunk %',
+                '{legacy_id}';
+        END IF;
     END IF;
+{chunk_tracking_sql}
 END ${outer_tag}$;
 """
     
@@ -1639,6 +2245,41 @@ END ${outer_tag}$;
         # Use a named tag for the outer DO block (consistent with chunk block)
         emb_tag = 'emb_fn'
         
+        embedding_run_setup_sql = ""
+        embedding_tracking_sql = ""
+        if migration_run_id:
+            run_sql = _migration_run_sql(migration_run_id)
+            embedding_run_setup_sql = f"""
+    SELECT record_action INTO v_document_action
+    FROM migration.migration_step_entities
+    WHERE migration_run_id = {run_sql}
+      AND step_key = '03_documents'
+      AND table_name = 'documents'
+      AND old_id = v_old_doc_id;
+
+    IF v_document_action IS NULL THEN
+        RAISE EXCEPTION
+            'Missing run-scoped document tracking for legacy document %',
+            v_old_doc_id;
+    END IF;
+"""
+            embedding_tracking_sql = f"""
+    INSERT INTO migration.migration_step_entities (
+        migration_run_id, step_key, table_name, old_id, new_id,
+        record_action
+    )
+    VALUES (
+        {run_sql}, '04_chunks_embeddings', 'embeddings',
+        {escape_sql_string(legacy_id)}, v_embedding_id,
+        CASE WHEN v_embedding_existed THEN 'reused' ELSE 'created' END
+    )
+    ON CONFLICT (migration_run_id, step_key, table_name, old_id)
+    DO UPDATE SET
+        new_id = EXCLUDED.new_id,
+        record_action = EXCLUDED.record_action,
+        recorded_at = now();
+"""
+
         embedding_sql = f"""
 -- Embedding for chunk {legacy_id}
 DO ${emb_tag}$
@@ -1646,6 +2287,9 @@ DECLARE
     v_chunk_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{legacy_id}');
     v_old_doc_id VARCHAR := {escape_sql_string(doc_id)};
     v_document_id uuid;
+    v_document_action VARCHAR := 'created';
+    v_embedding_id uuid;
+    v_embedding_existed BOOLEAN;
 BEGIN
     -- Lookup document_id from migration mapping table (FAST)
     v_document_id := migration.get_new_id('documents', v_old_doc_id);
@@ -1658,12 +2302,21 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM documents WHERE id = v_document_id) THEN
         RETURN;
     END IF;
+{embedding_run_setup_sql}
     
+    SELECT id INTO v_embedding_id
+    FROM embeddings
+    WHERE chunk_id = v_chunk_id
+    LIMIT 1;
+    v_embedding_existed := v_embedding_id IS NOT NULL;
+    IF v_document_action = 'reused' AND NOT v_embedding_existed THEN
+        RAISE EXCEPTION
+            'Reused document % is missing the embedding for chunk %; resume its owning run instead',
+            v_old_doc_id, {escape_sql_string(legacy_id)};
+    END IF;
+
     -- Insert embedding if not exists
-    IF NOT EXISTS (
-        SELECT 1 FROM embeddings
-        WHERE chunk_id = v_chunk_id
-    ) THEN
+    IF NOT v_embedding_existed THEN
         INSERT INTO embeddings (
             id,
             chunk_id,
@@ -1680,8 +2333,18 @@ BEGIN
             vector_dims('{embeddings_value}'::vector),
             '{default_embedding_model}',
             {created_at_sql}
-        );
+        )
+        RETURNING id INTO v_embedding_id;
+    ELSIF EXISTS (
+        SELECT 1 FROM embeddings
+        WHERE id = v_embedding_id
+          AND (chunk_id <> v_chunk_id OR document_id <> v_document_id)
+    ) THEN
+        RAISE EXCEPTION
+            'Embedding collision for legacy chunk %',
+            {escape_sql_string(legacy_id)};
     END IF;
+{embedding_tracking_sql}
 END ${emb_tag}$;
 """
     
@@ -1693,60 +2356,93 @@ END ${emb_tag}$;
     return combined_sql
 
 
+def _doc_id_from_metadata(metadata_raw) -> Optional[str]:
+    if isinstance(metadata_raw, str):
+        try:
+            return json.loads(metadata_raw.replace("'", '"')).get('doc_id')
+        except Exception:
+            return None
+    if isinstance(metadata_raw, dict):
+        return metadata_raw.get('doc_id')
+    return None
+
+
+def _owner_id_from_metadata(metadata_raw) -> Optional[str]:
+    if isinstance(metadata_raw, str):
+        try:
+            return clean_string(
+                json.loads(metadata_raw.replace("'", '"')).get('user_id')
+            )
+        except Exception:
+            return None
+    if isinstance(metadata_raw, dict):
+        return clean_string(metadata_raw.get('user_id'))
+    return None
+
+
 def generate_chunks_embeddings_migration_sql(
-    jeen_dev_df: pd.DataFrame,
+    jeen_dev_df,
     output_file: str,
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     default_embedding_model: str = 'text-embedding-ada-002',
     skip_empty_embeddings: bool = False,
-    target_embedding_dim: Optional[int] = None
+    target_embedding_dim: Optional[int] = None,
+    migration_run_id: Optional[str] = None,
+    expected_record_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for chunks and embeddings tables.
     Each source row generates TWO inserts: one for chunk, one for embedding.
-    
+
     Args:
-        jeen_dev_df: DataFrame with jeen_dev data
-        output_file: Path to output SQL file
+        jeen_dev_df: A DataFrame with jeen_dev data, OR an iterable of
+            DataFrame chunks (e.g. from ``execute_query_chunked``) already
+            ordered by ``metadata->>'doc_id', id`` at the SQL level. Passing
+            an iterable streams row generation without materializing the
+            full result set in memory, which matters for heavy users with
+            tens of thousands of chunks.
+        output_file: Path to output SQL file (also the first shard's path)
         source_info: Source database info string
         namespace_uuid: Fixed namespace UUID for chunk_id generation
         default_embedding_model: Default embedding model name
         skip_empty_embeddings: If True, skip rows without embeddings
         target_embedding_dim: If set, truncate embeddings to this dimension (e.g. 1024)
-        
+        expected_record_count: Row count for the header, required when
+            ``jeen_dev_df`` is a streamed iterable (its length is unknown
+            up front); ignored when a DataFrame is passed directly.
+
     Returns:
         Dictionary with generation stats
     """
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    
+
     # Clean up old chunks/embeddings migration files
     cleanup_old_migration_files(output_file, '04_chunks_embeddings_')
-    
-    # Group by doc_id to assign chunk_index
-    jeen_dev_df['doc_id_from_metadata'] = jeen_dev_df['metadata'].apply(
-        lambda x: json.loads(x.replace("'", '"')).get('doc_id') if isinstance(x, str) else x.get('doc_id') if isinstance(x, dict) else None
-    )
-    
-    # Sort by doc_id and id for consistent chunk_index
-    jeen_dev_sorted = jeen_dev_df.sort_values(['doc_id_from_metadata', 'id'])
-    
-    # Assign chunk_index per document
-    jeen_dev_sorted['chunk_index'] = jeen_dev_sorted.groupby('doc_id_from_metadata').cumcount()
-    
-    chunk_count = 0
-    embedding_count = 0
-    skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
+
+    if isinstance(jeen_dev_df, pd.DataFrame):
+        jeen_dev_df = jeen_dev_df.copy()
+        jeen_dev_df['doc_id_from_metadata'] = jeen_dev_df['metadata'].apply(_doc_id_from_metadata)
+        jeen_dev_sorted = jeen_dev_df.sort_values(['doc_id_from_metadata', 'id'])
+        record_count_hint = len(jeen_dev_df)
+        frame_iter = [jeen_dev_sorted]
+    else:
+        # Streamed path: caller's query is ordered by (doc_id, id), so a
+        # running per-document counter reproduces the same chunk_index
+        # values as the DataFrame path's global sort + cumcount without
+        # ever holding the whole result set in memory.
+        record_count_hint = expected_record_count
+        frame_iter = jeen_dev_df
+
+    display_count = record_count_hint if record_count_hint is not None else 'unknown (streamed)'
+
+    header = f"""-- ============================================================
 -- CHUNKS & EMBEDDINGS MIGRATION SQL
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
 -- Source: {source_info}
 -- Destination: chunks + embeddings tables
--- Records to migrate: {len(jeen_dev_df)}
+-- Records to migrate: {display_count}
 -- 
 -- IMPORTANT: This script will INSERT chunks AND embeddings!
 -- IMPORTANT: Run users, folders, and documents migrations first.
@@ -1768,42 +2464,6 @@ SET client_encoding = 'UTF8';
 -- Ensure uuid-ossp extension is available
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- CONFIRMATION PROMPT: User must confirm before execution
-DO $$
-DECLARE
-    user_confirmation TEXT;
-BEGIN
-    RAISE NOTICE '';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'CHUNKS & EMBEDDINGS MIGRATION - CONFIRMATION REQUIRED';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'This script will migrate {len(jeen_dev_df)} chunks/embeddings';
-    RAISE NOTICE 'Namespace UUID: {namespace_uuid}';
-    RAISE NOTICE 'Default embedding model: {default_embedding_model}';
-    RAISE NOTICE 'Generated: {datetime.now().isoformat()}';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'PREREQUISITE: Users, folders, and documents must be migrated first!';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE '';
-    
-    user_confirmation := NULL;
-    
-    IF current_setting('is_superuser') = 'off' THEN
-        RAISE NOTICE 'Ready to proceed. Press Ctrl+C to cancel or Enter to continue...';
-    END IF;
-    
-    RAISE NOTICE 'Starting migration...';
-    RAISE NOTICE '';
-END $$;
-
--- Uncomment the lines below to require manual confirmation (recommended for first run)
--- Note: These are psql meta-commands that work in interactive psql sessions
--- \\\\prompt 'Type YES to confirm and continue with migration: ' user_confirmation
--- \\\\if :'user_confirmation' != 'YES'
---   \\\\echo 'Migration cancelled by user.'
---   \\\\quit
--- \\\\endif
-
 -- V5 uses untyped vector column + separate dimension column (per-row).
 -- Ensure the dimension column exists (it should from the V5 migration).
 DO $$
@@ -1818,42 +2478,128 @@ BEGIN
 END $$;
 
 """
-        sql_file.write(header)
-        
-        # Include migration schema setup (idempotent - safe if already exists in this DB)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
-        
-        # Write individual INSERT statements
-        for _, row in jeen_dev_sorted.iterrows():
+    preamble = header + generate_migration_schema_setup() + '\n'
+
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='04_chunks_embeddings',
+        target_database='document_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['04_chunks_embeddings'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['04_chunks_embeddings'],
+    )
+
+    chunk_count = 0
+    embedding_count = 0
+    skipped_count = 0
+    chunk_counters: Dict[str, int] = {}
+
+    for frame in frame_iter:
+        if 'doc_id_from_metadata' not in frame.columns:
+            frame = frame.copy()
+            frame['doc_id_from_metadata'] = frame['metadata'].apply(_doc_id_from_metadata)
+        for _, row in frame.iterrows():
+            doc_id = row['doc_id_from_metadata']
+            chunk_index = chunk_counters.get(doc_id, 0)
+            chunk_counters[doc_id] = chunk_index + 1
             sql = generate_chunk_and_embedding_inserts(
                 row,
-                chunk_index=int(row['chunk_index']),
+                chunk_index=chunk_index,
                 namespace_uuid=namespace_uuid,
                 default_embedding_model=default_embedding_model,
                 skip_empty_embeddings=skip_empty_embeddings,
-                target_embedding_dim=target_embedding_dim
+                target_embedding_dim=target_embedding_dim,
+                migration_run_id=migration_run_id,
             )
             if sql:
-                sql_file.write(sql)
-                sql_file.write('\n')
+                owner_id = _owner_id_from_metadata(row.get('metadata'))
+                shard_writer.write_unit(
+                    sql,
+                    owner_legacy_ids=[owner_id] if owner_id else None,
+                )
                 chunk_count += 1
-                # Check if embedding was included
                 if 'INSERT INTO embeddings' in sql:
                     embedding_count += 1
             else:
                 skipped_count += 1
-        
-        # Write footer
-        sql_file.write(f'\n-- Total chunks processed: {chunk_count}\n')
-        sql_file.write(f'-- Total embeddings processed: {embedding_count}\n')
-        sql_file.write(f'-- Skipped: {skipped_count}\n')
-    
+
+    # Reconcile processing state only after every chunk/embedding statement
+    # above committed (merged into the final shard so it runs exactly once).
+    reconciliation_sql = f"""
+UPDATE public.document_processing dp
+SET status = 'COMPLETED'::public.document_processing_status_enum,
+    is_ready = true
+FROM migration.id_mappings m
+WHERE m.table_name = 'documents'
+  AND m.migration_run_id IS NOT DISTINCT FROM {_migration_run_sql(migration_run_id)}
+  AND m.record_action = 'created'
+  AND dp.document_id = m.new_id
+  AND EXISTS (
+      SELECT 1
+      FROM public.chunks c
+      WHERE c.document_id = dp.document_id
+        AND c.document_processing_id = dp.id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM public.chunks c
+      WHERE c.document_id = dp.document_id
+        AND c.document_processing_id = dp.id
+        AND NOT EXISTS (
+            SELECT 1 FROM public.embeddings e WHERE e.chunk_id = c.id
+        )
+  );
+
+DO $readiness_reconcile$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM public.document_processing dp
+        JOIN migration.id_mappings m
+          ON m.table_name = 'documents'
+         AND m.new_id = dp.document_id
+         AND m.migration_run_id IS NOT DISTINCT FROM {_migration_run_sql(migration_run_id)}
+         AND m.record_action = 'created'
+        WHERE dp.is_ready = true
+          AND (
+              NOT EXISTS (
+                  SELECT 1 FROM public.chunks c
+                  WHERE c.document_id = dp.document_id
+                    AND c.document_processing_id = dp.id
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM public.chunks c
+                  WHERE c.document_id = dp.document_id
+                    AND (
+                        c.document_processing_id IS DISTINCT FROM dp.id
+                        OR NOT EXISTS (
+                        SELECT 1 FROM public.embeddings e WHERE e.chunk_id = c.id
+                        )
+                    )
+              )
+          )
+    ) THEN
+        RAISE EXCEPTION
+            'Readiness reconciliation failed: a ready document lacks chunks or embeddings';
+    END IF;
+END $readiness_reconcile$;
+
+-- Total chunks processed: {chunk_count}
+-- Total embeddings processed: {embedding_count}
+-- Skipped: {skipped_count}
+"""
+    manifest = shard_writer.finalize(epilogue=reconciliation_sql)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'chunks_processed': chunk_count,
         'embeddings_processed': embedding_count,
-        'skipped': skipped_count
+        'skipped': skipped_count,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -1952,13 +2698,240 @@ def extract_question_from_jsonb(question_data) -> str:
     return _extract_value_from_question_array(question_data) or _NO_QUESTION
 
 
+CONVERSATION_COLLISION_POLICIES = {
+    "adopt_exact",
+    "replace_unmapped",
+    "block",
+}
+
+
+def _uuid_array_sql(expressions: List[str]) -> str:
+    if not expressions:
+        return "ARRAY[]::uuid[]"
+    return "ARRAY[" + ", ".join(expressions) + "]::uuid[]"
+
+
+def _conversation_collision_sql(
+    conversation: Mapping[str, Any],
+    namespace_uuid: str,
+    user_id_overrides: Optional[Dict[str, str]],
+    collision_policy: str,
+) -> str:
+    """Build the runtime guard for one canonical conversation UUID."""
+    chat_id = str(conversation["chat_id"])
+    legacy_chat_id = str(conversation.get("legacy_chat_id") or chat_id)
+    owner_id = str(conversation["user_id"])
+    conversation_metadata = conversation.get("metadata")
+    expected_agent_id = conversation.get("agent_id")
+    legacy_log_ids = [
+        clean_string(row.get("id"))
+        for _, row in conversation["logs"].iterrows()
+    ]
+    message_ids = []
+    block_ids = []
+    for legacy_id in legacy_log_ids:
+        for role in ("user", "assistant"):
+            message_ids.append(
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{legacy_id}-{role}')})"
+            )
+            block_ids.append(
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{legacy_id}-{role}-block-0')})"
+            )
+    expected_messages_sql = _uuid_array_sql(message_ids)
+    expected_blocks_sql = _uuid_array_sql(block_ids)
+    expected_owner_sql = resolve_user_id_sql(owner_id, user_id_overrides)
+    metadata_reconciliation_sql = ""
+    if conversation_metadata:
+        metadata_sql = escape_json_for_sql(conversation_metadata)
+        agent_guard_sql = ""
+        if expected_agent_id:
+            agent_guard_sql = f"""
+        IF EXISTS (
+            SELECT 1
+            FROM conversations
+            WHERE id = v_chat_id
+              AND metadata ? 'initiatedByAgentId'
+              AND metadata->>'initiatedByAgentId'
+                  <> {escape_sql_string(str(expected_agent_id))}
+        ) THEN
+            RAISE EXCEPTION
+                'Conversation agent association mismatch for legacy conversation %',
+                v_old_chat_id;
+        END IF;
+"""
+        metadata_reconciliation_sql = f"""
+{agent_guard_sql}
+        UPDATE conversations
+        SET metadata = COALESCE(metadata, '{{}}'::jsonb) || {metadata_sql}
+        WHERE id = v_chat_id;
+"""
+
+    if collision_policy == "replace_unmapped":
+        unmapped_collision_sql = """
+        IF to_regclass('public.message_reactions') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.message_reactions
+                WHERE message_id IN (
+                    SELECT id FROM public.messages
+                    WHERE conversation_id = $1
+                )'
+            USING v_chat_id;
+        END IF;
+        IF to_regclass('public.document_attachments') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.document_attachments
+                WHERE conversation_id = $1'
+            USING v_chat_id;
+        END IF;
+        IF to_regclass('public.canvases') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.canvases
+                WHERE conversation_id = $1'
+            USING v_chat_id;
+        END IF;
+        IF to_regclass('public.knowledge_base_assignments') IS NOT NULL THEN
+            EXECUTE '
+                DELETE FROM public.knowledge_base_assignments
+                WHERE assigned_to_id = $1
+                  AND assigned_to_type::text = ''conversation'''
+            USING v_chat_id;
+        END IF;
+        DELETE FROM message_content_blocks
+        WHERE message_id IN (
+            SELECT id FROM messages WHERE conversation_id = v_chat_id
+        );
+        DELETE FROM messages WHERE conversation_id = v_chat_id;
+        DELETE FROM conversations WHERE id = v_chat_id;
+        RAISE NOTICE
+            'Replaced unmapped V5 conversation % with authoritative V4 data',
+            v_chat_id;
+"""
+    elif collision_policy == "block":
+        unmapped_collision_sql = """
+        RAISE EXCEPTION
+            'Conversation UUID collision for legacy conversation %',
+            v_chat_id;
+"""
+    else:
+        unmapped_collision_sql = f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE id = v_chat_id AND user_id = v_expected_user_id
+        ) THEN
+            RAISE EXCEPTION
+                'Conversation exact adoption owner mismatch for legacy conversation %',
+                v_chat_id;
+        END IF;
+
+        SELECT COUNT(*) INTO v_actual_message_count
+        FROM messages
+        WHERE conversation_id = v_chat_id;
+        SELECT COUNT(*) INTO v_matching_message_count
+        FROM unnest(v_expected_message_ids) expected(id)
+        WHERE EXISTS (SELECT 1 FROM messages WHERE id = expected.id);
+
+        SELECT COUNT(*) INTO v_actual_block_count
+        FROM message_content_blocks block
+        JOIN messages message ON message.id = block.message_id
+        WHERE message.conversation_id = v_chat_id;
+        SELECT COUNT(*) INTO v_matching_block_count
+        FROM unnest(v_expected_block_ids) expected(id)
+        WHERE EXISTS (
+            SELECT 1 FROM message_content_blocks WHERE id = expected.id
+        );
+
+        IF v_actual_message_count <> cardinality(v_expected_message_ids)
+           OR v_matching_message_count <> cardinality(v_expected_message_ids)
+           OR v_actual_block_count <> cardinality(v_expected_block_ids)
+           OR v_matching_block_count <> cardinality(v_expected_block_ids)
+        THEN
+            RAISE EXCEPTION
+                'Conversation exact adoption content mismatch for legacy conversation % '
+                '(messages %/%, blocks %/%)',
+                v_chat_id,
+                v_matching_message_count,
+                cardinality(v_expected_message_ids),
+                v_matching_block_count,
+                cardinality(v_expected_block_ids);
+        END IF;
+
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'conversations', v_old_chat_id, v_chat_id,
+            'legacy_adoption', NULL, 'reused',
+            'Adopted exact previously migrated conversation'
+        );
+        RAISE NOTICE
+            'Adopted exact previously migrated conversation %',
+            v_chat_id;
+{metadata_reconciliation_sql}
+"""
+
+    return f"""
+DO $conversation_collision$
+DECLARE
+    v_chat_id uuid := '{chat_id}'::uuid;
+    v_old_chat_id text := {escape_sql_string(legacy_chat_id)};
+    v_expected_user_id uuid := {expected_owner_sql};
+    v_expected_message_ids uuid[] := {expected_messages_sql};
+    v_expected_block_ids uuid[] := {expected_blocks_sql};
+    v_mapping_old_id text;
+    v_mapping_new_id uuid;
+    v_actual_message_count integer := 0;
+    v_matching_message_count integer := 0;
+    v_actual_block_count integer := 0;
+    v_matching_block_count integer := 0;
+BEGIN
+    SELECT old_id, new_id
+    INTO v_mapping_old_id, v_mapping_new_id
+    FROM migration.id_mappings
+    WHERE table_name = 'conversations'
+      AND (old_id = v_old_chat_id OR new_id = v_chat_id)
+    LIMIT 1;
+
+    IF FOUND THEN
+        IF v_mapping_old_id <> v_old_chat_id
+           OR v_mapping_new_id <> v_chat_id
+        THEN
+            RAISE EXCEPTION
+                'Canonical conversation mapping mismatch for legacy conversation %',
+                v_chat_id;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE id = v_chat_id AND user_id = v_expected_user_id
+        ) THEN
+            RAISE EXCEPTION
+                'Canonical conversation owner mismatch for legacy conversation %',
+                v_old_chat_id;
+        END IF;
+{metadata_reconciliation_sql}
+        RETURN;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM conversations WHERE id = v_chat_id) THEN
+{unmapped_collision_sql}
+    END IF;
+END $conversation_collision$;
+"""
+
+
 def generate_conversations_logs_migration_sql(
     logs_df: pd.DataFrame,
     output_file: str,
     source_info: str,
-    namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
+    namespace_uuid: str = CONVERSATION_MESSAGES_NAMESPACE_UUID,
     max_records_per_insert: int = 50,
-    user_id_overrides: Optional[Dict[str, str]] = None
+    user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
+    conversation_collision_policy: str = "adopt_exact",
+    agent_id_by_bot_id: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for jeen_dev_logs.
@@ -1977,16 +2950,76 @@ def generate_conversations_logs_migration_sql(
     Returns:
         Dictionary with generation stats
     """
+    if conversation_collision_policy not in CONVERSATION_COLLISION_POLICIES:
+        raise ValueError(
+            "conversation_collision_policy must be 'adopt_exact', "
+            "'replace_unmapped', or 'block'"
+        )
+    planned_agent_ids = {
+        str(bot_id).strip(): str(agent_id)
+        for bot_id, agent_id in (agent_id_by_bot_id or {}).items()
+        if str(bot_id).strip() and str(agent_id).strip()
+    }
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
     # Clean up old conversations migration files
     cleanup_old_migration_files(output_file, '05_conversations_')
     
-    # Filter: only rows with user_id and chat_id
+    source_row_count = len(logs_df)
+
+    def normalize_legacy_chat_id(value):
+        if _is_scalar_na(value):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return text.lower()
+
+    def target_chat_uuid(legacy_chat_id: str) -> tuple[str, bool]:
+        try:
+            return str(uuid.UUID(legacy_chat_id)), False
+        except (ValueError, TypeError, AttributeError):
+            return str(deterministic_uuid_v4_py(
+                namespace_uuid,
+                f"conversation-{legacy_chat_id}",
+            )), True
+
+    normalized_chat_ids = logs_df["chat_id"].apply(normalize_legacy_chat_id)
     logs_df = logs_df[
-        logs_df['user_id'].notna() & 
-        logs_df['chat_id'].notna()
+        logs_df["user_id"].notna() & normalized_chat_ids.notna()
     ].copy()
+    logs_df["legacy_chat_id"] = normalized_chat_ids[
+        normalized_chat_ids.notna()
+    ]
+    target_chat_id_rows = logs_df["legacy_chat_id"].apply(target_chat_uuid)
+    logs_df["chat_id"] = target_chat_id_rows.apply(lambda value: value[0])
+    logs_df["_chat_id_was_remapped"] = target_chat_id_rows.apply(
+        lambda value: value[1]
+    )
+    skipped_missing_chat_id = source_row_count - len(logs_df)
+    remapped_non_uuid_chat_ids = int(
+        logs_df.loc[logs_df["_chat_id_was_remapped"], "legacy_chat_id"].nunique()
+    )
+
+    target_sources = logs_df.groupby("chat_id")["legacy_chat_id"].nunique()
+    ambiguous_targets = target_sources[target_sources > 1]
+    if not ambiguous_targets.empty:
+        raise ValueError(
+            "Multiple legacy conversation IDs resolved to the same V5 UUID: "
+            + ", ".join(ambiguous_targets.index.astype(str).tolist()[:10])
+        )
+
+    shared_chat_ids = (
+        logs_df.groupby("chat_id")["user_id"].nunique()
+        if not logs_df.empty
+        else pd.Series(dtype=int)
+    )
+    shared_chat_ids = shared_chat_ids[shared_chat_ids > 1]
+    if not shared_chat_ids.empty:
+        raise ValueError(
+            "Conversation IDs are shared by multiple selected users: "
+            + ", ".join(shared_chat_ids.index.astype(str).tolist()[:10])
+        )
     
     if len(logs_df) == 0:
         return {
@@ -1994,7 +3027,11 @@ def generate_conversations_logs_migration_sql(
             'users_processed': 0,
             'conversations_processed': 0,
             'messages_processed': 0,
-            'blocks_processed': 0
+            'blocks_processed': 0,
+            'skipped_invalid_chat_id': skipped_missing_chat_id,
+            'remapped_non_uuid_chat_ids': remapped_non_uuid_chat_ids,
+            'truncated_titles': 0,
+            'multi_agent_conversations': 0,
         }
     
     # Add question_number if not present (for ordering)
@@ -2009,10 +3046,10 @@ def generate_conversations_logs_migration_sql(
     conversations_processed = 0
     messages_processed = 0
     blocks_processed = 0
+    truncated_titles = 0
+    multi_agent_conversations = 0
     
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
+    header = f"""-- ============================================================
 -- CONVERSATIONS, MESSAGES & MESSAGE_CONTENT_BLOCKS MIGRATION SQL
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
@@ -2075,12 +3112,43 @@ END $$;
 -- \\\\endif
 
 """
-        sql_file.write(header)
-        
-        # Include migration schema setup (idempotent - safe if already exists in this DB)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
-        
+    preamble = header + generate_migration_schema_setup() + '\n'
+
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='05_conversations',
+        target_database='completion_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['05_conversations'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['05_conversations'],
+    )
+    message_owner_scope_sql = ""
+    block_owner_scope_sql = ""
+    if migration_run_id:
+        run_sql = _migration_run_sql(migration_run_id)
+        message_owner_scope_sql = f"""
+  AND EXISTS (
+      SELECT 1
+      FROM migration.id_mappings m
+      WHERE m.table_name = 'conversations'
+        AND m.new_id = v.conversation_id
+        AND m.migration_run_id = {run_sql}
+        AND m.record_action = 'created'
+  )"""
+        block_owner_scope_sql = f"""
+  AND EXISTS (
+      SELECT 1
+      FROM messages owned_message
+      JOIN migration.id_mappings m
+        ON m.table_name = 'conversations'
+       AND m.new_id = owned_message.conversation_id
+       AND m.migration_run_id = {run_sql}
+       AND m.record_action = 'created'
+      WHERE owned_message.id = v.message_id
+  )"""
+
+    with contextlib.nullcontext(ShardWriterFileAdapter(shard_writer)) as sql_file:
         # Group by user_id
         for user_id, user_logs in logs_df.groupby('user_id'):
             users_processed += 1
@@ -2096,27 +3164,89 @@ END $$;
                 
                 # Aggregate conversation data
                 latest_row = chat_logs_sorted.iloc[-1]
-                title = clean_string(latest_row.get('title')) or f'Conversation {chat_id[:8]}'
+                raw_title = (
+                    clean_string(latest_row.get('title'))
+                    or f'Conversation {chat_id[:8]}'
+                )
+                if len(raw_title) > CONVERSATION_TITLE_MAX_LENGTH:
+                    truncated_titles += 1
+                title = raw_title[:CONVERSATION_TITLE_MAX_LENGTH]
                 message_count = len(chat_logs_sorted) * 2  # user + assistant per row
                 total_tokens = int(chat_logs_sorted['token_amount'].fillna(0).sum())
                 created_at = chat_logs_sorted['created_at'].min()
                 updated_at = chat_logs_sorted['created_at'].max()
+                legacy_chat_ids = sorted({
+                    str(value)
+                    for value in chat_logs_sorted["legacy_chat_id"]
+                    if str(value).strip()
+                })
+                if len(legacy_chat_ids) != 1:
+                    raise ValueError(
+                        f"Conversation {chat_id} contains multiple legacy chat IDs: "
+                        + ", ".join(legacy_chat_ids[:10])
+                    )
+                legacy_chat_id = legacy_chat_ids[0]
+                # A V4 chat can span several bots when the user switched agents
+                # mid-conversation. V5 links a conversation to exactly one
+                # agent, so the most recent bot in the chat wins and every bot
+                # the chat touched is preserved in metadata.
+                ordered_bot_ids = [
+                    cleaned
+                    for cleaned in (
+                        clean_string(value)
+                        for value in chat_logs_sorted.get(
+                            "bot_id", pd.Series(dtype=object)
+                        )
+                    )
+                    if cleaned
+                ]
+                bot_ids = sorted(set(ordered_bot_ids))
+                if len(bot_ids) > 1:
+                    multi_agent_conversations += 1
+                legacy_bot_id = ordered_bot_ids[-1] if ordered_bot_ids else None
+                planned_agent_id = (
+                    planned_agent_ids.get(legacy_bot_id)
+                    if legacy_bot_id
+                    else None
+                )
+                conversation_metadata = None
+                if legacy_bot_id:
+                    conversation_metadata = {
+                        "legacyBotId": legacy_bot_id,
+                        "legacyAgentLinkMissing": planned_agent_id is None,
+                    }
+                    if len(bot_ids) > 1:
+                        conversation_metadata["legacyBotIds"] = bot_ids
+                        conversation_metadata["legacyAgentResolution"] = (
+                            "last_agent_in_conversation"
+                        )
+                    if planned_agent_id:
+                        conversation_metadata["initiatedByAgentId"] = (
+                            planned_agent_id
+                        )
                 
                 conversations.append({
                     'chat_id': chat_id,
+                    'legacy_chat_id': legacy_chat_id,
                     'user_id': user_id,
                     'title': title,
                     'message_count': message_count,
                     'total_tokens': total_tokens,
                     'created_at': created_at,
                     'updated_at': updated_at,
+                    'legacy_bot_id': legacy_bot_id,
+                    'agent_id': planned_agent_id,
+                    'metadata': conversation_metadata,
                     'logs': chat_logs_sorted
                 })
             
             # Batch conversations if needed
             for batch_idx, conv_batch in enumerate([conversations[i:i+max_records_per_insert] 
                                                      for i in range(0, len(conversations), max_records_per_insert)]):
-                
+                sql_file.begin_unit(
+                    weight=len(conv_batch),
+                    owner_legacy_ids=[str(user_id)],
+                )
                 sql_file.write(f"\n-- User: {user_id} (Batch {batch_idx + 1}, {len(conv_batch)} conversations)\n\n")
                 
                 # Generate conversations INSERT
@@ -2130,19 +3260,57 @@ END $$;
                         f"{conv['message_count']}, {conv['total_tokens']}, "
                         f"true, NULL::timestamp, '{created_at_str}'::timestamptz, '{updated_at_str}'::timestamptz, "
                         f"'{updated_at_str}'::timestamptz, "
-                        f"{resolve_user_id_sql(str(user_id), user_id_overrides)})"
+                        f"{resolve_user_id_sql(str(user_id), user_id_overrides)}, "
+                        f"{escape_json_for_sql(conv['metadata']) if conv['metadata'] else 'NULL::jsonb'})"
                     )
                 
                 conv_values_joined = ',\n'.join(conv_values)
+                for conv in conv_batch:
+                    sql_file.write(
+                        _conversation_collision_sql(
+                            conv,
+                            namespace_uuid,
+                            user_id_overrides,
+                            conversation_collision_policy,
+                        )
+                    )
                 sql_file.write(f"""-- Conversations INSERT
-INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
+INSERT INTO conversations (id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id, metadata)
 SELECT * FROM (
   VALUES
 {conv_values_joined}
-) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id)
+) AS v(id, title, message_count, total_tokens, is_active, deleted_at, created_at, updated_at, last_interacted_at, user_id, metadata)
 WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = v.id);
 
 """)
+                # Track conversations in id_mappings for rollback
+                for conv in conv_batch:
+                    sql_file.write(
+                        f"INSERT INTO migration.id_mappings "
+                        f"(table_name, old_id, new_id, migration_batch, migration_run_id, record_action, notes) "
+                        f"VALUES ('conversations', {escape_sql_string(conv['legacy_chat_id'])}, '{conv['chat_id']}'::uuid, "
+                        f"'{migration_run_id or 'conversations_batch'}', {_migration_run_sql(migration_run_id)}, "
+                        f"'created', 'Migrated conversation') "
+                        f"ON CONFLICT (table_name, old_id) DO NOTHING;\n"
+                    )
+                    if migration_run_id:
+                        sql_file.write(
+                            "INSERT INTO migration.migration_step_entities "
+                            "(migration_run_id, step_key, table_name, old_id, new_id, record_action) "
+                            f"SELECT '{migration_run_id}'::uuid, '05_conversations', "
+                            f"'conversations', {escape_sql_string(conv['legacy_chat_id'])}, "
+                            f"'{conv['chat_id']}'::uuid, "
+                            f"CASE WHEN m.migration_run_id = '{migration_run_id}'::uuid "
+                            "THEN m.record_action ELSE 'reused' END "
+                            "FROM migration.id_mappings m "
+                            "WHERE m.table_name = 'conversations' "
+                            f"AND m.old_id = {escape_sql_string(conv['legacy_chat_id'])} "
+                            f"AND m.new_id = '{conv['chat_id']}'::uuid "
+                            "ON CONFLICT (migration_run_id, step_key, table_name, old_id) "
+                            "DO UPDATE SET new_id = EXCLUDED.new_id, "
+                            "record_action = EXCLUDED.record_action, recorded_at = now();\n"
+                        )
+                sql_file.write("\n")
                 conversations_processed += len(conv_batch)
                 
                 # Generate messages and content blocks INSERT
@@ -2279,7 +3447,7 @@ SELECT * FROM (
   VALUES
 {msg_values_joined}
 ) AS v(id, conversation_id, parent_message_id, role, has_tool_calls, iteration_count, content_block_count, finish_reason, created_at, updated_at, deleted_at, user_id, metadata)
-WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id);
+WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = v.id){message_owner_scope_sql};
 
 """)
                 
@@ -2292,27 +3460,38 @@ SELECT * FROM (
   VALUES
 {block_values_joined}
 ) AS v(id, message_id, sequence, type, content, execution_time_ms, created_at)
-WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id);
+WHERE NOT EXISTS (SELECT 1 FROM message_content_blocks WHERE id = v.id){block_owner_scope_sql};
 
 """)
-        
-        # Write footer
-        sql_file.write(f"""\n-- ============================================================
+                sql_file.end_unit()
+
+    footer = f"""\n-- ============================================================
 -- MIGRATION SUMMARY
 -- ============================================================
 -- Users processed: {users_processed}
 -- Conversations processed: {conversations_processed}
 -- Messages processed: {messages_processed}
 -- Content blocks processed: {blocks_processed}
+-- Rows skipped for null/blank chat_id: {skipped_missing_chat_id}
+-- Non-UUID conversation IDs deterministically remapped: {remapped_non_uuid_chat_ids}
+-- Multi-agent conversations linked to their last agent: {multi_agent_conversations}
 -- ============================================================
-""")
-    
+"""
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'users_processed': users_processed,
         'conversations_processed': conversations_processed,
         'messages_processed': messages_processed,
-        'blocks_processed': blocks_processed
+        'blocks_processed': blocks_processed,
+        'skipped_invalid_chat_id': skipped_missing_chat_id,
+        'remapped_non_uuid_chat_ids': remapped_non_uuid_chat_ids,
+        'truncated_titles': truncated_titles,
+        'multi_agent_conversations': multi_agent_conversations,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -2337,11 +3516,20 @@ def _safe_get(d: Optional[dict], key: str, default=None):
     return d.get(key, default)
 
 
+def _is_prompt_active(prompt_data: Optional[dict]) -> bool:
+    """Return True if a V4 JSONB prompt column has ``is_selected`` set to True."""
+    if prompt_data is None:
+        return False
+    return str(prompt_data.get("is_selected", False)).lower() == "true"
+
+
 def generate_agent_insert(
     row: pd.Series,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     user_id_overrides: Optional[Dict[str, str]] = None,
-    merged_instructions: Optional[Dict[str, str]] = None
+    merged_instructions: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
+    agent_collision_policy: str = "adopt_exact",
 ) -> Optional[str]:
     """
     Generate INSERT statements for a single agent (agents + agent_settings + knowledge_bases).
@@ -2351,8 +3539,8 @@ def generate_agent_insert(
     Args:
         row: Pandas Series with playground_bot_generator_config data
         namespace_uuid: Fixed namespace UUID for deterministic IDs
-        merged_instructions: Optional dict {bot_id: merged_instruction_text} from the
-                             prompt merger service; when present, overrides the legacy
+        merged_instructions: Optional dict {bot_id: merged_instruction_text} with
+                             concatenated prompt parts; when present, overrides the legacy
                              character_prompts.content value for the agent's instructions.
         
     Returns:
@@ -2363,14 +3551,7 @@ def generate_agent_insert(
 
     # folder_id is int4 in V4 — pandas may load it as float (e.g. 1393.0).
     # Must normalise to plain integer string so migration.id_mappings lookup matches.
-    _folder_id_raw = row.get('folder_id')
-    if _folder_id_raw is not None and not (isinstance(_folder_id_raw, float) and pd.isna(_folder_id_raw)):
-        try:
-            folder_id = str(int(float(_folder_id_raw)))
-        except (ValueError, TypeError):
-            folder_id = clean_string(_folder_id_raw)
-    else:
-        folder_id = None
+    folder_id = _normalize_legacy_folder_id(row.get('folder_id'))
     
     if not bot_id:
         return None
@@ -2418,20 +3599,28 @@ def generate_agent_insert(
     elif toolkit_settings and _safe_get(toolkit_settings, 'is_active') is not None:
         is_active = _safe_get(toolkit_settings, 'is_active') == 'Yes'
     
-    # Model (fallback chain)
+    # Model — pick from the first *active* prompt (is_selected=True),
+    # falling back to any prompt that has a model value.
     model = None
-    for prompt_data in [character_prompts, hack_prompt, analysis_prompt, relevant_answer_prompt]:
+    active_prompts = [p for p in [character_prompts, hack_prompt, analysis_prompt, relevant_answer_prompt]
+                      if _is_prompt_active(p)]
+    all_prompts = active_prompts or [character_prompts, hack_prompt, analysis_prompt, relevant_answer_prompt]
+    for prompt_data in all_prompts:
         m = clean_string(_safe_get(prompt_data, 'model'))
         if m:
             model = m[:128]
             break
     
-    # Instructions — prefer merged prompt from LLM if available
+    # Instructions — prefer merged (concatenated active prompts) if available.
+    # The merged dict already filters by is_selected.  The fallback only uses
+    # character_prompts when it is actually active.
     _merged = merged_instructions.get(bot_id) if merged_instructions else None
     if _merged:
         instructions = _merged
-    else:
+    elif _is_prompt_active(character_prompts):
         instructions = clean_string(_safe_get(character_prompts, 'content'))
+    else:
+        instructions = None
     
     # Enabled tools — toolkit_settings.data contains capability flags.
     # Known keys: chat, canvas, code, graph (all boolean).
@@ -2561,23 +3750,16 @@ def generate_agent_insert(
         if isinstance(folders_chosen_raw, list):
             # chosen_docs_folders is int4[] — normalise each element to plain integer string
             for f in folders_chosen_raw:
-                if f is not None:
-                    try:
-                        folders_chosen.append(str(int(float(f))))
-                    except (ValueError, TypeError):
-                        v = str(f).strip()
-                        if v:
-                            folders_chosen.append(v)
+                normalized = _normalize_legacy_folder_id(f)
+                if normalized:
+                    folders_chosen.append(normalized)
         elif isinstance(folders_chosen_raw, str):
             cleaned = folders_chosen_raw.strip('{}')
             if cleaned:
                 for f in cleaned.split(','):
-                    f = f.strip()
-                    if f:
-                        try:
-                            folders_chosen.append(str(int(float(f))))
-                        except (ValueError, TypeError):
-                            folders_chosen.append(f)
+                    normalized = _normalize_legacy_folder_id(f)
+                    if normalized:
+                        folders_chosen.append(normalized)
     
     # Build knowledge_bases + knowledge_base_assignments + knowledge_base_items SQL.
     # V5 moved from agent_documents to a knowledge-base architecture:
@@ -2592,6 +3774,17 @@ def generate_agent_insert(
         re_rank_score_kb = str(re_rank_score) if re_rank_score is not None else 'NULL'
 
         kb_inserts += f"""
+    IF EXISTS (SELECT 1 FROM knowledge_bases WHERE id = v_kb_id)
+       AND NOT EXISTS (
+           SELECT 1 FROM migration.id_mappings
+           WHERE table_name = 'knowledge_bases'
+             AND old_id = {escape_sql_string(bot_id)}
+             AND new_id = v_kb_id
+       ) THEN
+        RAISE EXCEPTION 'Knowledge-base UUID collision for legacy bot %',
+            {escape_sql_string(bot_id)};
+    END IF;
+
     -- Create knowledge base for this agent
     INSERT INTO knowledge_bases (
         id, name, description, similarity_top_k, re_rank_score,
@@ -2615,6 +3808,25 @@ def generate_agent_insert(
         SELECT 1 FROM knowledge_bases WHERE id = v_kb_id
     );
 
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_bases', {escape_sql_string(bot_id)}, v_kb_id,
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+
+    IF EXISTS (
+        SELECT 1 FROM knowledge_base_assignments
+        WHERE assigned_to_id = v_agent_id AND assigned_to_type = 'agent'
+          AND id <> v_kb_assignment_id
+    ) THEN
+        RAISE EXCEPTION 'Agent % already has an unrelated knowledge-base assignment',
+            v_agent_id;
+    END IF;
+
     -- Assign knowledge base to agent
     INSERT INTO knowledge_base_assignments (
         id, knowledge_base_id, assigned_to_id, assigned_to_type, is_active, created_at
@@ -2628,13 +3840,38 @@ def generate_agent_insert(
         now()
     WHERE NOT EXISTS (
         SELECT 1 FROM knowledge_base_assignments
-        WHERE assigned_to_id = v_agent_id AND assigned_to_type = 'agent'
+        WHERE id = v_kb_assignment_id
     );
+
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_base_assignments', {escape_sql_string(bot_id)}, v_kb_assignment_id,
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
 """
 
         for doc_id in docs_chosen:
+            item_old_id = f"{bot_id}-document-{doc_id}"
             kb_inserts += f"""
     -- KB item (document): {doc_id}
+    IF EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}'
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM migration.id_mappings
+        WHERE table_name = 'knowledge_base_items'
+          AND old_id = {escape_sql_string(item_old_id)}
+    ) THEN
+        RAISE EXCEPTION 'Knowledge-base item UUID collision for %',
+            {escape_sql_string(item_old_id)};
+    END IF;
+
     INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
     SELECT
         migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}'),
@@ -2647,11 +3884,40 @@ def generate_agent_insert(
         SELECT 1 FROM knowledge_base_items
         WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}')
     );
+
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_base_items',
+        {escape_sql_string(item_old_id)},
+        migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-{doc_id}'
+        ),
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
 """
 
         for fid in folders_chosen:
+            item_old_id = f"{bot_id}-folder-{fid}"
             kb_inserts += f"""
     -- KB item (folder): {fid}
+    IF EXISTS (
+        SELECT 1 FROM knowledge_base_items
+        WHERE id = migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}'
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM migration.id_mappings
+        WHERE table_name = 'knowledge_base_items'
+          AND old_id = {escape_sql_string(item_old_id)}
+    ) THEN
+        RAISE EXCEPTION 'Knowledge-base item UUID collision for %',
+            {escape_sql_string(item_old_id)};
+    END IF;
+
     INSERT INTO knowledge_base_items (id, knowledge_base_id, item_id, item_type, is_active, created_at)
     SELECT
         migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}'),
@@ -2664,6 +3930,31 @@ def generate_agent_insert(
         SELECT 1 FROM knowledge_base_items
         WHERE id = migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}')
     );
+
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action
+    ) VALUES (
+        'knowledge_base_items',
+        {escape_sql_string(item_old_id)},
+        migration.deterministic_uuid_v4(
+            '{namespace_uuid}'::uuid, '{bot_id}-kb-item-folder-{fid}'
+        ),
+        {escape_sql_string(migration_run_id or "agents_migration")},
+        {_migration_run_sql(migration_run_id)}, 'created'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+
+        kb_inserts += """
+    UPDATE knowledge_bases
+    SET total_document_count = (
+        SELECT COUNT(*)
+        FROM knowledge_base_items
+        WHERE knowledge_base_id = v_kb_id AND is_active
+    ),
+        updated_at = now()
+    WHERE id = v_kb_id;
 """
     
     # Build the DO block — include KB variables only when there are docs/folders
@@ -2672,6 +3963,164 @@ def generate_agent_insert(
         kb_declare = f"""
     v_kb_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb');
     v_kb_assignment_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-kb-assignment');"""
+    agent_tracking_sql = _record_primary_step_entity_sql(
+        migration_run_id,
+        "06_agents",
+        "agents",
+        escape_sql_string(bot_id),
+        "v_agent_id",
+    )
+    if agent_collision_policy not in {"adopt_exact", "block"}:
+        raise ValueError(
+            "agent_collision_policy must be 'adopt_exact' or 'block'"
+        )
+    if agent_collision_policy == "block":
+        unmapped_agent_sql = f"""
+        RAISE EXCEPTION
+            'Agent UUID collision for legacy bot % (target id % is not mapped from it)',
+            {escape_sql_string(bot_id)}, v_agent_id;
+"""
+    else:
+        expected_item_expressions = [
+            *[
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{bot_id}-kb-item-{doc_id}')})"
+                for doc_id in docs_chosen
+            ],
+            *[
+                "migration.deterministic_uuid_v4("
+                f"'{namespace_uuid}'::uuid, "
+                f"{escape_sql_string(f'{bot_id}-kb-item-folder-{fid}')})"
+                for fid in folders_chosen
+            ],
+        ]
+        expected_items_sql = _uuid_array_sql(expected_item_expressions)
+        helper_mapping_sql = ""
+        helper_exact_sql = f"""
+        IF EXISTS (
+            SELECT 1 FROM knowledge_base_assignments
+            WHERE assigned_to_id = v_agent_id
+        ) THEN
+            RAISE EXCEPTION
+                'Agent exact adoption helper mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
+"""
+        if has_docs_or_folders:
+            helper_exact_sql = f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM knowledge_bases WHERE id = v_kb_id
+        ) OR NOT EXISTS (
+            SELECT 1
+            FROM knowledge_base_assignments
+            WHERE id = v_kb_assignment_id
+              AND knowledge_base_id = v_kb_id
+              AND assigned_to_id = v_agent_id
+              AND assigned_to_type::text = 'agent'
+        ) OR (
+            SELECT COUNT(*)
+            FROM knowledge_base_assignments
+            WHERE assigned_to_id = v_agent_id
+        ) <> 1 OR (
+            SELECT COUNT(*)
+            FROM knowledge_base_items
+            WHERE knowledge_base_id = v_kb_id
+        ) <> cardinality({expected_items_sql}) OR (
+            SELECT COUNT(*)
+            FROM unnest({expected_items_sql}) expected(id)
+            WHERE EXISTS (
+                SELECT 1 FROM knowledge_base_items item
+                WHERE item.id = expected.id
+                  AND item.knowledge_base_id = v_kb_id
+            )
+        ) <> cardinality({expected_items_sql}) THEN
+            RAISE EXCEPTION
+                'Agent exact adoption helper mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
+"""
+            helper_mapping_sql = f"""
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES
+            ('knowledge_bases', {escape_sql_string(bot_id)}, v_kb_id,
+             'legacy_adoption', NULL, 'reused', 'Adopted exact agent helper'),
+            ('knowledge_base_assignments', {escape_sql_string(bot_id)},
+             v_kb_assignment_id, 'legacy_adoption', NULL, 'reused',
+             'Adopted exact agent helper')
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+            for doc_id in docs_chosen:
+                helper_mapping_sql += f"""
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'knowledge_base_items',
+            {escape_sql_string(f'{bot_id}-document-{doc_id}')},
+            migration.deterministic_uuid_v4(
+                '{namespace_uuid}'::uuid,
+                {escape_sql_string(f'{bot_id}-kb-item-{doc_id}')}
+            ),
+            'legacy_adoption', NULL, 'reused', 'Adopted exact agent helper'
+        )
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+            for fid in folders_chosen:
+                helper_mapping_sql += f"""
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'knowledge_base_items',
+            {escape_sql_string(f'{bot_id}-folder-{fid}')},
+            migration.deterministic_uuid_v4(
+                '{namespace_uuid}'::uuid,
+                {escape_sql_string(f'{bot_id}-kb-item-folder-{fid}')}
+            ),
+            'legacy_adoption', NULL, 'reused', 'Adopted exact agent helper'
+        )
+        ON CONFLICT (table_name, old_id) DO NOTHING;
+"""
+        unmapped_agent_sql = f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM agents
+            WHERE id = v_agent_id AND user_id = v_user_id
+        ) OR NOT EXISTS (
+            SELECT 1 FROM agent_settings
+            WHERE id = v_settings_id AND agent_id = v_agent_id
+        ) OR (
+            SELECT COUNT(*) FROM agent_settings
+            WHERE agent_id = v_agent_id
+        ) <> 1 THEN
+            RAISE EXCEPTION
+                'Agent exact adoption owner or settings mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
+{helper_exact_sql}
+        INSERT INTO migration.id_mappings (
+            table_name, old_id, new_id, migration_batch,
+            migration_run_id, record_action, notes
+        ) VALUES (
+            'agents', {escape_sql_string(bot_id)}, v_agent_id,
+            'legacy_adoption', NULL, 'reused',
+            'Adopted exact previously migrated agent'
+        );
+{helper_mapping_sql}
+{agent_tracking_sql}
+        INSERT INTO legacy_bot_to_agent_mapping (
+            old_bot_id, new_agent_id, agent_type, bot_name
+        ) VALUES (
+            {escape_sql_string(bot_id)}, v_agent_id, '{agent_type}',
+            {escape_sql_string(bot_name[:255])}
+        )
+        ON CONFLICT (old_bot_id) DO NOTHING;
+        RAISE NOTICE 'Adopted exact previously migrated agent %',
+            {escape_sql_string(bot_id)};
+        RETURN;
+"""
 
     sql = f"""
 -- Agent: {bot_name[:60]} (bot_id: {bot_id})
@@ -2681,6 +4130,40 @@ DECLARE
     v_settings_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, '{bot_id}-settings');
     v_user_id uuid := {resolve_user_id_sql(str(user_id), user_id_overrides)};{kb_declare}
 BEGIN
+    -- A valid canonical agent from an older run is append-only. Record reuse
+    -- for this run, but do not mutate the older agent or its helper rows.
+    IF migration.is_migrated('agents', {escape_sql_string(bot_id)}) THEN
+        v_agent_id := migration.get_new_id('agents', {escape_sql_string(bot_id)});
+        IF NOT EXISTS (
+            SELECT 1 FROM agents
+            WHERE id = v_agent_id AND user_id = v_user_id
+        ) THEN
+            RAISE EXCEPTION
+                'Canonical agent owner mismatch for legacy bot %',
+                {escape_sql_string(bot_id)};
+        END IF;
+{agent_tracking_sql}
+        RAISE NOTICE 'Agent % already migrated', {escape_sql_string(bot_id)};
+        RETURN;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id) THEN
+{unmapped_agent_sql}
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM agent_settings
+        WHERE (id = v_settings_id AND agent_id <> v_agent_id)
+           OR (agent_id = v_agent_id AND id <> v_settings_id)
+    ) OR EXISTS (
+        SELECT 1 FROM knowledge_base_assignments
+        WHERE assigned_to_id = v_agent_id
+    ) THEN
+        RAISE EXCEPTION
+            'Agent helper UUID collision for legacy bot %',
+            {escape_sql_string(bot_id)};
+    END IF;
+
     -- Insert agent if not exists
     IF NOT EXISTS (SELECT 1 FROM agents WHERE id = v_agent_id) THEN
         INSERT INTO agents (
@@ -2736,10 +4219,15 @@ BEGIN
     END IF;
 {kb_inserts}
     -- Track in migration.id_mappings
-    INSERT INTO migration.id_mappings (table_name, old_id, new_id, migration_batch, notes)
-    VALUES ('agents', '{bot_id}', v_agent_id, 'agents_migration',
+    INSERT INTO migration.id_mappings (
+        table_name, old_id, new_id, migration_batch,
+        migration_run_id, record_action, notes
+    )
+    VALUES ('agents', '{bot_id}', v_agent_id, '{migration_run_id or "agents_migration"}',
+            {_migration_run_sql(migration_run_id)}, 'created',
             'Type: {agent_type}. KB items: {len(docs_chosen) + len(folders_chosen)}')
     ON CONFLICT (table_name, old_id) DO NOTHING;
+{agent_tracking_sql}
     
     -- Track in legacy mapping table
     INSERT INTO legacy_bot_to_agent_mapping (old_bot_id, new_agent_id, agent_type, bot_name)
@@ -2758,7 +4246,9 @@ def generate_agents_migration_sql(
     source_info: str,
     namespace_uuid: str = '0b1e4c6a-1f4a-4b6e-8c3d-2a5f7e9d0c1b',
     user_id_overrides: Optional[Dict[str, str]] = None,
-    merged_instructions: Optional[Dict[str, str]] = None
+    merged_instructions: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
+    agent_collision_policy: str = "adopt_exact",
 ) -> Dict[str, Any]:
     """
     Generate SQL migration file for agents from playground_bot_generator_config.
@@ -2796,10 +4286,8 @@ def generate_agents_migration_sql(
     
     agents_processed = 0
     skipped_count = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        # Write header
-        header = f"""-- ============================================================
+
+    header = f"""-- ============================================================
 -- AGENTS MIGRATION SQL (from playground_bot_generator_config)
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
@@ -2829,14 +4317,7 @@ SET client_encoding = 'UTF8';
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 """
-        sql_file.write(header)
-        
-        # Include migration schema setup (idempotent)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
-        
-        # Create legacy mapping table
-        sql_file.write("""-- ============================================================
+    mapping_table_setup = """-- ============================================================
 -- CREATE MAPPING TABLE FOR TRACKING
 -- ============================================================
 CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
@@ -2847,32 +4328,54 @@ CREATE TABLE IF NOT EXISTS legacy_bot_to_agent_mapping (
     migrated_at TIMESTAMP DEFAULT now()
 );
 
-""")
-        
-        # Generate per-agent INSERT blocks
-        for _, row in agents_df.iterrows():
-            sql = generate_agent_insert(row, namespace_uuid, user_id_overrides, merged_instructions)
-            if sql:
-                sql_file.write(sql)
-                sql_file.write('\n')
-                agents_processed += 1
-            else:
-                skipped_count += 1
-        
-        # Write summary footer
-        sql_file.write(f"""\n-- ============================================================
+"""
+    preamble = header + generate_migration_schema_setup() + '\n' + mapping_table_setup
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='06_agents',
+        target_database='completion_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['06_agents'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['06_agents'],
+    )
+
+    for _, row in agents_df.iterrows():
+        sql = generate_agent_insert(
+            row,
+            namespace_uuid,
+            user_id_overrides,
+            merged_instructions,
+            migration_run_id,
+            agent_collision_policy,
+        )
+        if sql:
+            owner_id = clean_string(row.get('user_id'))
+            shard_writer.write_unit(
+                sql,
+                owner_legacy_ids=[owner_id] if owner_id else None,
+            )
+            agents_processed += 1
+        else:
+            skipped_count += 1
+
+    footer = f"""\n-- ============================================================
 -- MIGRATION SUMMARY
 -- ============================================================
 -- Agents processed: {agents_processed}
 -- Skipped (no bot_id): {skipped_count}
 -- ============================================================
-""")
-    
+"""
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
+
     return {
         'file': output_file,
         'agents_processed': agents_processed,
         'settings_processed': agents_processed,
-        'kb_items_linked': 0  # Tracked per-agent at runtime via RAISE NOTICE
+        'kb_items_linked': 0,  # Tracked per-agent at runtime via RAISE NOTICE
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }
 
 
@@ -2942,6 +4445,7 @@ def generate_conversions_migration_sql(
     namespace_uuid: str = CONVERSIONS_NAMESPACE_UUID,
     max_records_per_insert: int = 100,
     user_id_overrides: Optional[Dict[str, str]] = None,
+    migration_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate SQL migration for jeen_dev_translate -> conversions table.
@@ -2971,8 +4475,7 @@ def generate_conversions_migration_sql(
     rows_processed = 0
     rows_skipped = 0
 
-    with open(output_file, 'w', encoding='utf-8') as sql_file:
-        header = f"""-- ============================================================
+    header = f"""-- ============================================================
 -- CONVERSIONS & AGENT_CONVERSIONS MIGRATION SQL
 -- ============================================================
 -- Generated: {datetime.now().isoformat()}
@@ -2997,81 +4500,131 @@ SET client_encoding = 'UTF8';
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 """
-        sql_file.write(header)
-        sql_file.write(generate_migration_schema_setup())
-        sql_file.write('\n')
+    preamble = header + generate_migration_schema_setup() + '\n'
+    shard_writer = ShardWriter(
+        output_file=output_file,
+        step_key='07_conversions',
+        target_database='completion_db',
+        migration_run_id=migration_run_id,
+        preamble=preamble,
+        max_rows_per_shard=SHARD_MAX_ROWS['07_conversions'],
+        max_bytes_per_shard=SHARD_MAX_BYTES['07_conversions'],
+    )
 
-        for _, row in translate_df.iterrows():
-            source_id = row.get('id')
-            bot_id = row.get('bot_id')
-            user_id = row.get('user_id')
-            src = row.get('src')
-            translated = row.get('translated')
-            conv_type = row.get('type')
-            last_updated = row.get('last_updated')
+    for _, row in translate_df.iterrows():
+        source_id = row.get('id')
+        bot_id = row.get('bot_id')
+        user_id = row.get('user_id')
+        src = row.get('src')
+        translated = row.get('translated')
+        conv_type = row.get('type')
+        last_updated = row.get('last_updated')
 
-            if not bot_id or _is_scalar_na(bot_id):
-                rows_skipped += 1
-                continue
+        if not bot_id or _is_scalar_na(bot_id):
+            rows_skipped += 1
+            continue
 
-            if not user_id or _is_scalar_na(user_id):
-                rows_skipped += 1
-                continue
+        if not user_id or _is_scalar_na(user_id):
+            rows_skipped += 1
+            continue
 
-            conv_type_str = str(conv_type).strip() if conv_type and not _is_scalar_na(conv_type) else 'input'
-            if conv_type_str not in VALID_CONVERSION_TYPES:
-                conv_type_str = 'input'
+        conv_type_str = str(conv_type).strip() if conv_type and not _is_scalar_na(conv_type) else 'input'
+        if conv_type_str not in VALID_CONVERSION_TYPES:
+            conv_type_str = 'input'
 
-            original_text = (str(src).strip()[:1024]) if src and not _is_scalar_na(src) else ''
-            converted_text = (str(translated).strip()[:1024]) if translated and not _is_scalar_na(translated) else ''
+        original_text = (str(src).strip()[:1024]) if src and not _is_scalar_na(src) else ''
+        converted_text = (str(translated).strip()[:1024]) if translated and not _is_scalar_na(translated) else ''
 
-            parsed_date = parse_hebrew_date(str(last_updated) if last_updated and not _is_scalar_na(last_updated) else None)
-            updated_at_sql = f"'{parsed_date}'::timestamptz" if parsed_date else "NOW()"
+        parsed_date = parse_hebrew_date(str(last_updated) if last_updated and not _is_scalar_na(last_updated) else None)
+        updated_at_sql = f"'{parsed_date}'::timestamptz" if parsed_date else "NOW()"
 
-            conv_id_input = f"conv-{source_id}-{bot_id}"
-            user_id_sql = resolve_user_id_sql(str(user_id), user_id_overrides)
+        conv_id_input = f"conv-{source_id}-{bot_id}"
+        user_id_sql = resolve_user_id_sql(str(user_id), user_id_overrides)
+        conversion_tracking_sql = _record_primary_step_entity_sql(
+            migration_run_id,
+            "07_conversions",
+            "conversions",
+            escape_sql_string(conv_id_input),
+            "v_conversion_id",
+        )
 
-            is_active_val = 'true'
-            raw_active = row.get('is_active')
-            if raw_active is not None and not _is_scalar_na(raw_active):
-                is_active_val = 'true' if str(raw_active).lower() == 'true' else 'false'
+        is_active_val = 'true'
+        raw_active = row.get('is_active')
+        if raw_active is not None and not _is_scalar_na(raw_active):
+            is_active_val = 'true' if str(raw_active).lower() == 'true' else 'false'
 
-            sql_file.write(f"""
+        shard_writer.write_unit(f"""
 DO $$
 DECLARE
     v_conversion_id uuid := migration.deterministic_uuid_v4('{namespace_uuid}'::uuid, {escape_sql_string(conv_id_input)});
     v_user_id uuid := {user_id_sql};
     v_agent_id uuid := migration.deterministic_uuid_v4('{NAMESPACE_UUID}'::uuid, '{bot_id}-agent');
 BEGIN
+    IF migration.is_migrated(
+        'conversions', {escape_sql_string(conv_id_input)}
+    ) THEN
+        v_conversion_id := migration.get_new_id(
+            'conversions', {escape_sql_string(conv_id_input)}
+        );
+{conversion_tracking_sql}
+        RAISE NOTICE 'Conversion % already migrated', v_conversion_id;
+        RETURN;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id)
+       AND NOT EXISTS (
+       SELECT 1 FROM migration.id_mappings
+       WHERE table_name = 'conversions'
+         AND old_id = {escape_sql_string(conv_id_input)}
+         AND new_id = v_conversion_id
+       ) THEN
+    RAISE EXCEPTION
+        'Conversion UUID collision for legacy conversion %',
+        {escape_sql_string(conv_id_input)};
+    END IF;
+
     -- 1. Insert conversion entity
     IF NOT EXISTS (SELECT 1 FROM conversions WHERE id = v_conversion_id) THEN
-        INSERT INTO conversions (
-            id, user_id, conversion_type, original_text, converted_text,
-            deleted_at, created_at, updated_at
-        ) VALUES (
-            v_conversion_id,
-            v_user_id,
-            '{conv_type_str}'::conversions_conversion_type_enum,
-            {escape_sql_string(original_text)},
-            {escape_sql_string(converted_text)},
-            NULL,
-            {updated_at_sql},
-            {updated_at_sql}
-        );
-        RAISE NOTICE 'Conversion % inserted (bot_id=%)', v_conversion_id, {escape_sql_string(str(bot_id))};
+    INSERT INTO conversions (
+        id, user_id, conversion_type, original_text, converted_text,
+        deleted_at, created_at, updated_at
+    ) VALUES (
+        v_conversion_id,
+        v_user_id,
+        '{conv_type_str}'::conversions_conversion_type_enum,
+        {escape_sql_string(original_text)},
+        {escape_sql_string(converted_text)},
+        NULL,
+        {updated_at_sql},
+        {updated_at_sql}
+    );
+    RAISE NOTICE 'Conversion % inserted (bot_id=%)', v_conversion_id, {escape_sql_string(str(bot_id))};
     END IF;
 
     -- 2. Link conversion to agent
     IF NOT EXISTS (SELECT 1 FROM agent_conversions WHERE agent_id = v_agent_id AND conversion_id = v_conversion_id) THEN
-        INSERT INTO agent_conversions (agent_id, conversion_id, created_at, is_active)
-        VALUES (v_agent_id, v_conversion_id, {updated_at_sql}, {is_active_val});
-        RAISE NOTICE 'agent_conversions link: agent=% conversion=%', v_agent_id, v_conversion_id;
+    INSERT INTO agent_conversions (agent_id, conversion_id, created_at, is_active)
+    VALUES (v_agent_id, v_conversion_id, {updated_at_sql}, {is_active_val});
+    RAISE NOTICE 'agent_conversions link: agent=% conversion=%', v_agent_id, v_conversion_id;
     END IF;
-END $$;
-""")
-            rows_processed += 1
 
-        sql_file.write(f"""
+    -- 3. Track in id_mappings for rollback
+    INSERT INTO migration.id_mappings (
+    table_name, old_id, new_id, migration_batch,
+    migration_run_id, record_action, notes
+    )
+    VALUES (
+    'conversions', {escape_sql_string(conv_id_input)}, v_conversion_id,
+    '{migration_run_id or "conversions_batch"}',
+    {_migration_run_sql(migration_run_id)}, 'created', 'Migrated conversion'
+    )
+    ON CONFLICT (table_name, old_id) DO NOTHING;
+{conversion_tracking_sql}
+END $$;
+""", owner_legacy_ids=[str(user_id)])
+        rows_processed += 1
+
+    footer = f"""
 -- ============================================================
 -- MIGRATION SUMMARY
 -- ============================================================
@@ -3079,10 +4632,14 @@ END $$;
 -- Agent_conversions links created: {rows_processed}
 -- Skipped (no bot_id/user_id): {rows_skipped}
 -- ============================================================
-""")
+"""
+    manifest = shard_writer.finalize(epilogue=footer)
+    manifest.save(manifest_path_for(output_file))
 
     return {
         'file': output_file,
         'conversions_processed': rows_processed,
         'conversions_skipped': rows_skipped,
+        'shards': [s.file_path for s in manifest.shards],
+        'manifest': manifest.to_dict(),
     }

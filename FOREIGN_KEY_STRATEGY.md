@@ -10,7 +10,7 @@ This document explains the FK (Foreign Key) constraint strategy for the V4→V5 
 jeen-dev-db-migration-test:5432
 ├── user_db      (users, users_groups)
 ├── document_db  (folders, documents, chunks)
-└── completion_db (agents, agent_settings, agent_documents)
+└── completion_db (agents, agent_settings, knowledge_bases, knowledge_base_assignments, knowledge_base_items)
 ```
 
 ### PostgreSQL Limitation
@@ -70,11 +70,17 @@ ADD CONSTRAINT fk_agent_settings_agent
 FOREIGN KEY (agent_id) 
 REFERENCES public.agents(id);
 
--- ✅ FK from agent_documents to agents (same database)
-ALTER TABLE public.agent_documents
-ADD CONSTRAINT fk_agent_documents_agent 
-FOREIGN KEY (agent_id) 
-REFERENCES public.agents(id);
+-- ✅ FK from knowledge_base_assignments to knowledge_bases (same database)
+ALTER TABLE public.knowledge_base_assignments
+ADD CONSTRAINT fk_kb_assignments_kb
+FOREIGN KEY (knowledge_base_id)
+REFERENCES public.knowledge_bases(id);
+
+-- ✅ FK from knowledge_base_items to knowledge_bases (same database)
+ALTER TABLE public.knowledge_base_items
+ADD CONSTRAINT fk_kb_items_kb
+FOREIGN KEY (knowledge_base_id)
+REFERENCES public.knowledge_bases(id);
 ```
 
 ### 2. Cross-Database References ❌
@@ -180,11 +186,13 @@ Created 3 schema files with FK constraints where possible:
 
 ### `schemas/target_completion_db_schema.sql`
 - ✅ FK: `agent_settings.agent_id → agents.id`
-- ✅ FK: `agent_documents.agent_id → agents.id`
+- ✅ FK: `knowledge_base_assignments.knowledge_base_id → knowledge_bases.id`
+- ✅ FK: `knowledge_base_items.knowledge_base_id → knowledge_bases.id`
 - ❌ NO FK: `agents.user_id → user_db.users.id` (cross-database)
 - ❌ NO FK: `agents.folder_id → document_db.folders.id` (cross-database)
-- ❌ NO FK: `agent_documents.document_id → document_db.documents.id` (cross-database)
-- Creates: agents, agent_settings, agent_documents
+- ❌ NO FK: `knowledge_base_assignments.assigned_to_id → agents.id` (polymorphic assignment target)
+- ❌ NO FK: `knowledge_base_items.item_id → document_db.documents.id / folders.id` (cross-database)
+- Creates: agents, agent_settings, knowledge_bases, knowledge_base_assignments, knowledge_base_items
 
 ## FK Constraints Summary
 
@@ -199,13 +207,14 @@ Created 3 schema files with FK constraints where possible:
 | agents | user_id | users | id | ❌ NO FK (cross-DB) | → user_db |
 | agents | folder_id | folders | id | ❌ NO FK (cross-DB) | → document_db |
 | agent_settings | agent_id | agents | id | ✅ FK enforced | completion_db |
-| agent_settings | user_id | users | id | ❌ NO FK (cross-DB) | → user_db |
-| agent_documents | agent_id | agents | id | ✅ FK enforced | completion_db |
-| agent_documents | document_id | documents | id | ❌ NO FK (cross-DB) | → document_db |
+| knowledge_base_assignments | knowledge_base_id | knowledge_bases | id | ✅ FK enforced | completion_db |
+| knowledge_base_assignments | assigned_to_id | agents | id | ❌ NO FK (polymorphic target) | completion_db |
+| knowledge_base_items | knowledge_base_id | knowledge_bases | id | ✅ FK enforced | completion_db |
+| knowledge_base_items | item_id | documents/folders | id | ❌ NO FK (cross-DB) | → document_db |
 
 **Summary**: 
 - ✅ **7 FKs enforced** (within-database)
-- ❌ **7 FKs not possible** (cross-database)
+- ❌ **6 FKs not possible** (cross-database or polymorphic)
 
 ## Setup Instructions
 
@@ -331,7 +340,7 @@ If cross-database FKs are critical, consider using **schemas in one database**:
 single_database
 ├── user_db schema      (users, users_groups)
 ├── document_db schema  (folders, documents, chunks)
-└── completion_db schema (agents, agent_settings, agent_documents)
+└── completion_db schema (agents, agent_settings, knowledge_bases, knowledge_base_assignments, knowledge_base_items)
 ```
 
 Then change `.env`:

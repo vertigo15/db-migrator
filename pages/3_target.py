@@ -27,12 +27,10 @@ TRANSFORM_DIR = os.path.join(BASE_DIR, "output", "transform")
 
 
 def init_session_state():
-    """Initialize session state from localStorage, falling back to .env defaults.
+    """Initialize session state from .env defaults.
 
-    NOTE: We intentionally skip load_connection() here because it calls
-    st_javascript which injects an iframe that triggers an extra Streamlit
-    rerun, causing the "ghost form" visual glitch.  .env defaults are
-    sufficient; the user can always re-enter values in the form.
+    Also auto-populates target_config (ConnectionConfig object) so downstream
+    pages can use it without requiring the user to click 'Test Connection'.
     """
     if "target_form_loaded" not in st.session_state:
         st.session_state.target_form_loaded = True
@@ -41,6 +39,19 @@ def init_session_state():
         connection_data = {k: v for k, v in env_defaults.items() if v}
 
         st.session_state[SessionKeys.TARGET_CONNECTION] = connection_data
+
+    if "target_config" not in st.session_state:
+        env_defaults = get_env_target_defaults()
+        if env_defaults.get("host") and env_defaults.get("database") and env_defaults.get("username") and env_defaults.get("password"):
+            config = ConnectionConfig(
+                host=env_defaults["host"],
+                port=int(env_defaults["port"]),
+                database=env_defaults["database"],
+                username=env_defaults["username"],
+                password=env_defaults["password"],
+            )
+            st.session_state["target_config"] = config
+            st.session_state["target_schema_mode"] = env_defaults.get("schema_mode", "schemas")
 
 
 def render_target_connection():
@@ -192,12 +203,17 @@ def render_target_tables_status():
 
     # Schema inspector
     with st.expander("🔍 Schema Inspector"):
-        for name in LOAD_ORDER:
-            info = table_info.get(name, {})
-            if info.get("exists") and info.get("columns"):
-                st.markdown(f"**{info.get('full_name')}**")
-                cols_df = pd.DataFrame(info["columns"])
-                st.dataframe(cols_df, hide_index=True, use_container_width=True)
+        if st.toggle(
+            "Render schema details",
+            value=False,
+            key="_render_target_schema_details",
+        ):
+            for name in LOAD_ORDER:
+                info = table_info.get(name, {})
+                if info.get("exists") and info.get("columns"):
+                    st.markdown(f"**{info.get('full_name')}**")
+                    cols_df = pd.DataFrame(info["columns"])
+                    st.dataframe(cols_df, hide_index=True, use_container_width=True)
 
 
 def render_load_configuration():

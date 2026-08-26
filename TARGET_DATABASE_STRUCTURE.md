@@ -22,7 +22,12 @@ PostgreSQL Server: jeen-dev-db-migration-test:5432
     └── public
         ├── agents
         ├── agent_settings
-        └── agent_documents
+        ├── knowledge_bases
+        ├── knowledge_base_assignments
+        ├── knowledge_base_items
+        ├── conversations
+        ├── messages
+        └── message_content_blocks
 ```
 
 ## Database Details
@@ -67,7 +72,12 @@ Schema: public
 |-------|-------------|-------------|
 | `agents` | AI agent configurations | id (UUID), name, bot_data (JSONB) |
 | `agent_settings` | Agent-specific settings | agent_id, user_id, settings (JSONB) |
-| `agent_documents` | Agent-document associations | agent_id, document_id |
+| `knowledge_bases` | RAG settings and document-set metadata | id (UUID), name, similarity_top_k |
+| `knowledge_base_assignments` | Links knowledge bases to agents | knowledge_base_id, assigned_to_id |
+| `knowledge_base_items` | Links knowledge bases to documents/folders | knowledge_base_id, item_id, item_type |
+| `conversations` | Conversation headers | id (UUID), user_id, title |
+| `messages` | Conversation messages | id (UUID), conversation_id, role |
+| `message_content_blocks` | Message content payloads | id (UUID), message_id, content |
 
 **Connection String**:
 ```
@@ -219,7 +229,12 @@ SELECT COUNT(*) FROM public.chunks;
 -- completion_db
 SELECT COUNT(*) FROM public.agents;
 SELECT COUNT(*) FROM public.agent_settings;
-SELECT COUNT(*) FROM public.agent_documents;
+SELECT COUNT(*) FROM public.knowledge_bases;
+SELECT COUNT(*) FROM public.knowledge_base_assignments;
+SELECT COUNT(*) FROM public.knowledge_base_items;
+SELECT COUNT(*) FROM public.conversations;
+SELECT COUNT(*) FROM public.messages;
+SELECT COUNT(*) FROM public.message_content_blocks;
 ```
 
 ## Summary

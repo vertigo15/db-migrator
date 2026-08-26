@@ -3,12 +3,15 @@ Database connection helpers for PostgreSQL.
 """
 import subprocess
 import os
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Iterator, List, Optional, Tuple, Any
 from dataclasses import dataclass
+from uuid import uuid4
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
 import streamlit as st
 
 from utils.config import get_all_table_names, TABLE_DEFINITIONS
@@ -62,6 +65,82 @@ def get_connection(config: ConnectionConfig) -> psycopg2.extensions.connection:
         options='-c client_encoding=UTF8',
     )
     return conn
+
+
+@st.cache_resource(show_spinner=False)
+def _get_read_pool(
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+) -> ThreadedConnectionPool:
+    """Create one thread-safe read pool per distinct database config."""
+    return ThreadedConnectionPool(
+        1,
+        int(os.getenv("DB_READ_POOL_MAX", "8")),
+        host=host,
+        port=port,
+        database=database,
+        user=username,
+        password=password,
+        options="-c client_encoding=UTF8 -c default_transaction_read_only=on",
+        connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+        application_name="db-migrator-ui-read",
+    )
+
+
+def get_read_pool(config: ConnectionConfig) -> ThreadedConnectionPool:
+    """Return the cached read pool for ``config``."""
+    return _get_read_pool(
+        config.host,
+        int(config.port),
+        config.database,
+        config.username,
+        config.password,
+    )
+
+
+@contextmanager
+def pooled_read_connection(
+    config: ConnectionConfig,
+    *,
+    autocommit: bool = True,
+):
+    """Borrow a clean read-only connection and always return it to the pool."""
+    pool = get_read_pool(config)
+    conn = pool.getconn()
+    close_connection = False
+    try:
+        if conn.closed:
+            close_connection = True
+            raise psycopg2.InterfaceError("Pooled connection is closed")
+        if (
+            conn.get_transaction_status()
+            != psycopg2.extensions.TRANSACTION_STATUS_IDLE
+        ):
+            conn.rollback()
+        conn.autocommit = autocommit
+        yield conn
+    except (psycopg2.InterfaceError, psycopg2.OperationalError):
+        close_connection = True
+        raise
+    finally:
+        try:
+            if not conn.closed:
+                if (
+                    conn.get_transaction_status()
+                    != psycopg2.extensions.TRANSACTION_STATUS_IDLE
+                ):
+                    conn.rollback()
+                # Keep a consistent pool invariant. Transactional callers only
+                # opt out of autocommit for the duration of this context.
+                conn.autocommit = True
+        except Exception:
+            close_connection = True
+            raise
+        finally:
+            pool.putconn(conn, close=close_connection or bool(conn.closed))
 
 
 def test_connection(config: ConnectionConfig) -> Tuple[bool, str]:
@@ -258,25 +337,22 @@ def check_tables_exist(config: ConnectionConfig, prefix: str) -> Dict[str, bool]
     results = {}
     
     try:
-        conn = get_connection(config)
-        cursor = conn.cursor()
-        
+        with pooled_read_connection(config) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = ANY(%s)
+                    """,
+                    (list(table_names.values()),),
+                )
+                existing = {row[0] for row in cursor.fetchall()}
         for logical_name, actual_name in table_names.items():
-            cursor.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = %s
-                );
-            """, (actual_name,))
-            exists = cursor.fetchone()[0]
             results[logical_name] = {
                 "actual_name": actual_name,
-                "exists": exists
+                "exists": actual_name in existing,
             }
-        
-        cursor.close()
-        conn.close()
         return results
     except Exception as e:
         st.error(f"Error checking tables: {e}")
@@ -286,12 +362,10 @@ def check_tables_exist(config: ConnectionConfig, prefix: str) -> Dict[str, bool]
 def get_table_row_count(config: ConnectionConfig, table_name: str) -> int:
     """Get the row count for a table."""
     try:
-        conn = get_connection(config)
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT COUNT(*) FROM public.{table_name};")
-        count = cursor.fetchone()[0]
-        cursor.close()
-        conn.close()
+        with pooled_read_connection(config) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) FROM public.{table_name};")
+                count = cursor.fetchone()[0]
         return count
     except Exception:
         return -1
@@ -309,12 +383,9 @@ def execute_query(config: ConnectionConfig, query: str, params: tuple = None) ->
     Returns:
         pandas DataFrame with results
     """
-    conn = get_connection(config)
-    try:
+    with pooled_read_connection(config) as conn:
         df = pd.read_sql_query(query, conn, params=params)
         return df
-    finally:
-        conn.close()
 
 
 def execute_query_chunked(
@@ -322,9 +393,9 @@ def execute_query_chunked(
     query: str, 
     params: tuple = None,
     chunk_size: int = 10000
-) -> pd.DataFrame:
+) -> Iterator[pd.DataFrame]:
     """
-    Execute a query and return results in chunks (for large tables).
+    Stream a query from PostgreSQL in bounded DataFrame chunks.
     
     Args:
         config: Connection configuration
@@ -335,12 +406,32 @@ def execute_query_chunked(
     Returns:
         Generator yielding DataFrame chunks
     """
-    conn = get_connection(config)
-    try:
-        for chunk in pd.read_sql_query(query, conn, params=params, chunksize=chunk_size):
-            yield chunk
-    finally:
-        conn.close()
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+
+    # Named cursors are server-side cursors in psycopg2 and require an open
+    # transaction. The pooled context rolls that transaction back and restores
+    # autocommit before the connection is returned to the pool.
+    with pooled_read_connection(config, autocommit=False) as conn:
+        cursor = conn.cursor(name=f"db_migrator_stream_{uuid4().hex}")
+        try:
+            cursor.itersize = chunk_size
+            cursor.execute(query, params)
+            columns = None
+
+            while True:
+                rows = cursor.fetchmany(chunk_size)
+                if not rows:
+                    break
+                if columns is None:
+                    # psycopg2 populates description for a named cursor only
+                    # after the first FETCH, not after DECLARE/execute.
+                    columns = [
+                        description[0] for description in cursor.description
+                    ]
+                yield pd.DataFrame.from_records(rows, columns=columns)
+        finally:
+            cursor.close()
 
 
 def get_table_schema(config: ConnectionConfig, table_name: str) -> List[Dict]:
@@ -366,12 +457,10 @@ def get_table_schema(config: ConnectionConfig, table_name: str) -> List[Dict]:
         AND table_name = %s
         ORDER BY ordinal_position;
     """
-    conn = get_connection(config)
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute(query, (table_name,))
-    results = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    with pooled_read_connection(config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(query, (table_name,))
+            results = cursor.fetchall()
     return [dict(row) for row in results]
 
 

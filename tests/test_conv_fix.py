@@ -8,6 +8,7 @@ Verify the 5 fixes applied to sql_generator.py:
 """
 import sys
 import os
+import tempfile
 import pandas as pd
 from datetime import datetime
 
@@ -63,7 +64,7 @@ def test_extract_question_from_jsonb():
     print("PASS: extract_question_from_jsonb")
 
 # ─── 4 & 5. End-to-end generation ─────────────────────────────────────────────
-def test_generation():
+def test_generation(tmp_path=None):
     rows = []
     for turn in range(3):
         rows.append({
@@ -96,7 +97,8 @@ def test_generation():
         })
 
     df = pd.DataFrame(rows)
-    out_file = os.path.join(os.path.dirname(__file__), 'output_test_conv.sql')
+    output_dir = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp()
+    out_file = os.path.join(output_dir, 'output_test_conv.sql')
     result = generate_conversations_logs_migration_sql(df, out_file, 'test-source')
 
     print(f"  messages_processed={result['messages_processed']}, blocks_processed={result['blocks_processed']}")

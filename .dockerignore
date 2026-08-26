@@ -19,12 +19,15 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
+.venv*/
 env/
 ENV/
 
 # Generated output (mounted as volumes)
 output/
 backups/
+.tmp_db_move/
+*.tar
 
 # IDE
 .idea/

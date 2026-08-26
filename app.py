@@ -231,7 +231,9 @@ def main():
         subgraph V5C["V5 &middot; completion_db"]
             ag["agents"]
             as2["agent_settings"]
-            ad["agent_documents"]
+            kb["knowledge_bases"]
+            kba["knowledge_base_assignments"]
+            kbi["knowledge_base_items"]
             cv["conversations"]
             ms["messages"]
             mb["message_content_blocks"]
@@ -247,7 +249,9 @@ def main():
         v4l -- "Step 5" --> mb
         v4b -- "Step 6" --> ag
         v4b -- "Step 6" --> as2
-        v4b -- "Step 6" --> ad
+        v4b -- "Step 6" --> kb
+        v4b -- "Step 6" --> kba
+        v4b -- "Step 6" --> kbi
         v4b -. "topup: fetch missing docs" .-> v4d
         v4d -. "Step 3 &#40;+topup&#41;" .-> d
 
@@ -256,7 +260,6 @@ def main():
         mid -.-> d
         mid -.-> c
         mid -.-> ag
-        mid -.-> ad
         mid -.-> cv
     </div>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
@@ -308,10 +311,8 @@ def main():
                 ("metadata", "Multiple", "JSONB legacyData: id, job, model, group_id, azure_oid, department, token_used, words_used, subfeatures, token_limit, company_name, phone_number, last_connected, letter_checkbox, times_connected, enabled_features, history_categories, company_name_in_hebrew"),
                 ("created_at", "created_at", "Direct"),
                 ("updated_at", "—", "now()"),
-                ("deleted_at", "—", "NULL"),
                 ("zitadel_user_id", "—", "NULL"),
                 ("organization_id", "—", "Configurable UUID: from `DEFAULT_ORG_ID` env var or Org ID input field in UI (default: `356b50f7-bcbd-42aa-9392-e1605f42f7a1`)"),
-                ("is_owner", "—", "false (DB default — not explicitly inserted)"),
                 ("preferred_language", "—", "NULL (DB default — not explicitly inserted)"),
             ],
         },
@@ -453,12 +454,12 @@ def main():
             "step": "06",
             "name": "Agents",
             "source": "`playground_bot_generator_config`",
-            "target": "`agents` + `agent_settings` + `agent_documents`",
+            "target": "`agents` + `agent_settings` + `knowledge_bases` + `knowledge_base_assignments` + `knowledge_base_items`",
             "logic": (
                 "Agent type derived from config (all legacy bots migrate as `cortex`). "
                 "JSONB fields (`bot_data`, `toolkit_settings`, prompts) decomposed into "
                 "normalized columns. `docs_chosen` and `chosen_docs_folders` expanded "
-                "into `agent_documents` link table via `migration.get_new_id`. "
+                "into knowledge base items via `migration.get_new_id`. "
                 "RAG settings extracted and mapped. "
                 "**Dependency resolution (auto-topup):** before this SQL is generated, "
                 "every document and folder referenced by selected agents is verified against "
@@ -466,7 +467,7 @@ def main():
                 "and added to steps 03 & 04 (with `[agent-topup]` annotation). Missing "
                 "folders are fetched with their full ancestor chain. "
                 "References to documents or folders that no longer exist in V4 are flagged "
-                "as stale — those specific `agent_documents` links will be dropped. "
+                "as stale — those specific knowledge base item links will be dropped. "
                 "After topup, every `migration.get_new_id(...)` call in this file is "
                 "guaranteed to resolve correctly."
             ),
@@ -491,9 +492,10 @@ def main():
                 ("agent_settings.show_source_text", "toolkit_settings.questions_selected", "Contains 'Display the source text'"),
                 ("agent_settings.follow_up_questions", "toolkit_settings.questions_selected", "Contains 'Follow-up questions'"),
                 ("agent_settings.additional_links", "additional_links_title.is_selected", "== 'true'"),
-                ("agent_documents.document_id", "docs_chosen", "migration.get_new_id('documents', doc_id) — guaranteed by topup"),
-                ("agent_documents.document_id", "chosen_docs_folders", "migration.get_new_id('folders', fid) — guaranteed by topup"),
-                ("agent_documents.type", "—", "'document' or 'folder'"),
+                ("knowledge_bases.id", "bot_id", "deterministic_uuid_v4(NAMESPACE, '{bot_id}-kb')"),
+                ("knowledge_base_assignments.assigned_to_id", "bot_id", "deterministic_uuid_v4(NAMESPACE, '{bot_id}-agent')"),
+                ("knowledge_base_items.item_id", "docs_chosen / chosen_docs_folders", "migration.get_new_id('documents'/'folders', id) — guaranteed by topup"),
+                ("knowledge_base_items.item_type", "—", "'document' or 'folder'"),
             ],
         },
     ]

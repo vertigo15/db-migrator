@@ -1,12 +1,11 @@
 # DB Migrator Dependencies
-streamlit>=1.30.0
-streamlit-javascript>=0.1.5
+streamlit>=1.37.0
+# streamlit-javascript no longer needed — using st.components.v1.html instead
 psycopg2-binary>=2.9.9
 pandas>=2.0.0
 pyyaml>=6.0.1
 python-dotenv>=1.0.0
 reportlab>=4.0.0
 requests>=2.31.0
-# LLM client (prompt merger — inlined from prompt-merger service)
-openai>=1.0.0
-pydantic>=2.0.0
+# Excel file import support
+openpyxl>=3.1.0
